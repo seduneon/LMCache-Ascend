@@ -89,28 +89,20 @@ class TaskPool:
         if not running:
             return None
         return min(t.estimated_end() for t in running)
-        
-    def advance_to(self, now: float) -> None:
-        for t in self.ready():
-            t.start(now)
-        
-        running = self.running()
-        if not running:
-            return
-        
-        time = self.next()
-        for t in running:
-            t.advance_to(time)
-        
-        running = self.running() 
-        for t in running:
-            if t.is_done():
-                t.finish()
-        
-        for t in self.ready():
-            t.start(time)
-        
-    
+
+    def start_ready(self, t: float) -> None:
+        for task in self.ready():
+            task.start(t)
+
+    def advance_running_to(self, t: float) -> None:
+        for task in self.running():
+            task.advance_to(t)
+
+    def finish_done(self) -> None:
+        for task in list(self.running()):
+            if task.is_done():
+                task.finish()
+
 class MemoryTask(Task):
     def __init__(
         self,
