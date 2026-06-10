@@ -41,8 +41,6 @@ class Simulator:
 
     def run(self, max_steps: int = 100_000) -> float:
         for _ in range(max_steps):
-            if self.engine.is_idle():
-                break
             if not self.step():
                 break
         return self.now
