@@ -9,14 +9,9 @@ class TaskStatus(StrEnum):
     COMPLETED = "completed"
 
 class Task(ABC):
-    def __init__(
-        self, 
-        dependents: list, 
-        dependencies: list,
-        work_left: float,
-        resource: Resource):
-        self.wake = dependents
-        self.needs = len(dependencies)
+    def __init__(self, work_left: float, resource: Resource):
+        self.wake: list[Task] = []
+        self.needs = 0
         self.work_left = work_left
         self.resource = resource
         self.status = TaskStatus.PENDING
@@ -107,7 +102,7 @@ class TaskPool:
         for t in running:
             t.advance_to(time)
         
-        running = self.running()
+        running = self.running() 
         for t in running:
             if t.is_done():
                 t.finish()
@@ -119,14 +114,12 @@ class TaskPool:
 class MemoryTask(Task):
     def __init__(
         self,
-        dependents: list,
-        dependencies: list,
         work_left: float,
         resource: Resource,
         memory: Memory,
         block_hash: str,
     ):
-        super().__init__(dependents, dependencies, work_left, resource)
+        super().__init__(work_left, resource)
         self.memory = memory
         self.block_hash = block_hash
 

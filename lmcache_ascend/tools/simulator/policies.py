@@ -2,8 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Literal
 
-from request import Request
-from memory import Memory
+from memory import BlockState, Memory
 
 @dataclass
 class LookupResult():
@@ -12,5 +11,24 @@ class LookupResult():
 
 class LookupPolicy(ABC):
     @abstractmethod
-    def lookup(self, memories: dict[str, Memory], request: Request) -> LookupResult | None:
+    def lookup(self, memories: dict[str, Memory], block_hashes: list[str]) -> LookupResult | None:
         pass
+
+class ComputeAllLookup(LookupPolicy):
+    def lookup(self, memories: dict[str, Memory], block_hashes: list[str]) -> LookupResult | None:
+        hbm = memories["hbm"]
+        blocks: dict[str, Literal["compute"]] = {}
+
+        for block_hash in block_hashes:
+            state = hbm.state_of(block_hash)
+            if state == BlockState.RESIDENT:
+                continue
+            if state in (BlockState.LOADING, BlockState.EVICTING):
+                return None
+            blocks[block_hash] = "compute"
+
+        if hbm.free_size() < len(blocks):
+            return None
+
+        return LookupResult(evicts=[], blocks=blocks)
+
