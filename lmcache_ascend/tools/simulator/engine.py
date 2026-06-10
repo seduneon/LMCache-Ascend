@@ -1,7 +1,7 @@
 import heapq
 from collections import deque
 
-from memory import BlockState, Memory
+from memory import Memory
 from policies import LookupPolicy, LookupResult
 from request import Request, RequestStatus
 from resource import ComputeResource
@@ -64,11 +64,17 @@ class Engine:
 
         for block_hash in req.block_hashes:
             if block_hash in result.blocks:
-                hbm.reserve(block_hash, req.req_id)
-            elif hbm.state_of(block_hash) == BlockState.RESIDENT:
-                hbm.add_holder(block_hash, req.req_id)
-            elif hbm.state_of(block_hash) in (BlockState.RESERVED, BlockState.LOADING):
-                hbm.add_holder(block_hash, req.req_id)
+                hbm.append_reserved(block_hash, req.req_id)
+                continue
+
+            resident = hbm.best_resident(block_hash)
+            if resident is not None:
+                resident.holders.add(req.req_id)
+                continue
+
+            inflight = hbm.inflight_incoming(block_hash)
+            if inflight is not None:
+                inflight.holders.add(req.req_id)
 
     def _build_tasks(self, req: Request, result: LookupResult) -> None:
         hbm = self.memories["hbm"]
@@ -80,7 +86,7 @@ class Engine:
                 work_left=self.work_per_evict,
                 resource=self.compute_res,
                 memory=hbm,
-                block_hash=victim,
+                block=victim,
             )
             self.pool.add(task, [])
             evict_tasks.append(task)
@@ -89,9 +95,9 @@ class Engine:
         prereqs_tail = list(evict_tasks)
 
         for block_hash in req.block_hashes:
-            existing = hbm.find(block_hash)
-            if existing and existing.task is not None:
-                prereqs_tail = list(evict_tasks) + [existing.task]
+            inflight = hbm.inflight_incoming(block_hash)
+            if inflight is not None and block_hash not in result.blocks:
+                prereqs_tail = list(evict_tasks) + [inflight.task]
                 continue
 
             if block_hash not in result.blocks:
@@ -101,15 +107,20 @@ class Engine:
             if action != "compute":
                 raise NotImplementedError(f"v0 only supports compute, got {action!r}")
 
+            block = hbm.find_reserved_for(block_hash, req.req_id)
+            if block is None:
+                raise RuntimeError(
+                    f"no reserved block for {block_hash!r} request {req.req_id!r}"
+                )
+
             task = LoadTask(
                 work_left=self.work_per_block,
                 resource=self.compute_res,
                 memory=hbm,
-                block_hash=block_hash,
+                block=block,
             )
             self.pool.add(task, prereqs_tail)
-            if existing is not None:
-                existing.task = task
+            block.task = task
             tasks.append(task)
             prereqs_tail = [task]
 
@@ -128,8 +139,3 @@ class Engine:
 
     def next_arrival(self) -> float | None:
         return self.pending[0][0] if self.pending else None
-
-    def is_idle(self) -> bool:
-        if self.pending or self.waiting or self.active:
-            return False
-        return not self.pool.running() and not self.pool.ready()

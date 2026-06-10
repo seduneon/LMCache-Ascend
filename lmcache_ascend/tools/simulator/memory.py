@@ -32,56 +32,74 @@ class Memory:
     def __init__(self, size: int, name: str):
         self.name = name
         self.size = size
-        self.blocks: dict[str, KVBlock] = {}
+        self.blocks: dict[str, list[KVBlock]] = {}
 
-    def state_of(self, block_hash: str) -> BlockState | None:
-        b = self.blocks.get(block_hash)
-        return b.state if b else None
+    def get(self, block_hash: str) -> list[KVBlock]:
+        return self.blocks.setdefault(block_hash, [])
 
     def used_size(self) -> int:
-        return len(self.blocks)
+        return sum(len(copies) for copies in self.blocks.values())
 
     def free_size(self) -> int:
         return self.size - self.used_size()
 
-    def update(self, block_hash: str, state: BlockState, task: Task | None = None):
-        existing = self.blocks.get(block_hash)
-        holders = existing.holders.copy() if existing else set()
-        self.blocks[block_hash] = KVBlock(block_hash, state, task, holders)
+    def append(self, block: KVBlock) -> None:
+        self.get(block.hash).append(block)
 
-    def remove(self, block_hash: str):
-        self.blocks.pop(block_hash, None)
+    def remove_block(self, block: KVBlock) -> None:
+        copies = self.blocks.get(block.hash)
+        if copies is None:
+            return
+        copies.remove(block)
+        if not copies:
+            del self.blocks[block.hash]
 
-    def find(self, block_hash: str) -> KVBlock | None:
-        return self.blocks.get(block_hash)
+    def best_resident(self, block_hash: str) -> KVBlock | None:
+        return next(
+            (b for b in self.get(block_hash) if b.state == BlockState.RESIDENT),
+            None,
+        )
+
+    def inflight_incoming(self, block_hash: str) -> KVBlock | None:
+        return next(
+            (
+                b
+                for b in self.get(block_hash)
+                if b.state in (BlockState.RESERVED, BlockState.LOADING) and b.task is not None
+            ),
+            None,
+        )
+
+    def evicting(self, block_hash: str) -> KVBlock | None:
+        return next(
+            (b for b in self.get(block_hash) if b.state == BlockState.EVICTING),
+            None,
+        )
+
+    def find_reserved_for(self, block_hash: str, req_id: str) -> KVBlock | None:
+        for block in reversed(self.get(block_hash)):
+            if (
+                block.state == BlockState.RESERVED
+                and req_id in block.holders
+                and block.task is None
+            ):
+                return block
+        return None
 
     def list(self) -> list[KVBlock]:
-        return list(self.blocks.values())
+        return [block for copies in self.blocks.values() for block in copies]
 
-    def reserve(self, block_hash: str, req_id: str) -> None:
-        existing = self.blocks.get(block_hash)
-        if existing is None:
-            self.blocks[block_hash] = KVBlock(
-                block_hash, BlockState.RESERVED, holders={req_id}
-            )
-            return
-        existing.holders.add(req_id)
-
-    def add_holder(self, block_hash: str, req_id: str) -> None:
-        block = self.blocks.get(block_hash)
-        if block is None:
-            raise KeyError(f"block {block_hash!r} not in memory")
-        block.holders.add(req_id)
+    def append_reserved(self, block_hash: str, req_id: str) -> KVBlock:
+        block = KVBlock(block_hash, BlockState.RESERVED, holders={req_id})
+        self.append(block)
+        return block
 
     def release_request(self, req_id: str) -> None:
-        for block_hash in list(self.blocks):
-            block = self.blocks[block_hash]
-            block.holders.discard(req_id)
-            if block.state == BlockState.RESERVED and not block.holders:
-                self.remove(block_hash)
+        for copies in list(self.blocks.values()):
+            for block in list(copies):
+                block.holders.discard(req_id)
+                if block.state == BlockState.RESERVED and not block.holders:
+                    self.remove_block(block)
 
-    def can_evict(self, block_hash: str) -> bool:
-        block = self.blocks.get(block_hash)
-        if block is None:
-            return False
+    def can_evict_block(self, block: KVBlock) -> bool:
         return block.state == BlockState.RESIDENT and len(block.holders) == 0

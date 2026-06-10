@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from resource import Resource
 from enum import StrEnum
-from memory import BlockState, Memory
+from memory import BlockState, KVBlock, Memory
 
 class TaskStatus(StrEnum):
     PENDING = "pending"
@@ -109,23 +109,26 @@ class MemoryTask(Task):
         work_left: float,
         resource: Resource,
         memory: Memory,
-        block_hash: str,
+        block: KVBlock,
     ):
         super().__init__(work_left, resource)
         self.memory = memory
-        self.block_hash = block_hash
+        self.block = block
+        self.block_hash = block.hash
 
 class LoadTask(MemoryTask):
     def on_start(self) -> None:
-        self.memory.update(self.block_hash, BlockState.LOADING, self)
+        self.block.state = BlockState.LOADING
+        self.block.task = self
 
     def on_end(self) -> None:
-        self.memory.update(self.block_hash, BlockState.RESIDENT, None)
+        self.block.state = BlockState.RESIDENT
+        self.block.task = None
 
 class EvictTask(MemoryTask):
     def on_start(self) -> None:
-        self.memory.update(self.block_hash, BlockState.EVICTING, self)
+        self.block.state = BlockState.EVICTING
+        self.block.task = self
 
     def on_end(self) -> None:
-        self.memory.remove(self.block_hash)
-
+        self.memory.remove_block(self.block)
