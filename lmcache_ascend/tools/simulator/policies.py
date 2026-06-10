@@ -19,21 +19,31 @@ class LookupPolicy(ABC):
         pass
 
 
-def _pick_victims(hbm: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
-    victims: list[KVBlock] = []
-    for block_hash, copies in hbm.blocks.items():
-        if block_hash in exclude:
-            continue
-        for block in copies:
-            if not hbm.can_evict_block(block):
+class EvictionPolicy(ABC):
+    @abstractmethod
+    def pick_victims(self, hbm: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+        pass
+
+
+class FirstAvailableEviction(EvictionPolicy):
+    def pick_victims(self, hbm: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+        victims: list[KVBlock] = []
+        for block_hash, copies in hbm.blocks.items():
+            if block_hash in exclude:
                 continue
-            victims.append(block)
-            if len(victims) >= count:
-                return victims
-    return victims
+            for block in copies:
+                if not hbm.can_evict_block(block):
+                    continue
+                victims.append(block)
+                if len(victims) >= count:
+                    return victims
+        return victims
 
 
 class ComputeAllLookup(LookupPolicy):
+    def __init__(self, eviction_policy: EvictionPolicy | None = None):
+        self.eviction_policy = eviction_policy or FirstAvailableEviction()
+
     def lookup(self, memories: dict[str, Memory], block_hashes: list[str]) -> LookupResult | None:
         hbm = memories["hbm"]
         blocks: dict[str, Literal["compute"]] = {}
@@ -53,7 +63,7 @@ class ComputeAllLookup(LookupPolicy):
 
         evicts: list[KVBlock] = []
         if deficit > 0:
-            evicts = _pick_victims(hbm, deficit, exclude)
+            evicts = self.eviction_policy.pick_victims(hbm, deficit, exclude)
             if len(evicts) < deficit:
                 return None
 
