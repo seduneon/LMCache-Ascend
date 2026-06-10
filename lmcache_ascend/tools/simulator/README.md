@@ -1,34 +1,17 @@
 # Simulator
 
-## v0
+## v0 scope
 
-### Requirements
+- Single HBM, compute-only loads
+- FIFO admission, head-of-line blocking on failed lookup
+- `ComputeAllLookup` + `FirstAvailableEviction`
+- Multiple concurrent active requests
 
-- no KV cache, everything is compute
-- a single instance HBM, no PD disaggregation
+## Next (v1 ideas)
 
-### Structure
-
-- Resources (ABC)
-    - current workload info
-    - add, del functions
-- ComputeResource, MemoryResources
-    - override speed information
-- TaskPool
-    - tasks 
-    - add
-    - next
-- Task (ABC)
-    - dependents
-    - dependencies
-    - left
-- TransferTask, ComputeTask, EvictTask
-    - onStart, onEnd, other info
-- Memory
-    - size
-    - kv blocks
-- KV block
-    - size
-    - hash
-    - info (LRU, etc)
-    - dependents
+- `pull` action and multiple memory tiers
+- LRU / better eviction policies (`EvictionPolicy` subclass)
+- Separate bandwidth resource for transfer/evict
+- `run()` done vs stuck status
+- Prefill/decode (`RequestPD`) in the workflow
+- Tests
