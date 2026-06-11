@@ -28,3 +28,13 @@ class ComputeResource(Resource):
     @property
     def speed(self) -> float:
         return 0.0 if self.works == 0 else self.base_speed / self.works
+
+
+class BandwidthResource(Resource):
+    def __init__(self, base_speed: float):
+        super().__init__()
+        self.base_speed = base_speed
+
+    @property
+    def speed(self) -> float:
+        return 0.0 if self.works == 0 else self.base_speed / self.works
