@@ -1,10 +1,8 @@
-import heapq
-from collections import deque
-
 from memory import Memory
-from policies import LookupPolicy, LookupResult
-from request import Request, RequestPD, RequestStatus
+from policies import LookupResult
+from request import Request, RequestStatus
 from resource import BandwidthResource, ComputeResource
+from scheduler import Batch, BatchEntry, Scheduler
 from tasks import EvictTask, LoadTask, Task, TaskPool, TaskStatus
 
 
@@ -16,12 +14,13 @@ class Engine:
         pool: TaskPool,
         memories: dict[str, Memory],
         local_memory: str,
-        policy: LookupPolicy,
+        policy,
         compute_res: ComputeResource,
         bandwidth_res: BandwidthResource | None = None,
         work_per_block: float = 1.0,
         work_per_transfer: float | None = None,
         work_per_evict: float | None = None,
+        max_blocks_per_step: int = 10_000,
     ):
         self.engine_id = engine_id
         self.pool = pool
@@ -36,50 +35,75 @@ class Engine:
         )
         self.work_per_evict = work_per_evict if work_per_evict is not None else work_per_block
 
-        self.pending: list[tuple[float, str, Request]] = []
-        self.waiting: deque[Request] = deque()
-        self.active: list[Request] = []
-        self.request_tasks: dict[str, list[Task]] = {}
+        self.scheduler = Scheduler(
+            policy=policy,
+            memories=memories,
+            local_memory=local_memory,
+            max_blocks_per_step=max_blocks_per_step,
+        )
+        for req in requests:
+            self.scheduler.add_request(req)
 
-        for r in requests:
-            r.status = RequestStatus.PENDING
-            heapq.heappush(self.pending, (r.arrival_time, r.req_id, r))
+    @property
+    def waiting(self):
+        return self.scheduler.waiting
+
+    @property
+    def running(self):
+        return self.scheduler.running
+
+    @property
+    def completed(self):
+        return self.scheduler.completed
 
     def _local(self) -> Memory:
         return self.memories[self.local_memory]
 
     def schedule_request(self, req: Request) -> None:
-        req.status = RequestStatus.PENDING
-        heapq.heappush(self.pending, (req.arrival_time, req.req_id, req))
+        self.scheduler.add_request(req)
 
     def release_arrivals(self, now: float) -> None:
-        while self.pending and self.pending[0][0] <= now:
-            _, _, r = heapq.heappop(self.pending)
-            r.status = RequestStatus.WAITING
-            self.waiting.append(r)
+        self.scheduler.release_arrivals(now)
 
-    def admit(self) -> bool:
-        """Admit the head waiting request if lookup succeeds. Returns True if admitted."""
-        if not self.waiting:
-            return False
+    def next_arrival(self) -> float | None:
+        return self.scheduler.next_arrival()
 
-        req = self.waiting[0]
-        result = self.policy.lookup(self.memories, req.block_hashes)
-        if result is None:
-            return False
+    def schedule(self) -> Batch:
+        return self.scheduler.schedule()
 
-        self.waiting.popleft()
-        req.status = RequestStatus.RUNNING
-        self.active.append(req)
-        self._reserve(req, result)
-        self._build_tasks(req, result)
-        self.check_completions()
-        return True
+    def execute_batch(self, batch: Batch) -> list[Task]:
+        """Reserve memory and enqueue all work for this batch."""
+        all_tasks: list[Task] = []
+        for entry in batch.entries:
+            self._reserve(entry.req, entry.result, entry.block_hashes)
+            tasks = self._build_tasks(entry.req, entry.result, entry.block_hashes)
+            all_tasks.extend(tasks)
+        return all_tasks
 
-    def _reserve(self, req: Request, result: LookupResult) -> None:
+    def apply_batch(self, batch: Batch) -> list[Request]:
+        """Advance state after the batch finishes (vLLM update_from_output)."""
+        local = self._local()
+        finished: list[Request] = []
+
+        for entry in batch.entries:
+            req = entry.req
+            if req.num_computed_blocks < req.prefix_block_count:
+                req.num_computed_blocks = req.prefix_block_count
+            elif req.pending_block_hash is not None:
+                req.block_hashes.append(req.pending_block_hash)
+                req.pending_block_hash = None
+                req.num_computed_blocks += 1
+
+            if req.num_computed_blocks >= req.blocks_target():
+                self.scheduler.finish_request(req)
+                finished.append(req)
+
+        return finished
+
+    def _reserve(self, req: Request, result: LookupResult, block_hashes: list[str]) -> None:
         local = self._local()
 
-        for block_hash in req.block_hashes:
+        for block_hash in block_hashes:
             if block_hash in result.blocks:
                 local.append_reserved(block_hash, req.req_id)
                 continue
@@ -93,7 +117,12 @@ class Engine:
             if inflight is not None:
                 inflight.holders.add(req.req_id)
 
-    def _build_tasks(self, req: Request, result: LookupResult) -> None:
+    def _build_tasks(
+        self,
+        req: Request,
+        result: LookupResult,
+        block_hashes: list[str],
+    ) -> list[Task]:
         local = self._local()
         tasks: list[Task] = []
         evict_tasks: list[Task] = []
@@ -104,19 +133,15 @@ class Engine:
                 resource=self.compute_res,
                 memory=local,
                 block=victim,
+                req_id=req.req_id,
             )
             self.pool.add(task, [])
             evict_tasks.append(task)
             tasks.append(task)
 
-        prereqs_tail = list(evict_tasks)
+        prereqs_tail: list[Task] = list(evict_tasks)
 
-        for block_hash in req.block_hashes:
-            inflight = local.inflight_incoming(block_hash)
-            if inflight is not None and block_hash not in result.blocks:
-                prereqs_tail = list(evict_tasks) + [inflight.task]
-                continue
-
+        for block_hash in block_hashes:
             if block_hash not in result.blocks:
                 continue
 
@@ -133,6 +158,7 @@ class Engine:
                     resource=self.compute_res,
                     memory=local,
                     block=dst_block,
+                    req_id=req.req_id,
                 )
                 self.pool.add(task, prereqs_tail)
                 dst_block.task = task
@@ -150,16 +176,14 @@ class Engine:
                     raise RuntimeError(
                         f"no resident source block {block_hash!r} on {src_key!r}"
                     )
-                prereqs = list(prereqs_tail)
-                if src_block.task is not None and src_block.task not in prereqs:
-                    prereqs.append(src_block.task)
                 task = LoadTask(
                     work_left=self.work_per_transfer,
                     resource=self.bandwidth_res,
                     memory=local,
                     block=dst_block,
+                    req_id=req.req_id,
                 )
-                self.pool.add(task, prereqs)
+                self.pool.add(task, prereqs_tail)
                 dst_block.task = task
                 tasks.append(task)
                 prereqs_tail = [task]
@@ -167,21 +191,4 @@ class Engine:
 
             raise NotImplementedError(f"unsupported action {action!r}")
 
-        self.request_tasks[req.req_id] = tasks
-
-    def check_completions(self) -> list[Request]:
-        local = self._local()
-        completed: list[Request] = []
-        for req in list(self.active):
-            tasks = self.request_tasks.get(req.req_id, [])
-            if tasks and not all(t.status == TaskStatus.COMPLETED for t in tasks):
-                continue
-            req.status = RequestStatus.COMPLETE
-            local.release_request(req.req_id)
-            self.active.remove(req)
-            self.request_tasks.pop(req.req_id, None)
-            completed.append(req)
-        return completed
-
-    def next_arrival(self) -> float | None:
-        return self.pending[0][0] if self.pending else None
+        return tasks

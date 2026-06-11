@@ -101,5 +101,15 @@ class Memory:
                 if block.state == BlockState.RESERVED and not block.holders:
                     self.remove_block(block)
 
+    def free_request(self, req_id: str) -> None:
+        """Drop all KV state for a request (vLLM kv_cache_manager.free)."""
+        for copies in list(self.blocks.values()):
+            for block in list(copies):
+                if req_id not in block.holders:
+                    continue
+                block.holders.discard(req_id)
+                if not block.holders:
+                    self.remove_block(block)
+
     def can_evict_block(self, block: KVBlock) -> bool:
         return block.state == BlockState.RESIDENT and len(block.holders) == 0

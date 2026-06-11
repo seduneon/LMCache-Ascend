@@ -59,17 +59,17 @@ class LookupPolicy:
 
     def lookup(self, memories: dict[str, Memory], block_hashes: list[str]) -> LookupResult | None:
         local = memories[self.local_memory]
-        actions = self._resolve_actions(memories, block_hashes)
+        actions = self.resolve_actions(memories, block_hashes)
         if actions is None:
             return None
         evicts = self.eviction_policy.plan(
-            local, self._slots_needed(actions), set(block_hashes)
+            local, self.slots_needed(actions), set(block_hashes)
         )
         if evicts is None:
             return None
         return LookupResult(evicts=evicts, blocks=actions)
 
-    def _resolve_actions(
+    def resolve_actions(
         self, memories: dict[str, Memory], block_hashes: list[str]
     ) -> BlockActions | None:
         local = memories[self.local_memory]
@@ -100,7 +100,7 @@ class LookupPolicy:
             or local.inflight_incoming(block_hash) is not None
         )
 
-    def _slots_needed(self, actions: BlockActions) -> int:
+    def slots_needed(self, actions: BlockActions) -> int:
         return sum(
             1
             for action in actions.values()
