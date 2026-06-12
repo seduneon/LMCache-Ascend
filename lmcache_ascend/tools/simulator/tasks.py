@@ -9,10 +9,9 @@ class TaskStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
-    CANCELLED = "cancelled"
 
 
-_TERMINAL = frozenset({TaskStatus.COMPLETED, TaskStatus.CANCELLED})
+_TERMINAL = frozenset({TaskStatus.COMPLETED})
 
 
 def _is_ready(task: "Task") -> bool:
@@ -20,8 +19,6 @@ def _is_ready(task: "Task") -> bool:
         return False
     if not task.prereqs:
         return True
-    if any(p.status == TaskStatus.CANCELLED for p in task.prereqs):
-        return False
     return all(p.status == TaskStatus.COMPLETED for p in task.prereqs)
 
 
@@ -71,9 +68,6 @@ class Task(ABC):
     def on_end(self) -> None:
         pass
 
-    def on_cancel(self) -> None:
-        pass
-
     def estimated_end(self):
         assert self.status == TaskStatus.RUNNING
         return self.resource.time_takes(self.work_left) + self.now
@@ -121,33 +115,6 @@ class TaskPool:
             if task.is_done():
                 task.finish()
 
-    def cancel_tasks(self, tasks: list[Task]) -> None:
-        """Cancel tasks and same-request dependents.
-
-        Readiness is derived from prereq status (_is_ready), not a needs counter.
-        Cross-request dependents of a cancelled prereq stay pending (poisoned) and
-        are not started; they are not auto-cancelled.
-        """
-        to_cancel: set[Task] = set()
-        frontier = list(tasks)
-        while frontier:
-            task = frontier.pop()
-            if task in to_cancel or task.status in _TERMINAL:
-                continue
-            to_cancel.add(task)
-            for dep in task.wake:
-                if dep.req_id is not None and dep.req_id == task.req_id:
-                    frontier.append(dep)
-
-        for task in to_cancel:
-            if task.status == TaskStatus.RUNNING:
-                task.resource.remove()
-            task.on_cancel()
-            task.status = TaskStatus.CANCELLED
-            task.wake.clear()
-
-        self.tasks = [t for t in self.tasks if t not in to_cancel]
-
 
 class MemoryTask(Task):
     def __init__(
@@ -173,12 +140,6 @@ class LoadTask(MemoryTask):
         self.block.state = BlockState.RESIDENT
         self.block.task = None
 
-    def on_cancel(self) -> None:
-        if self.block.task is self:
-            self.block.task = None
-        if self.block.state == BlockState.LOADING:
-            self.block.state = BlockState.RESERVED
-
 
 class EvictTask(MemoryTask):
     def on_start(self) -> None:
@@ -187,9 +148,3 @@ class EvictTask(MemoryTask):
 
     def on_end(self) -> None:
         self.memory.remove_block(self.block)
-
-    def on_cancel(self) -> None:
-        if self.block.task is self:
-            self.block.task = None
-        if self.block.state == BlockState.EVICTING:
-            self.block.state = BlockState.RESIDENT

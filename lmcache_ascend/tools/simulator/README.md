@@ -130,7 +130,7 @@ def step(self):
 
 - **`scheduler.py`** — queues, `Batch` / `BatchEntry`, preempt while building the batch (victims not in the current batch).
 - **`engine.py`** — `execute_batch()` + `apply_batch()` only; no mid-step admit/schedule loops.
-- **No `cancel_tasks` on preempt** — a step drains fully before the next `schedule()`; preemption only frees KV and resets request state.
+- Preempt does not touch the task pool — a step drains fully before the next `schedule()`; preemption only frees KV and resets request state.
 - **Pull prereqs** — no shared `src_block.task` dependency; schedule requires source `RESIDENT` (decode spawned after prefill completes).
 
 ### Implemented (PD v1)
@@ -205,7 +205,7 @@ Eviction only picks `RESIDENT` blocks with `len(holders) == 0`. Running requests
 
 ### Task DAG (`tasks.py`)
 
-Readiness is derived from prereq **status** (`_is_ready`), not a `needs` counter. `cancel_tasks()` cascades only to dependents with the same `req_id`; cross-request dependents of a cancelled prereq stay pending (poisoned). Preempt does not call `cancel_tasks` — each step drains before the next schedule.
+Readiness is derived from prereq **status** (`_is_ready`: all prereqs `COMPLETED`). Each step drains its batch before the next schedule, so tasks are not aborted mid-flight.
 
 ### Planned improvements (highest impact first)
 

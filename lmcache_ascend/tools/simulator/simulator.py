@@ -3,7 +3,7 @@ from request import Request, RequestPD, RequestStatus
 from tasks import Task, TaskPool, TaskStatus
 
 
-_TERMINAL = frozenset({TaskStatus.COMPLETED, TaskStatus.CANCELLED})
+_TERMINAL = frozenset({TaskStatus.COMPLETED})
 
 
 class Simulator:
