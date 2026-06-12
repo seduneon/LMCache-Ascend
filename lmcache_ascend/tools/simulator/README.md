@@ -33,11 +33,11 @@ Preemption frees KV and resets the request; it does not touch the task pool — 
 
 `Scheduler.schedule()` per engine, once per step:
 
-1. **RUNNING** (FCFS) — decode output: 1 token/request (`block_size`), subject to shared `token_budget`; allocate with preempt loop.
-2. **WAITING** (if no preempt this step) — admit while `len(running) < max_num_seqs` and `token_budget > 0`; full prefix `lookup` (no preempt on waiting path).
-3. Phase from request cursor: `req.is_prefill_chunk()` ↔ vLLM `num_computed_tokens < prompt_len`.
+1. **RUNNING** (FCFS) — decode output (1 token/request) or prefill continuation when `is_prefill_chunk()`, capped by shared `token_budget`; allocate with preempt loop.
+2. **WAITING** (if no preempt this step) — admit while `len(running) < max_num_seqs` and `token_budget > 0`; prefix `lookup` on full prefix or a chunk when `enable_chunked_prefill` (no preempt on waiting path).
+3. Phase from request cursor: `req.is_prefill_chunk()` ↔ vLLM `num_computed_tokens < prompt_len`; `apply_batch` advances `num_computed_blocks` by blocks completed this step.
 
-Engine knobs: `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `enable_chunked_prefill` (default off).
+Engine knobs: `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `enable_chunked_prefill` (default off; enables partial prefix admit and RUNNING prefill chunks).
 
 ## Policy hooks
 
@@ -98,12 +98,11 @@ Roughly **~70%** ready for evict/pull/compute policy sweeps. Not a full vLLM clo
 
 | Gap | Affects |
 |-----|---------|
-| Chunked prefill in RUNNING | Long-prompt memory spikes |
 | Early decode wait | Async PD |
 | `num_computed_blocks` bumped in `apply_batch` not at schedule | Tight memory timing |
 | Workload generator / metrics CLI | Large sweeps |
 
-**Suggested path to ~85% policy-lab ready:** (1) free KV on complete, (2) run metrics, (3) chunked prefill if prefill+memory matters. Remaining gap vs vLLM is block-table/refcount fidelity.
+**Suggested path to ~85% policy-lab ready:** (1) free KV on complete, (2) run metrics. Remaining gap vs vLLM is block-table/refcount fidelity.
 
 ## PD 1P1D
 
@@ -142,6 +141,5 @@ Pull requires source `RESIDENT` (decode spawned after prefill completes). No sha
 
 1. `free_request()` on normal completion
 2. Run metrics (evictions, pulls, computes, preemptions)
-3. Chunked prefill in RUNNING path
-4. Move cursor bump to schedule time
-5. Early decode wait; workload config file
+3. Move cursor bump to schedule time
+4. Early decode wait; workload config file

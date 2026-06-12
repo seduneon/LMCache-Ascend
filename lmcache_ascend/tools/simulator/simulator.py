@@ -250,6 +250,43 @@ def run_limits_test() -> None:
     print("limits_test ok")
 
 
+def run_chunked_prefill_test() -> None:
+    """Chunked prefill: partial prefix from WAITING and continuation in RUNNING."""
+    from memory import Memory
+    from policies import LookupPolicy
+    from resource import ComputeResource
+
+    memories = {"hbm": Memory(size=100, name="hbm")}
+    policy = LookupPolicy(local_memory="hbm")
+    pool = TaskPool()
+    eng = Engine(
+        engine_id="e0",
+        requests=[],
+        pool=pool,
+        memories=memories,
+        local_memory="hbm",
+        policy=policy,
+        compute_res=ComputeResource(base_speed=1.0),
+        block_size=1,
+        max_num_batched_tokens=2,
+        enable_chunked_prefill=True,
+        work_per_block=1.0,
+    )
+    prefix = [f"p{i}" for i in range(5)]
+    req = Request("r1", 0.0, list(prefix), RequestPD.PREFILL, RequestStatus.PENDING)
+    eng.schedule_request(req)
+
+    sim = Simulator([eng], pool)
+    steps = 0
+    while sim.step():
+        steps += 1
+
+    assert len(eng.completed) == 1
+    assert eng.completed[0].num_computed_blocks == len(prefix)
+    assert steps >= 3, "5 tokens with budget 2 needs multiple prefill steps"
+    print(f"chunked_prefill_test ok steps={steps}")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -257,9 +294,13 @@ if __name__ == "__main__":
         run_deadlock_test()
     elif len(sys.argv) > 1 and sys.argv[1] == "limits":
         run_limits_test()
+    elif len(sys.argv) > 1 and sys.argv[1] == "chunked":
+        run_chunked_prefill_test()
     else:
         run_pd_demo()
         print()
         run_deadlock_test()
         print()
         run_limits_test()
+        print()
+        run_chunked_prefill_test()

@@ -64,12 +64,26 @@ class Scheduler:
     def next_arrival(self) -> float | None:
         return self.pending[0][0] if self.pending else None
 
+    def _remaining_prefill_tokens(self, req: Request) -> int:
+        return (req.prefix_block_count - req.num_computed_blocks) * self.block_size
+
+    def _blocks_for_prefill_chunk(self, req: Request, num_new_tokens: int) -> list[str]:
+        start = req.num_computed_blocks
+        if start >= req.prefix_block_count:
+            return []
+        num_blocks = (num_new_tokens + self.block_size - 1) // self.block_size
+        num_blocks = min(num_blocks, req.prefix_block_count - start)
+        return list(req.block_hashes[start : start + num_blocks])
+
     def _num_new_tokens_running(self, req: Request, token_budget: int) -> int:
-        if req.pd != RequestPD.DECODE:
-            return 0
         if req.num_computed_blocks >= req.blocks_target():
             return 0
         if req.is_prefill_chunk():
+            remaining = self._remaining_prefill_tokens(req)
+            if remaining <= 0:
+                return 0
+            return min(remaining, token_budget)
+        if req.pd != RequestPD.DECODE:
             return 0
         remaining = (req.blocks_target() - req.num_computed_blocks) * self.block_size
         if remaining <= 0:
@@ -77,7 +91,7 @@ class Scheduler:
         return min(self.block_size, remaining, token_budget)
 
     def _waiting_prefix_tokens(self, req: Request) -> int:
-        return len(req.block_hashes) * self.block_size
+        return self._remaining_prefill_tokens(req)
 
     def _entry_scheduled_tokens(self, entry: BatchEntry) -> int:
         if not any(action == "compute" for action in entry.result.blocks.values()):
@@ -97,12 +111,12 @@ class Scheduler:
                 idx += 1
                 continue
 
-            block_hashes = self._blocks_for_running_decode(req)
+            block_hashes = self._blocks_for_running(req, num_new_tokens)
             if not block_hashes:
                 idx += 1
                 continue
 
-            result = self._allocate_running(
+            result = self._allocate_blocks(
                 req, block_hashes, scheduled_ids, batch.preempted
             )
             if result is None:
@@ -134,7 +148,10 @@ class Scheduler:
                 else:
                     num_new_tokens = prefix_tokens
 
-                block_hashes = list(req.block_hashes)
+                block_hashes = self._blocks_for_prefill_chunk(req, num_new_tokens)
+                if not block_hashes:
+                    break
+
                 result = self.policy.lookup(self.memories, block_hashes)
                 if result is None:
                     break
@@ -154,19 +171,19 @@ class Scheduler:
 
         return batch
 
-    def _blocks_for_running_decode(self, req: Request) -> list[str]:
+    def _blocks_for_running(self, req: Request, num_new_tokens: int) -> list[str]:
+        if req.is_prefill_chunk():
+            return self._blocks_for_prefill_chunk(req, num_new_tokens)
         if req.pd != RequestPD.DECODE:
             return []
         if req.num_computed_blocks >= req.blocks_target():
-            return []
-        if req.num_computed_blocks < req.prefix_block_count:
             return []
 
         block_hash = f"blk:{req.req_id}:{req.num_computed_blocks}"
         req.pending_block_hash = block_hash
         return [block_hash]
 
-    def _allocate_running(
+    def _allocate_blocks(
         self,
         req: Request,
         block_hashes: list[str],
@@ -174,9 +191,11 @@ class Scheduler:
         preempted: list[Request],
     ) -> LookupResult | None:
         local = self._local()
-        actions = {h: "compute" for h in block_hashes}
-        exclude = set(block_hashes)
+        actions = self.policy.resolve_actions(self.memories, block_hashes)
+        if actions is None:
+            return None
 
+        exclude = set(block_hashes)
         while True:
             evicts = self.policy.eviction_policy.plan(
                 local, self.policy.slots_needed(actions), exclude

@@ -183,12 +183,12 @@ class Engine:
 
         for entry in batch.entries:
             req = entry.req
-            if req.num_computed_blocks < req.prefix_block_count:
-                req.num_computed_blocks = req.prefix_block_count
-            elif req.pending_block_hash is not None:
+            if req.pending_block_hash is not None:
                 req.block_hashes.append(req.pending_block_hash)
                 req.pending_block_hash = None
                 req.num_computed_blocks += 1
+            else:
+                req.num_computed_blocks += len(entry.block_hashes)
 
             if req.num_computed_blocks >= req.blocks_target():
                 self.scheduler.finish_request(req)
