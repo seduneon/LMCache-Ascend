@@ -23,8 +23,7 @@ def _is_ready(task: "Task") -> bool:
 
 
 class Task(ABC):
-    def __init__(self, work_left: float, resource: Resource, req_id: str | None = None):
-        self.req_id = req_id
+    def __init__(self, work_left: float, resource: Resource):
         self.wake: list[Task] = []
         self.prereqs: list[Task] = []
         self.work_left = work_left
@@ -123,12 +122,32 @@ class MemoryTask(Task):
         resource: Resource,
         memory: Memory,
         block: KVBlock,
-        req_id: str | None = None,
     ):
-        super().__init__(work_left, resource, req_id=req_id)
+        super().__init__(work_left, resource)
         self.memory = memory
         self.block = block
         self.block_hash = block.hash
+
+
+class ForwardTask(Task):
+    """One batched model forward (vLLM: single GPU step for all compute in the batch)."""
+
+    def __init__(
+        self,
+        work_left: float,
+        resource: Resource,
+        blocks: list[KVBlock],
+    ):
+        super().__init__(work_left, resource)
+        self.blocks = blocks
+
+    def on_start(self) -> None:
+        for block in self.blocks:
+            block.state = BlockState.LOADING
+
+    def on_end(self) -> None:
+        for block in self.blocks:
+            block.state = BlockState.RESIDENT
 
 
 class LoadTask(MemoryTask):

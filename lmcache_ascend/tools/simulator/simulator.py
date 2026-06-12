@@ -212,12 +212,54 @@ def run_deadlock_test() -> None:
     print(f"r2 computed={by_id['r2'].num_computed_blocks}/{by_id['r2'].total_blocks()}")
 
 
+def run_limits_test() -> None:
+    """max_num_seqs and max_num_batched_tokens (vLLM scheduler limits)."""
+    from memory import Memory
+    from policies import LookupPolicy
+    from resource import ComputeResource
+    from scheduler import Scheduler
+
+    memories = {"hbm": Memory(size=100, name="hbm")}
+    policy = LookupPolicy(local_memory="hbm")
+    sched = Scheduler(
+        policy, memories, "hbm", max_num_seqs=1, max_num_batched_tokens=10, block_size=1
+    )
+    r1 = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
+    r2 = Request("r2", 0.0, ["b"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
+    r1.prefix_block_count = 1
+    r2.prefix_block_count = 1
+    sched.waiting.extend([r1, r2])
+    batch = sched.schedule()
+    assert len(batch.entries) == 1, "max_num_seqs=1 admits one waiting request"
+    assert len(sched.waiting) == 1
+    assert len(sched.running) == 1
+
+    sched2 = Scheduler(
+        policy, memories, "hbm", max_num_seqs=10, max_num_batched_tokens=2, block_size=1
+    )
+    for rid in ("r1", "r2", "r3"):
+        req = Request(
+            rid, 0.0, ["p"], RequestPD.DECODE, RequestStatus.RUNNING, max_output_blocks=2
+        )
+        req.prefix_block_count = 1
+        req.num_computed_blocks = 1
+        sched2.running.append(req)
+    batch2 = sched2.schedule()
+    assert len(batch2.entries) == 2, "token_budget=2 schedules two decode reqs"
+    assert batch2.total_num_scheduled_tokens == 2
+    print("limits_test ok")
+
+
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "deadlock":
         run_deadlock_test()
+    elif len(sys.argv) > 1 and sys.argv[1] == "limits":
+        run_limits_test()
     else:
         run_pd_demo()
         print()
         run_deadlock_test()
+        print()
+        run_limits_test()

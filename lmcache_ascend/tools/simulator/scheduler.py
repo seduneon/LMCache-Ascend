@@ -11,12 +11,14 @@ class BatchEntry:
     req: Request
     block_hashes: list[str]
     result: LookupResult
+    num_scheduled_tokens: int = 0
 
 
 @dataclass
 class Batch:
     entries: list[BatchEntry] = field(default_factory=list)
     preempted: list[Request] = field(default_factory=list)
+    total_num_scheduled_tokens: int = 0
 
 
 class Scheduler:
@@ -27,12 +29,19 @@ class Scheduler:
         policy: LookupPolicy,
         memories: dict,
         local_memory: str,
-        max_blocks_per_step: int = 10_000,
+        *,
+        max_num_seqs: int = 10_000,
+        max_num_batched_tokens: int = 10_000,
+        block_size: int = 1,
+        enable_chunked_prefill: bool = False,
     ):
         self.policy = policy
         self.memories = memories
         self.local_memory = local_memory
-        self.max_blocks_per_step = max_blocks_per_step
+        self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.block_size = block_size
+        self.enable_chunked_prefill = enable_chunked_prefill
 
         self.pending: list[tuple[float, str, Request]] = []
         self.waiting: deque[Request] = deque()
@@ -55,15 +64,40 @@ class Scheduler:
     def next_arrival(self) -> float | None:
         return self.pending[0][0] if self.pending else None
 
+    def _num_new_tokens_running(self, req: Request, token_budget: int) -> int:
+        if req.pd != RequestPD.DECODE:
+            return 0
+        if req.num_computed_blocks >= req.blocks_target():
+            return 0
+        if req.is_prefill_chunk():
+            return 0
+        remaining = (req.blocks_target() - req.num_computed_blocks) * self.block_size
+        if remaining <= 0:
+            return 0
+        return min(self.block_size, remaining, token_budget)
+
+    def _waiting_prefix_tokens(self, req: Request) -> int:
+        return len(req.block_hashes) * self.block_size
+
+    def _entry_scheduled_tokens(self, entry: BatchEntry) -> int:
+        if not any(action == "compute" for action in entry.result.blocks.values()):
+            return 0
+        return entry.num_scheduled_tokens
+
     def schedule(self) -> Batch:
         batch = Batch()
         scheduled_ids: set[str] = set()
-        block_budget = self.max_blocks_per_step
+        token_budget = self.max_num_batched_tokens
 
         idx = 0
-        while idx < len(self.running) and block_budget > 0:
+        while idx < len(self.running) and token_budget > 0:
             req = self.running[idx]
-            block_hashes = self._blocks_for_running(req)
+            num_new_tokens = self._num_new_tokens_running(req, token_budget)
+            if num_new_tokens == 0:
+                idx += 1
+                continue
+
+            block_hashes = self._blocks_for_running_decode(req)
             if not block_hashes:
                 idx += 1
                 continue
@@ -75,34 +109,52 @@ class Scheduler:
                 idx += 1
                 continue
 
-            batch.entries.append(BatchEntry(req, block_hashes, result))
+            entry = BatchEntry(req, block_hashes, result, num_new_tokens)
+            batch.entries.append(entry)
             scheduled_ids.add(req.req_id)
-            block_budget -= self.policy.slots_needed(result.blocks)
+            scheduled = self._entry_scheduled_tokens(entry)
+            token_budget -= scheduled
+            batch.total_num_scheduled_tokens += scheduled
             idx += 1
 
-        while self.waiting and block_budget > 0:
-            req = self.waiting[0]
-            req.prefix_block_count = len(req.block_hashes)
-            block_hashes = list(req.block_hashes)
+        if not batch.preempted:
+            while self.waiting and token_budget > 0:
+                if len(self.running) >= self.max_num_seqs:
+                    break
 
-            result = self.policy.lookup(self.memories, block_hashes)
-            if result is None:
-                break
+                req = self.waiting[0]
+                req.prefix_block_count = len(req.block_hashes)
+                prefix_tokens = self._waiting_prefix_tokens(req)
 
-            slots = self.policy.slots_needed(result.blocks)
-            if slots > block_budget:
-                break
+                if not self.enable_chunked_prefill and prefix_tokens > token_budget:
+                    break
 
-            self.waiting.popleft()
-            req.status = RequestStatus.RUNNING
-            self.running.append(req)
-            batch.entries.append(BatchEntry(req, block_hashes, result))
-            scheduled_ids.add(req.req_id)
-            block_budget -= slots
+                if self.enable_chunked_prefill:
+                    num_new_tokens = min(prefix_tokens, token_budget)
+                else:
+                    num_new_tokens = prefix_tokens
+
+                block_hashes = list(req.block_hashes)
+                result = self.policy.lookup(self.memories, block_hashes)
+                if result is None:
+                    break
+
+                entry = BatchEntry(req, block_hashes, result, num_new_tokens)
+                scheduled = self._entry_scheduled_tokens(entry)
+                if scheduled > token_budget:
+                    break
+
+                self.waiting.popleft()
+                req.status = RequestStatus.RUNNING
+                self.running.append(req)
+                batch.entries.append(entry)
+                scheduled_ids.add(req.req_id)
+                token_budget -= scheduled
+                batch.total_num_scheduled_tokens += scheduled
 
         return batch
 
-    def _blocks_for_running(self, req: Request) -> list[str]:
+    def _blocks_for_running_decode(self, req: Request) -> list[str]:
         if req.pd != RequestPD.DECODE:
             return []
         if req.num_computed_blocks >= req.blocks_target():

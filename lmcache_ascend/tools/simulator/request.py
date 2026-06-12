@@ -34,3 +34,7 @@ class Request:
         if self.pd == RequestPD.PREFILL:
             return self.prefix_block_count
         return self.total_blocks()
+
+    def is_prefill_chunk(self) -> bool:
+        """vLLM: num_computed_tokens < prompt length (here: prefix blocks)."""
+        return self.num_computed_blocks < self.prefix_block_count

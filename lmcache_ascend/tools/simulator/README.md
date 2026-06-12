@@ -150,12 +150,23 @@ def step(self):
 
 `num_computed_blocks` is the single cursor. Output block IDs are assigned when scheduled (`blk:{req_id}:{index}`) and appended to `block_hashes` when the batch completes.
 
+### Batched forward (compute time)
+
+Each engine step with compute uses one `ForwardTask` per batch (vLLM: single GPU forward):
+
+- Phase from request cursor (vLLM `is_prefill_chunk`): `num_computed_blocks < prefix_block_count`
+- **Prefill** cost: `work_per_prefill_token × (compute_blocks × block_size)`
+- **Decode** cost: `work_per_decode_req × num_decode_entries` (1 token/request/step)
+- **Pull** and **evict** stay as separate `LoadTask` / `EvictTask`; forward runs after they complete
+
+Defaults: `block_size=1`, `work_per_prefill_token=work_per_block`, `work_per_decode_req=work_per_block`.
+
 ## Known gaps and divergences from vLLM
 
 ### Critical problems (can cause wrong or fragile behavior)
 
-**No batch / concurrency limits (`max_num_seqs`, `token_budget`)**  
-vLLM caps how many sequences run and how many tokens are scheduled per step. `Scheduler.schedule()` can still place many running decode requests (one block each) in one batch with no global token cap.
+**~~No batch / concurrency limits~~** *(partial — steps A–C)*  
+`max_num_seqs` caps waiting admit (`len(running)`). `max_num_batched_tokens` is shared `token_budget` per step (RUNNING decode first, then WAITING). `num_scheduled_tokens` on each `BatchEntry`. Chunked prefill in RUNNING path not yet implemented (step D).
 
 **Prefill is not in the RUNNING schedule loop**  
 Prefill is admitted from `WAITING` as a full-prefix batch entry. vLLM schedules running prefills incrementally (chunked prefill) with the same allocate/preempt loop.
@@ -209,7 +220,7 @@ Readiness is derived from prereq **status** (`_is_ready`: all prereqs `COMPLETED
 
 ### Planned improvements (highest impact first)
 
-1. `max_running_reqs` + per-step schedule budget (even “1 block total per engine per step”)
+1. ~~`max_num_seqs` + `max_num_batched_tokens`~~ *(done — steps A–C; chunked prefill step D pending)*
 2. Unified allocate/preempt for chunked prefill in the RUNNING path
 3. Move `num_computed_blocks` bump to schedule time, not `apply_batch`
 4. `free_request()` on normal completion, not just `release_request()`
