@@ -12,15 +12,12 @@ class Simulator:
         self,
         engines: list[Engine],
         pool: TaskPool,
-        spawn_decode: dict[str, str] | None = None,
         pd: PDConfig | None = None,
     ):
         self.engines = {eng.engine_id: eng for eng in engines}
         self.pool = pool
         self.pd = pd
-        if pd and spawn_decode and spawn_decode != pd.spawn_map:
-            raise ValueError("spawn_decode conflicts with pd.spawn_map; use PDConfig only")
-        self.spawn_decode = pd.spawn_map if pd else (spawn_decode or {})
+        self.spawn_map: dict[str, str] = pd.spawn_map if pd else {}
         if pd is not None:
             pd.validate_and_apply(self.engines)
         self.now = 0.0
@@ -99,7 +96,7 @@ class Simulator:
 
         for eng in self.engines.values():
             for req in completed_by_engine[eng.engine_id]:
-                decode_id = self.spawn_decode.get(eng.engine_id)
+                decode_id = self.spawn_map.get(eng.engine_id)
                 if decode_id is None or req.pd != RequestPD.PREFILL:
                     continue
                 decode_eng = self.engines[decode_id]

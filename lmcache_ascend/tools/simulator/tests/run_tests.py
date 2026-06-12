@@ -254,32 +254,6 @@ def run_pd_read_test() -> None:
     print(f"pd_read_test ok finish_time={finish}")
 
 
-def run_resolve_pull_actions_test() -> None:
-    from memory import BlockState, Memory
-    from policies import LookupPolicy
-
-    memories = {
-        "npu-0:hbm": Memory(size=10, name="npu-0:hbm"),
-        "npu-1:hbm": Memory(size=10, name="npu-1:hbm"),
-    }
-    for block_hash in ("a", "b"):
-        memories["npu-0:hbm"].append_reserved(block_hash, "producer")
-        block = memories["npu-0:hbm"].find_reserved_for(block_hash, "producer")
-        block.state = BlockState.RESIDENT
-
-    policy = LookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
-    block_hashes = ["a", "b", "c"]
-
-    actions = policy.resolve_actions(memories, block_hashes)
-    assert actions is not None
-    assert actions["c"] == "compute"
-
-    pull_actions = policy.resolve_pull_actions(memories, block_hashes)
-    assert pull_actions is None, "missing source block must not fall back to compute"
-
-    print("resolve_pull_actions_test ok")
-
-
 def run_remote_kv_admit_test() -> None:
     from memory import BlockState, Memory
     from policies import LookupPolicy
@@ -483,7 +457,6 @@ def run_pd_config_validation_test() -> None:
 _ALL = {
     "pd": [
         run_pd_read_test,
-        run_resolve_pull_actions_test,
         run_remote_kv_admit_test,
         run_pd_backpressure_test,
         run_remote_kv_max_seqs_test,
@@ -498,15 +471,22 @@ _ALL = {
 
 
 def main(argv: list[str] | None = None) -> None:
+    from tests.test_unit import run_unit_tests
+
     argv = argv if argv is not None else sys.argv[1:]
     if argv:
         key = argv[0]
+        if key == "unit":
+            run_unit_tests()
+            return
         if key not in _ALL:
             raise SystemExit(f"unknown test group: {key!r}")
         for test in _ALL[key]:
             test()
         return
 
+    run_unit_tests()
+    print()
     run_pd_demo()
     print()
     run_deadlock_test()

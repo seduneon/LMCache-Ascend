@@ -89,12 +89,6 @@ class LookupPolicy:
             actions[block_hash] = resolution
         return actions
 
-    def resolve_pull_actions(
-        self, memories: dict[str, Memory], block_hashes: list[str]
-    ) -> BlockActions | None:
-        """Remote-KV admit: every non-local block must be pullable (no compute fallback)."""
-        return self.resolve_actions(memories, block_hashes, allow_compute=False)
-
     def _resolve_block(
         self,
         memories: dict[str, Memory],

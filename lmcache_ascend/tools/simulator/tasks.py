@@ -14,25 +14,23 @@ class TaskStatus(StrEnum):
 _TERMINAL = frozenset({TaskStatus.COMPLETED})
 
 
-def _is_ready(task: "Task") -> bool:
-    if task.status != TaskStatus.PENDING:
-        return False
-    if not task.prereqs:
-        return True
-    return all(p.status == TaskStatus.COMPLETED for p in task.prereqs)
-
-
 class Task(ABC):
     def __init__(self, work_left: float, resource: Resource):
-        self.wake: list[Task] = []
         self.prereqs: list[Task] = []
         self.work_left = work_left
         self.resource = resource
         self.status = TaskStatus.PENDING
 
+    def is_ready(self) -> bool:
+        if self.status != TaskStatus.PENDING:
+            return False
+        return not self.prereqs or all(
+            p.status == TaskStatus.COMPLETED for p in self.prereqs
+        )
+
     def start(self, time: float) -> None:
         assert self.status == TaskStatus.PENDING
-        assert _is_ready(self)
+        assert self.is_ready()
         self.status = TaskStatus.RUNNING
         self.now = time
         self.resource.add()
@@ -57,7 +55,6 @@ class Task(ABC):
         self.resource.remove()
         self.on_end()
         self.status = TaskStatus.COMPLETED
-        self.wake.clear()
 
     @abstractmethod
     def on_start(self) -> None:
@@ -81,25 +78,16 @@ class TaskPool:
         return [t for t in input if t.status not in _TERMINAL]
 
     def add(self, task: Task, prereqs: list[Task]) -> None:
-        prereqs = self.filter(prereqs)
-        task.prereqs = list(prereqs)
-        for prereq in prereqs:
-            prereq.wake.append(task)
+        task.prereqs = self.filter(prereqs)
         self.tasks.append(task)
 
     def ready(self) -> list[Task]:
         self.tasks = self.filter(self.tasks)
-        return [t for t in self.tasks if _is_ready(t)]
+        return [t for t in self.tasks if t.is_ready()]
 
     def running(self) -> list[Task]:
         self.tasks = self.filter(self.tasks)
         return [t for t in self.tasks if t.status == TaskStatus.RUNNING]
-
-    def next(self) -> float | None:
-        running = self.running()
-        if not running:
-            return None
-        return min(t.estimated_end() for t in running)
 
     def start_ready(self, t: float) -> None:
         for task in self.ready():
@@ -126,7 +114,6 @@ class MemoryTask(Task):
         super().__init__(work_left, resource)
         self.memory = memory
         self.block = block
-        self.block_hash = block.hash
 
 
 class ForwardTask(Task):

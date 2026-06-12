@@ -10,6 +10,7 @@ python3.12 simulator.py limits     # max_num_seqs / token_budget test only
 python3.12 simulator.py chunked    # chunked prefill test
 python3.12 simulator.py pd         # PD read-mode + remote-KV tests
 python3.12 simulator.py waiting    # waiting preempt + queue rotation
+python3.12 simulator.py unit       # unit tests only
 ```
 
 ## Architecture
@@ -23,7 +24,8 @@ python3.12 simulator.py waiting    # waiting preempt + queue rotation
 | `policies.py` | `LookupPolicy` (pull/compute), `EvictionPolicy` |
 | `tasks.py` | `ForwardTask` (batched compute), `LoadTask` (pull), `EvictTask` |
 | `memory.py` | Content-keyed slot budget, holders, block states |
-| `tests/run_tests.py` | Integration and unit tests |
+| `tests/run_tests.py` | Integration tests and CLI |
+| `tests/test_unit.py` | Policy, task, memory, scheduler unit tests |
 
 Each `Simulator.step()`:
 

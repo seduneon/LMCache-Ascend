@@ -70,12 +70,6 @@ class Memory:
             None,
         )
 
-    def evicting(self, block_hash: str) -> KVBlock | None:
-        return next(
-            (b for b in self.get(block_hash) if b.state == BlockState.EVICTING),
-            None,
-        )
-
     def find_reserved_for(self, block_hash: str, req_id: str) -> KVBlock | None:
         for block in reversed(self.get(block_hash)):
             if (
@@ -93,13 +87,6 @@ class Memory:
         block = KVBlock(block_hash, BlockState.RESERVED, holders={req_id})
         self.append(block)
         return block
-
-    def release_request(self, req_id: str) -> None:
-        for copies in list(self.blocks.values()):
-            for block in list(copies):
-                block.holders.discard(req_id)
-                if block.state == BlockState.RESERVED and not block.holders:
-                    self.remove_block(block)
 
     def free_request(self, req_id: str) -> None:
         """Drop all KV state for a request (vLLM kv_cache_manager.free)."""

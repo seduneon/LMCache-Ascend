@@ -71,7 +71,6 @@ class Engine:
             work_per_decode_req if work_per_decode_req is not None else work_per_block
         )
         self.hold_kv_on_complete = hold_kv_on_complete
-        self._remote_kv_wait = remote_kv_wait
 
         self.scheduler = Scheduler(
             policy=policy,
@@ -104,7 +103,6 @@ class Engine:
 
     @remote_kv_wait.setter
     def remote_kv_wait(self, enabled: bool) -> None:
-        self._remote_kv_wait = enabled
         self.scheduler.remote_kv_wait = enabled
 
     def _local(self) -> Memory:
