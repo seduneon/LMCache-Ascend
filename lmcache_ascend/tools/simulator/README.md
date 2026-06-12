@@ -1,232 +1,147 @@
 # KV Cache Simulator
 
-Discrete-event simulator for KV cache admission, eviction, compute, and PD transfer.
+Discrete-event simulator for KV cache scheduling, eviction, compute, and PD transfer. Block-grained workflow model aligned with vLLM’s batch scheduler (not a cycle-accurate GPU sim).
 
 ```bash
 cd lmcache_ascend/tools/simulator
-python3.12 simulator.py            # PD demo + deadlock test
-python3.12 simulator.py deadlock   # deadlock / preemption test only
+python3.12 simulator.py            # PD demo + deadlock + limits tests
+python3.12 simulator.py deadlock   # preemption test only
+python3.12 simulator.py limits     # max_num_seqs / token_budget test only
 ```
 
-## PD disaggregation — 1P1D event mapping
+## Architecture
 
-Minimal **1 prefill NPU + 1 decode NPU**, one logical request `req_id="r1"`, prefix blocks `["a","b","c"]`.
-
-### Naming (many NPUs / HBMs)
-
-Do **not** name memories by role (`hbm_p`, `hbm_d`). Use stable **instance / tier keys**:
-
-```python
-memories = {
-    "npu-0:hbm": Memory(size=100, name="npu-0:hbm"),  # prefill in 1P1D
-    "npu-1:hbm": Memory(size=100, name="npu-1:hbm"),  # decode in 1P1D
-}
-
-Engine(
-    engine_id="npu-0",
-    role=RequestPD.PREFILL,
-    local_memory="npu-0:hbm",   # where this engine reserves/loads
-    memories=memories,            # full map; lookup may read other tiers
-)
-```
-
-- **`engine_id`** — NPU instance (`npu-0`, `npu-1`, …). Role (prefill/decode) lives on `Engine`, not on memory names.
-- **`local_memory`** — this engine's primary KV tier (usually `"{engine_id}:hbm"`).
-- **`memories` keys** — any tier on any NPU (`npu-2:ssd`, `npu-0:cpu`, …).
-- **Pull source** — `("pull", "npu-0:hbm")`, not `("pull", "prefill")`. The source is a **memory key**, not a role.
-
-1P1D is just `npu-0` = producer, `npu-1` = consumer. XpYd is more engines with the same keys.
-
-### Components to add
-
-| New piece | vLLM analogue |
-|-----------|----------------|
-| `Engine(engine_id, role, local_memory)` | vLLM instance / `kv_producer` or `kv_consumer` |
-| `memories: dict[str, Memory]` | per-NPU KV pools (and later SSD/CPU tiers) |
-| `LookupPolicy` | local hit skip; optional `pull_sources`; else compute |
-| `LoadTask` on `BandwidthResource` (pull) | `start_load_kv` |
-| Same `req_id` on both engines | `request_id` in KV connector metadata |
-| `Simulator` loops all engines | global clock |
-
-### Example workload
-
-```
-# Same req_id (vLLM: request_id links producer send ↔ consumer recv)
-npu-0: Request(req_id="r1", pd=PREFILL, arrival=0,   blocks=[a,b,c])
-npu-1: Request(req_id="r1", pd=DECODE,  arrival=3*, blocks=[a,b,c])  (* spawned when prefill completes)
-```
-
-Decode may also arrive early and sit in `WAITING` until blocks are `RESIDENT` on `npu-0:hbm` (like `get_num_new_matched_tokens` returning `None`).
-
-### vLLM step → simulator events
-
-Assume `work=1`, `bandwidth` speed `1`, no eviction, HBM large enough.
-
-| Time | vLLM step | Simulator events |
-|------|-----------|------------------|
-| **0** | Client → proxy → prefill | `npu-0.release_arrivals(0)`: `r1` → `WAITING` |
-| **0** | Prefill admits | `npu-0.admit()`: lookup → `{blocks:{a,b,c:compute}}`; reserve on `npu-0:hbm`; `Load(a)→Load(b)→Load(c)` |
-| **0–3** | Prefill forward (3 blocks) | Compute advances; at **t=3** a,b,c `RESIDENT` on `npu-0:hbm` |
-| **3** | Prefill `request_finished` | `r1` prefill → `COMPLETE`; spawn `r1` decode on `npu-1` at `now=3` |
-| **3** | Decode engine sees request | `npu-1.release_arrivals(3)`: `r1` → `WAITING` |
-| **3** | `get_num_new_matched_tokens` | `npu-1.admit()`: a,b,c on `npu-0:hbm` → `{blocks:{a,b,c:("pull","npu-0:hbm")}}`; reserve on `npu-1:hbm`; 3× pull `LoadTask` |
-| **3–6** | `start_load_kv` (pull) | `LoadTask` on `BandwidthResource`; dst blocks `RESIDENT` on `npu-1:hbm` |
-| **6** | Decode KV ready | Transfers done; `r1` decode tasks complete → `COMPLETE` |
-
-**End-to-end finish ≈ 6 + max_output_blocks** (3 prefill compute + 3 transfer + 1 compute per generated block).
-
-### Task DAG (req_id r1)
-
-```
-npu-0 (npu-0:hbm):
-  Load(a) → Load(b) → Load(c)
-
-npu-1 (npu-1:hbm), after t=3:
-  Load(a, bandwidth) → Load(b) → Load(c)   # pull from npu-0:hbm
-```
-
-Cross-engine prereq (if decode admitted before prefill done): each pull `LoadTask` prereqs on prefill `LoadTask` for same hash.
-
-### Lookup rules
-
-`LookupPolicy(local_memory, pull_sources=[])` — compute-only misses. With `pull_sources` (e.g. `["npu-0:hbm"]`):
-
-```python
-if local hit or loading:                 skip
-elif memories[src].best_resident(h):     ("pull", src)   # first matching src
-elif memories[src].inflight_incoming(h): None  # wait
-else:                                    "compute"
-```
-
-### Admission / spawn
-
-**Option B (recommended):** prefill `COMPLETE` → inject decode request with the **same `req_id`**:
-
-```python
-def on_prefill_complete(req_id, finish_time, blocks):
-    decode_pending.append(Request(req_id, finish_time, blocks, pd=DECODE, ...))
-```
-
-**Early decode (vLLM async):** decode in `WAITING` at t=0; `lookup → None` until prefill loads finish; retry each `step()`.
-
-Pull uses the same `LoadTask` as compute on `BandwidthResource`. Schedule requires the source block to be `RESIDENT` (no cross-request task prereq on the producer).
-
-### Simulator loop (vLLM batch scheduling)
+| File | Role |
+|------|------|
+| `scheduler.py` | Queues, `schedule()` → `Batch` (RUNNING → WAITING, preempt at allocate) |
+| `engine.py` | `execute_batch()` (reserve, tasks), `apply_batch()` (advance state) |
+| `simulator.py` | Global clock, multi-engine step, PD spawn |
+| `policies.py` | `LookupPolicy` (pull/compute), `EvictionPolicy` |
+| `tasks.py` | `ForwardTask` (batched compute), `LoadTask` (pull), `EvictTask` |
+| `memory.py` | Content-keyed slot budget, holders, block states |
 
 Each `Simulator.step()`:
 
+1. `release_arrivals`
+2. Per engine: `batch = schedule()` → `execute_batch(batch)`
+3. Drain all batch tasks
+4. `apply_batch(batch)`; spawn decode on prefill complete
+
+Preemption frees KV and resets the request; it does not touch the task pool — the step drains before the next `schedule()`.
+
+## Scheduling (vLLM-shaped)
+
+`Scheduler.schedule()` per engine, once per step:
+
+1. **RUNNING** (FCFS) — decode output: 1 token/request (`block_size`), subject to shared `token_budget`; allocate with preempt loop.
+2. **WAITING** (if no preempt this step) — admit while `len(running) < max_num_seqs` and `token_budget > 0`; full prefix `lookup` (no preempt on waiting path).
+3. Phase from request cursor: `req.is_prefill_chunk()` ↔ vLLM `num_computed_tokens < prompt_len`.
+
+Engine knobs: `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `enable_chunked_prefill` (default off).
+
+## Policy hooks
+
+### Eviction — `EvictionPolicy`
+
 ```python
-def step(self):
-    for eng in self.engines:
-        eng.release_arrivals(self.now)
-    for eng in self.engines:
-        batch = eng.schedule()          # Scheduler: RUNNING → WAITING, preempt at allocate
-        eng.execute_batch(batch)        # reserve + enqueue tasks for this batch only
-    drain until all batch tasks complete
-    for eng in self.engines:
-        eng.apply_batch(batch)          # advance num_computed_blocks, finish requests
-    spawn decode on prefill complete
+class MyEviction(EvictionPolicy):
+    def pick_victims(self, hbm, count, exclude) -> list[KVBlock]: ...
+
+LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())
 ```
 
-- **`scheduler.py`** — queues, `Batch` / `BatchEntry`, preempt while building the batch (victims not in the current batch).
-- **`engine.py`** — `execute_batch()` + `apply_batch()` only; no mid-step admit/schedule loops.
-- Preempt does not touch the task pool — a step drains fully before the next `schedule()`; preemption only frees KV and resets request state.
-- **Pull prereqs** — no shared `src_block.task` dependency; schedule requires source `RESIDENT` (decode spawned after prefill completes).
+`plan()` computes slot deficit and calls `pick_victims`. Victims must be `RESIDENT` with `len(holders)==0` (`memory.can_evict_block`).
 
-### Implemented (PD v1)
+### Pull / compute — `LookupPolicy`
 
-- `BandwidthResource`, pull via `LoadTask`, `LookupPolicy(pull_sources=...)`
-- `Engine(engine_id, local_memory, ...)`, pull via `("pull", memory_key)`
-- Multi-engine `Simulator`, `spawn_decode={"npu-0": "npu-1"}`
+```python
+LookupPolicy(
+    local_memory="npu-1:hbm",
+    pull_sources=["npu-0:hbm", "npu-0:ssd"],  # first resident source wins
+)
+```
 
-### Scheduling (vLLM-aligned)
+Per block: local hit → skip; else pull from first source with `RESIDENT` block; else `compute`. `lookup → None` if a pull source has the block inflight (not implemented: early decode wait).
 
-`Scheduler.schedule()` per engine, once per sim step:
+### Compute / transfer cost — `Engine` + `ForwardTask`
 
-1. **RUNNING** — each decode request gets 1 output block; `allocate` with preempt loop (FCFS tail, skip requests already in this batch).
-2. **WAITING** — admit head while block budget remains; full prefix `lookup` (no preempt on waiting path).
-3. **`execute_batch`** — reserve + build task DAG for all entries; sim drains this batch before the next step.
-4. **`apply_batch`** — advance `num_computed_blocks`, append output hashes, finish requests.
+- One `ForwardTask` per engine batch (all compute blocks in the step).
+- Prefill cost: `work_per_prefill_token × num_scheduled_tokens`
+- Decode cost: `work_per_decode_req × num_decode_entries_with_compute`
+- Pull: `work_per_transfer` on `BandwidthResource`; evict: `work_per_evict`
 
-`num_computed_blocks` is the single cursor. Output block IDs are assigned when scheduled (`blk:{req_id}:{index}`) and appended to `block_hashes` when the batch completes.
+## Policy experiment readiness
 
-### Batched forward (compute time)
+Roughly **~70%** ready for evict/pull/compute policy sweeps. Not a full vLLM clone.
 
-Each engine step with compute uses one `ForwardTask` per batch (vLLM: single GPU forward):
+### Ready now
 
-- Phase from request cursor (vLLM `is_prefill_chunk`): `num_computed_blocks < prefix_block_count`
-- **Prefill** cost: `work_per_prefill_token × (compute_blocks × block_size)`
-- **Decode** cost: `work_per_decode_req × num_decode_entries` (1 token/request/step)
-- **Pull** and **evict** stay as separate `LoadTask` / `EvictTask`; forward runs after they complete
+| Experiment | Hook |
+|------------|------|
+| Pull source order (1P1D) | `pull_sources` list order |
+| Compute vs transfer cost | `work_per_prefill_token`, `work_per_decode_req`, `work_per_transfer` |
+| Memory pressure + preempt | `Memory(size)`, deadlock scenario |
+| Batch limits | `max_num_seqs`, `max_num_batched_tokens` |
+| Custom eviction | `EvictionPolicy.pick_victims` |
 
-Defaults: `block_size=1`, `work_per_prefill_token=work_per_block`, `work_per_decode_req=work_per_block`.
+### Usable with caveats
 
-## Known gaps and divergences from vLLM
+- **Eviction under load** — running requests pin blocks via `holders`; only unheld `RESIDENT` blocks evict. Pressure is often preemption-driven, not cache replacement. Fine for relative policy comparison if you understand the model.
+- **Prefix hits** — implicit via `best_resident`; no ref-counted block pool like vLLM.
 
-### Critical problems (can cause wrong or fragile behavior)
+### Fix before trusting eviction/memory studies
 
-**~~No batch / concurrency limits~~** *(partial — steps A–C)*  
-`max_num_seqs` caps waiting admit (`len(running)`). `max_num_batched_tokens` is shared `token_budget` per step (RUNNING decode first, then WAITING). `num_scheduled_tokens` on each `BatchEntry`. Chunked prefill in RUNNING path not yet implemented (step D).
+1. **`free_request()` on completion** — today `release_request()` leaves `RESIDENT` KV after finish, inflating `used_size`.
+2. **Metrics** — no built-in evict/pull/preempt counters yet (only `finish_time` from demos).
 
-**Prefill is not in the RUNNING schedule loop**  
-Prefill is admitted from `WAITING` as a full-prefix batch entry. vLLM schedules running prefills incrementally (chunked prefill) with the same allocate/preempt loop.
+### Not implemented (distorts specific experiments)
 
-**Preemption only while scheduling RUNNING decode blocks**  
-Preempt runs in `Scheduler._allocate_running()` when decode output allocation fails. The `WAITING` path uses `lookup` without preempt (vLLM-aligned). A waiting request can starve until running requests free slots or are preempted.
+| Gap | Affects |
+|-----|---------|
+| Chunked prefill in RUNNING | Long-prompt memory spikes |
+| Early decode wait | Async PD |
+| `num_computed_blocks` bumped in `apply_batch` not at schedule | Tight memory timing |
+| Workload generator / metrics CLI | Large sweeps |
 
-**Completion vs schedule timing**  
-vLLM advances `num_computed_tokens` at schedule time (`_update_after_schedule`). The simulator advances `num_computed_blocks` in `apply_batch()` after the batch drains. That still shifts memory lifetime and PD spawn timing relative to vLLM.
+**Suggested path to ~85% policy-lab ready:** (1) free KV on complete, (2) run metrics, (3) chunked prefill if prefill+memory matters. Remaining gap vs vLLM is block-table/refcount fidelity.
 
-**Memory model: holders block eviction, not a block table**  
-Eviction only picks `RESIDENT` blocks with `len(holders) == 0`. Running requests pin all their blocks via holders, so pressure is entirely preemption-driven. vLLM’s paged block pool and refcounts behave differently (prefix cache blocks, shared physical slots, connector-owned blocks).
+## PD 1P1D
 
-**Completed requests leave KV resident**  
-`_finish_request` calls `release_request()`, which only removes unheld `RESERVED` blocks. `RESIDENT` KV stays in memory (holders cleared). vLLM frees via `kv_cache_manager.free()` on finish/preempt. This can inflate `used_size` and change eviction/preemption dynamics.
+Memories use instance keys, not roles:
 
-### Major modeling divergences (usually intentional)
+```python
+memories = {
+    "npu-0:hbm": Memory(size=100),
+    "npu-1:hbm": Memory(size=100),
+}
+# spawn_decode={"npu-0": "npu-1"}  — decode request injected when prefill completes
+```
+
+Typical timeline (`work=1`, large HBM, `finish_time≈11` for 3 prefix + 3 pull + 5 decode blocks):
+
+| Phase | Engine | What happens |
+|-------|--------|----------------|
+| Prefill | npu-0 | `schedule` → one `ForwardTask` for prefix blocks |
+| Transfer | npu-1 | chained pull `LoadTask`s on bandwidth |
+| Decode | npu-1 | one `ForwardTask` per step per output block |
+
+Pull requires source `RESIDENT` (decode spawned after prefill completes). No shared producer-task prereqs.
+
+## vLLM divergences (intentional simplifications)
 
 | Area | vLLM | Simulator |
 |------|------|-----------|
-| Unit of work | Tokens (variable chunk sizes) | 1 block = 1 forward |
-| Physical KV | Block table + pool | Content-keyed slot budget |
-| Prefix cache | `PrefixCacheBlock` / hash chain | Implicit via `best_resident` hit skip |
-| Output blocks | Placeholders, spec decode, async discard | `blk:{req}:{idx}` assigned at schedule |
-| Waiting admission | `allocate_slots` fails → stop | `lookup → None` (remote wait or memory) |
-| Preempt victim | FCFS `running.pop()` or priority | FCFS tail of `running` |
-| Preempt reset | `num_computed_tokens = 0`, `PREEMPTED` | `num_computed_blocks = 0`, trim prefix hashes |
-| PD | Connector, async KV load, matched tokens | Spawn decode on prefill complete; pull when src `RESIDENT` |
-| Early decode | Wait in queue until remote KV ready | Not implemented |
-| Eviction policy | LRU etc. on physical blocks | `FirstAvailableEviction` on unheld resident copies |
-| Resources | Per-worker GPU | Shared global `TaskPool` + one compute/bandwidth resource |
+| Unit of work | Tokens | Blocks (`block_size` tokens/block) |
+| Physical KV | Block table + refcounts | Content-keyed slots + holders |
+| Scheduler output | `num_scheduled_tokens` per req | `BatchEntry.num_scheduled_tokens` |
+| Preempt | `kv_cache_manager.free` | `free_request` + reset cursor |
+| PD | KV connector, async match | Spawn on prefill complete; pull if resident |
+| Eviction | LRU on physical blocks | Pluggable; default `FirstAvailableEviction` |
 
-### PD-specific gaps
+## Roadmap
 
-- **No early decode** — decode cannot sit in `WAITING` while prefill is still computing (vLLM `get_num_new_matched_tokens → None`).
-- **No producer eviction after transfer** — prefill blocks stay on the producer after pull.
-- **Spawn timing** — decode is injected only when prefill **completes**, not when KV is merely resident/transferable.
-- **Cross-engine failure modes** — source eviction or source preempt during an in-flight pull is not modeled.
-
-### What is reasonably aligned
-
-- Batch scheduling: one `schedule()` per engine per step, drain batch before next step
-- RUNNING before WAITING inside `Scheduler.schedule()`
-- Reserve-before-forward (`append_reserved` → `LoadTask`)
-- vLLM-style preempt at running allocate failure: `free_request`, reset progress, prepend to `waiting`
-- Block-level output hash assigned when scheduled, appended in `apply_batch`
-
-### Task DAG (`tasks.py`)
-
-Readiness is derived from prereq **status** (`_is_ready`: all prereqs `COMPLETED`). Each step drains its batch before the next schedule, so tasks are not aborted mid-flight.
-
-### Planned improvements (highest impact first)
-
-1. ~~`max_num_seqs` + `max_num_batched_tokens`~~ *(done — steps A–C; chunked prefill step D pending)*
-2. Unified allocate/preempt for chunked prefill in the RUNNING path
-3. Move `num_computed_blocks` bump to schedule time, not `apply_batch`
-4. `free_request()` on normal completion, not just `release_request()`
-
-### Later
-
-- Early decode wait (decode arrives before prefill done)
-- Prefill KV eviction after transfer
-- Multiple pull sources / tiers per decode policy
+1. `free_request()` on normal completion
+2. Run metrics (evictions, pulls, computes, preemptions)
+3. Chunked prefill in RUNNING path
+4. Move cursor bump to schedule time
+5. Early decode wait; workload config file
