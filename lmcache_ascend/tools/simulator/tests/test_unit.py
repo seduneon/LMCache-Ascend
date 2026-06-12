@@ -5,7 +5,7 @@ from __future__ import annotations
 from memory import BlockState, Memory
 from policies import LookupPolicy
 from request import Request, RequestPD, RequestStatus
-from resource import ComputeResource
+from resource import BandwidthResource, ComputeResource
 from scheduler import Scheduler
 from tasks import Task, TaskPool, TaskStatus
 
@@ -89,6 +89,74 @@ def test_finish_frees_kv() -> None:
     assert req in sched.completed
 
 
+def test_cost_model_picks_faster_pull_source() -> None:
+    memories = {
+        "fast": Memory(size=10, name="fast"),
+        "slow": Memory(size=10, name="slow"),
+        "dst": Memory(size=10, name="dst"),
+    }
+    _make_resident(memories["fast"], "a")
+    _make_resident(memories["slow"], "a")
+
+    fast_link = BandwidthResource(base_speed=10.0)
+    slow_link = BandwidthResource(base_speed=1.0)
+    policy = LookupPolicy(local_memory="dst", pull_sources=["slow", "fast"])
+    policy.bind_cost_model(
+        compute_res=ComputeResource(base_speed=1.0),
+        transfer_links={"fast": fast_link, "slow": slow_link},
+        work_per_transfer=1.0,
+        work_per_block=1.0,
+    )
+
+    action = policy.resolve_actions(memories, ["a"])["a"]
+    assert action == ("pull", "fast")
+
+
+def test_cost_model_prefers_compute_under_load() -> None:
+    memories = {
+        "src": Memory(size=10, name="src"),
+        "dst": Memory(size=10, name="dst"),
+    }
+    _make_resident(memories["src"], "a")
+
+    compute_res = ComputeResource(base_speed=10.0)
+    congested_link = BandwidthResource(base_speed=1.0)
+    congested_link.works = 9
+
+    policy = LookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy.bind_cost_model(
+        compute_res=compute_res,
+        transfer_links={"src": congested_link},
+        work_per_transfer=1.0,
+        work_per_block=1.0,
+    )
+
+    assert policy.resolve_actions(memories, ["a"])["a"] == "compute"
+
+
+def test_cost_model_pull_only_ignores_compute() -> None:
+    memories = {
+        "src": Memory(size=10, name="src"),
+        "dst": Memory(size=10, name="dst"),
+    }
+    _make_resident(memories["src"], "a")
+
+    compute_res = ComputeResource(base_speed=100.0)
+    slow_link = BandwidthResource(base_speed=0.1)
+
+    policy = LookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy.bind_cost_model(
+        compute_res=compute_res,
+        transfer_links={"src": slow_link},
+        work_per_transfer=1.0,
+        work_per_block=1.0,
+    )
+
+    assert policy.resolve_actions(memories, ["a"], allow_compute=False) == {
+        "a": ("pull", "src")
+    }
+
+
 def test_local_satisfied_inflight() -> None:
     memories = {"hbm": Memory(size=10, name="hbm")}
     policy = LookupPolicy("hbm")
@@ -103,6 +171,9 @@ def run_unit_tests() -> None:
     tests = [
         test_lookup_compute,
         test_pull_only_rejects_compute_fallback,
+        test_cost_model_picks_faster_pull_source,
+        test_cost_model_prefers_compute_under_load,
+        test_cost_model_pull_only_ignores_compute,
         test_task_prereq_ordering,
         test_prefix_block_count_on_arrival,
         test_finish_frees_kv,

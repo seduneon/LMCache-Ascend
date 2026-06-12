@@ -1,8 +1,13 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from memory import KVBlock, Memory
+
+if TYPE_CHECKING:
+    from resource import BandwidthResource, ComputeResource
 
 BlockAction = Literal["compute"] | tuple[Literal["pull"], str]
 BlockActions = dict[str, BlockAction]
@@ -59,6 +64,25 @@ class LookupPolicy:
         self.local_memory = local_memory
         self.pull_sources = pull_sources or []
         self.eviction_policy = eviction_policy or FirstAvailableEviction()
+        self._compute_res: ComputeResource | None = None
+        self._transfer_links: dict[str, BandwidthResource] = {}
+        self._work_per_transfer = 1.0
+        self._work_per_block = 1.0
+        self._use_cost_model = False
+
+    def bind_cost_model(
+        self,
+        *,
+        compute_res: ComputeResource | None,
+        transfer_links: dict[str, BandwidthResource] | None,
+        work_per_transfer: float,
+        work_per_block: float,
+    ) -> None:
+        self._compute_res = compute_res
+        self._transfer_links = transfer_links or {}
+        self._work_per_transfer = work_per_transfer
+        self._work_per_block = work_per_block
+        self._use_cost_model = bool(self._transfer_links and compute_res is not None)
 
     def lookup(self, memories: dict[str, Memory], block_hashes: list[str]) -> LookupResult | None:
         local = memories[self.local_memory]
@@ -100,6 +124,18 @@ class LookupPolicy:
         if self.local_satisfied(local, block_hash):
             return "local"
 
+        if not self._use_cost_model:
+            return self._resolve_block_legacy(memories, block_hash, allow_compute=allow_compute)
+
+        return self._resolve_block_cost(memories, block_hash, allow_compute=allow_compute)
+
+    def _resolve_block_legacy(
+        self,
+        memories: dict[str, Memory],
+        block_hash: str,
+        *,
+        allow_compute: bool,
+    ) -> BlockResolution:
         for src_key in self.pull_sources:
             src = memories[src_key]
             if src.inflight_incoming(block_hash) is not None:
@@ -110,6 +146,58 @@ class LookupPolicy:
         if allow_compute:
             return "compute"
         return None
+
+    def _resolve_block_cost(
+        self,
+        memories: dict[str, Memory],
+        block_hash: str,
+        *,
+        allow_compute: bool,
+    ) -> BlockResolution:
+        pull_candidates: list[tuple[float, int, str]] = []
+
+        for order, src_key in enumerate(self.pull_sources):
+            src = memories[src_key]
+            if src.inflight_incoming(block_hash) is not None:
+                return None
+            if src.best_resident(block_hash) is None:
+                continue
+
+            link = self._transfer_links.get(src_key)
+            if link is None:
+                continue
+            pull_candidates.append(
+                (
+                    link.share_time(self._work_per_transfer, link.works + 1),
+                    order,
+                    src_key,
+                )
+            )
+
+        best_pull: tuple[float, int, str] | None = (
+            min(pull_candidates, key=lambda item: (item[0], item[1]))
+            if pull_candidates
+            else None
+        )
+
+        if best_pull is None:
+            if allow_compute:
+                return "compute"
+            return None
+
+        if not allow_compute:
+            return ("pull", best_pull[2])
+
+        assert self._compute_res is not None
+        compute_res = self._compute_res
+        t_compute = compute_res.share_time(self._work_per_block, compute_res.works + 1)
+        t_pull = best_pull[0]
+
+        if t_pull < t_compute:
+            return ("pull", best_pull[2])
+        if t_compute < t_pull:
+            return "compute"
+        return ("pull", best_pull[2])
 
     def local_satisfied(self, local: Memory, block_hash: str) -> bool:
         return (

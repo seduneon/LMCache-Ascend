@@ -63,7 +63,39 @@ LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())
 
 ### Pull / compute — `LookupPolicy`
 
-Per block via `_resolve_block()`: local hit → skip; else pull from first `RESIDENT` source; else `compute` (or `None` when `allow_compute=False` for remote-KV admit).
+When `Engine` wires `transfer_links` and `compute_res`, resolution uses a **cost model**:
+
+```text
+share_time(work, sharers) = latency + work * sharers / base_speed
+t_pull(src)  = link.share_time(work_per_transfer, link.works + 1)
+t_recompute  = compute.share_time(work_per_block, compute.works + 1)
+action       = argmin(t_pull, t_recompute)   # tie → pull
+```
+
+`+1` is passed by the policy (work not yet queued). Running tasks use `share_time(work_left, works)` in `Task.estimated_end()`.
+
+Among pull sources, pick the minimum `t_pull`. Each source has its own `BandwidthResource` queue so load on one link does not affect another.
+
+Without `transfer_links`, behavior is legacy: first `RESIDENT` source in `pull_sources` order, then `compute` (or `None` when `allow_compute=False` for remote-KV admit).
+
+```python
+fast = BandwidthResource(base_speed=100.0, latency=0.01)
+slow = BandwidthResource(base_speed=1.0, latency=0.5)
+policy = LookupPolicy(
+    local_memory="npu-1:hbm",
+    pull_sources=["npu-0:ssd", "npu-0:dram"],
+)
+Engine(
+    ...,
+    policy=policy,
+    transfer_links={"npu-0:ssd": slow, "npu-0:dram": fast},
+    compute_res=ComputeResource(base_speed=50.0),
+    work_per_transfer=1.0,
+    work_per_block=1.0,
+)
+# Or one shared link for all sources (backward compatible):
+Engine(..., bandwidth_res=BandwidthResource(base_speed=10.0))
+```
 
 ## Policy experiment readiness
 
@@ -73,7 +105,8 @@ Roughly **~80%** ready for evict/pull/compute policy sweeps.
 
 | Experiment | Hook |
 |------------|------|
-| Pull source order (1P1D) | `pull_sources` list order |
+| Pull vs recompute (load-aware) | `transfer_links`, `compute_res`, `work_per_transfer`, `work_per_block` |
+| Pull source tie-break | `pull_sources` list order when costs equal |
 | Compute vs transfer cost | `work_per_prefill_token`, `work_per_decode_req`, `work_per_transfer` |
 | Memory pressure + preempt | `Memory(size)`, deadlock + waiting preempt tests |
 | Batch limits | `max_num_seqs`, `max_num_batched_tokens` |
@@ -86,6 +119,7 @@ Roughly **~80%** ready for evict/pull/compute policy sweeps.
 |-----|---------|
 | PD write mode (early spawn, D gates P) | Concurrent PD overlap |
 | `num_computed_blocks` bumped in `apply_batch` not at schedule | Tight memory timing |
+| Per-tier placement / duplicate caps | HBM vs DRAM vs SSD placement policy |
 | Pull source refcount / consumption | Multi-consumer source memory |
 | Workload generator / metrics CLI | Large sweeps |
 

@@ -66,7 +66,7 @@ class Task(ABC):
 
     def estimated_end(self):
         assert self.status == TaskStatus.RUNNING
-        return self.resource.time_takes(self.work_left) + self.now
+        return self.now + self.resource.share_time(self.work_left, self.resource.works)
 
 
 class TaskPool:

@@ -39,6 +39,7 @@ class Engine:
         policy,
         compute_res: ComputeResource,
         bandwidth_res: BandwidthResource | None = None,
+        transfer_links: dict[str, BandwidthResource] | None = None,
         work_per_block: float = 1.0,
         work_per_transfer: float | None = None,
         work_per_evict: float | None = None,
@@ -58,6 +59,9 @@ class Engine:
         self.policy = policy
         self.compute_res = compute_res
         self.bandwidth_res = bandwidth_res
+        if transfer_links is None and bandwidth_res is not None and policy.pull_sources:
+            transfer_links = {src: bandwidth_res for src in policy.pull_sources}
+        self.transfer_links = transfer_links or {}
         self.work_per_block = work_per_block
         self.work_per_transfer = (
             work_per_transfer if work_per_transfer is not None else work_per_block
@@ -71,6 +75,13 @@ class Engine:
             work_per_decode_req if work_per_decode_req is not None else work_per_block
         )
         self.hold_kv_on_complete = hold_kv_on_complete
+
+        policy.bind_cost_model(
+            compute_res=self.compute_res,
+            transfer_links=self.transfer_links,
+            work_per_transfer=self.work_per_transfer,
+            work_per_block=self.work_per_block,
+        )
 
         self.scheduler = Scheduler(
             policy=policy,
@@ -160,11 +171,15 @@ class Engine:
                     continue
 
                 if isinstance(action, tuple) and action[0] == "pull":
-                    if self.bandwidth_res is None:
-                        raise RuntimeError("bandwidth_res required for pull")
+                    src_key = action[1]
+                    link = self.transfer_links.get(src_key)
+                    if link is None:
+                        raise RuntimeError(
+                            f"transfer link required for pull source {src_key!r}"
+                        )
                     task = LoadTask(
                         work_left=self.work_per_transfer,
-                        resource=self.bandwidth_res,
+                        resource=link,
                         memory=local,
                         block=dst_block,
                     )
