@@ -1,6 +1,6 @@
 from memory import KVBlock, Memory
 from policies import LookupResult
-from request import Request, RequestStatus
+from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
 from scheduler import Batch, BatchEntry, Scheduler
 from tasks import EvictTask, ForwardTask, LoadTask, Task, TaskPool
@@ -46,6 +46,8 @@ class Engine:
         max_num_seqs: int = 10_000,
         max_num_batched_tokens: int = 10_000,
         enable_chunked_prefill: bool = False,
+        remote_kv_wait: bool = False,
+        hold_kv_on_complete: bool = False,
         work_per_prefill_token: float | None = None,
         work_per_decode_req: float | None = None,
     ):
@@ -68,6 +70,8 @@ class Engine:
         self.work_per_decode_req = (
             work_per_decode_req if work_per_decode_req is not None else work_per_block
         )
+        self.hold_kv_on_complete = hold_kv_on_complete
+        self._remote_kv_wait = remote_kv_wait
 
         self.scheduler = Scheduler(
             policy=policy,
@@ -77,6 +81,7 @@ class Engine:
             max_num_batched_tokens=max_num_batched_tokens,
             block_size=block_size,
             enable_chunked_prefill=enable_chunked_prefill,
+            remote_kv_wait=remote_kv_wait,
         )
         for req in requests:
             self.scheduler.add_request(req)
@@ -92,6 +97,15 @@ class Engine:
     @property
     def completed(self):
         return self.scheduler.completed
+
+    @property
+    def remote_kv_wait(self) -> bool:
+        return self.scheduler.remote_kv_wait
+
+    @remote_kv_wait.setter
+    def remote_kv_wait(self, enabled: bool) -> None:
+        self._remote_kv_wait = enabled
+        self.scheduler.remote_kv_wait = enabled
 
     def _local(self) -> Memory:
         return self.memories[self.local_memory]
@@ -177,12 +191,18 @@ class Engine:
 
         return all_tasks
 
-    def apply_batch(self, batch: Batch) -> list[Request]:
+    def apply_batch(self, batch: Batch) -> tuple[list[Request], list[Request]]:
         """Advance state after the batch finishes (vLLM update_from_output)."""
         finished: list[Request] = []
+        remote_kv_done: list[Request] = []
 
         for entry in batch.entries:
             req = entry.req
+            if entry.remote_kv:
+                self.scheduler.promote_remote_kv_complete(req)
+                remote_kv_done.append(req)
+                continue
+
             if req.pending_block_hash is not None:
                 req.block_hashes.append(req.pending_block_hash)
                 req.pending_block_hash = None
@@ -191,10 +211,16 @@ class Engine:
                 req.num_computed_blocks += len(entry.block_hashes)
 
             if req.num_computed_blocks >= req.blocks_target():
-                self.scheduler.finish_request(req)
+                if req.pd == RequestPD.PREFILL and self.hold_kv_on_complete:
+                    self.scheduler.finish_prefill_held(req)
+                else:
+                    self.scheduler.finish_request(req)
                 finished.append(req)
 
-        return finished
+        return finished, remote_kv_done
+
+    def release_held_kv(self, req_id: str) -> None:
+        self._local().free_request(req_id)
 
     def _reserve(self, req: Request, result: LookupResult, block_hashes: list[str]) -> None:
         local = self._local()

@@ -4,21 +4,26 @@ Discrete-event simulator for KV cache scheduling, eviction, compute, and PD tran
 
 ```bash
 cd lmcache_ascend/tools/simulator
-python3.12 simulator.py            # PD demo + deadlock + limits tests
+python3.12 simulator.py            # full test suite
 python3.12 simulator.py deadlock   # preemption test only
 python3.12 simulator.py limits     # max_num_seqs / token_budget test only
+python3.12 simulator.py chunked    # chunked prefill test
+python3.12 simulator.py pd         # PD read-mode + remote-KV tests
+python3.12 simulator.py waiting    # waiting preempt + queue rotation
 ```
 
 ## Architecture
 
 | File | Role |
 |------|------|
-| `scheduler.py` | Queues, `schedule()` → `Batch` (RUNNING → WAITING, preempt at allocate) |
+| `scheduler.py` | Queues, `schedule()` → `Batch` (RUNNING → WAITING, unified allocate + preempt) |
 | `engine.py` | `execute_batch()` (reserve, tasks), `apply_batch()` (advance state) |
 | `simulator.py` | Global clock, multi-engine step, PD spawn |
+| `pd.py` | `PDConfig` — validates and applies read-mode flags to engines |
 | `policies.py` | `LookupPolicy` (pull/compute), `EvictionPolicy` |
 | `tasks.py` | `ForwardTask` (batched compute), `LoadTask` (pull), `EvictTask` |
 | `memory.py` | Content-keyed slot budget, holders, block states |
+| `tests/run_tests.py` | Integration and unit tests |
 
 Each `Simulator.step()`:
 
@@ -33,11 +38,15 @@ Preemption frees KV and resets the request; it does not touch the task pool — 
 
 `Scheduler.schedule()` per engine, once per step:
 
-1. **RUNNING** (FCFS) — decode output (1 token/request) or prefill continuation when `is_prefill_chunk()`, capped by shared `token_budget`; allocate with preempt loop.
-2. **WAITING** (if no preempt this step) — admit while `len(running) < max_num_seqs` and `token_budget > 0`; prefix `lookup` on full prefix or a chunk when `enable_chunked_prefill` (no preempt on waiting path).
+1. **RUNNING** (FCFS) — decode output or prefill continuation when `is_prefill_chunk()`, capped by `token_budget`; `_allocate_blocks()` with preempt loop.
+2. **WAITING** (if no preempt this step) — same `_allocate_blocks()` path (not a separate lookup-only path). `WAITING_REMOTE_KV` at queue head is rotated to tail so later requests can proceed.
 3. Phase from request cursor: `req.is_prefill_chunk()` ↔ vLLM `num_computed_tokens < prompt_len`; `apply_batch` advances `num_computed_blocks` by blocks completed this step.
 
-Engine knobs: `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `enable_chunked_prefill` (default off; enables partial prefix admit and RUNNING prefill chunks).
+`prefix_block_count` is set when a request leaves `PENDING` (or when spawned), not only at admit time.
+
+On normal completion, `finish_request()` calls `free_request()` so HBM is not leaked.
+
+Engine knobs: `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `enable_chunked_prefill`.
 
 ## Policy hooks
 
@@ -50,29 +59,13 @@ class MyEviction(EvictionPolicy):
 LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())
 ```
 
-`plan()` computes slot deficit and calls `pick_victims`. Victims must be `RESIDENT` with `len(holders)==0` (`memory.can_evict_block`).
-
 ### Pull / compute — `LookupPolicy`
 
-```python
-LookupPolicy(
-    local_memory="npu-1:hbm",
-    pull_sources=["npu-0:hbm", "npu-0:ssd"],  # first resident source wins
-)
-```
-
-Per block: local hit → skip; else pull from first source with `RESIDENT` block; else `compute`. `lookup → None` if a pull source has the block inflight (not implemented: early decode wait).
-
-### Compute / transfer cost — `Engine` + `ForwardTask`
-
-- One `ForwardTask` per engine batch (all compute blocks in the step).
-- Prefill cost: `work_per_prefill_token × num_scheduled_tokens`
-- Decode cost: `work_per_decode_req × num_decode_entries_with_compute`
-- Pull: `work_per_transfer` on `BandwidthResource`; evict: `work_per_evict`
+Per block via `_resolve_block()`: local hit → skip; else pull from first `RESIDENT` source; else `compute` (or `None` when `allow_compute=False` for remote-KV admit).
 
 ## Policy experiment readiness
 
-Roughly **~70%** ready for evict/pull/compute policy sweeps. Not a full vLLM clone.
+Roughly **~80%** ready for evict/pull/compute policy sweeps.
 
 ### Ready now
 
@@ -80,51 +73,41 @@ Roughly **~70%** ready for evict/pull/compute policy sweeps. Not a full vLLM clo
 |------------|------|
 | Pull source order (1P1D) | `pull_sources` list order |
 | Compute vs transfer cost | `work_per_prefill_token`, `work_per_decode_req`, `work_per_transfer` |
-| Memory pressure + preempt | `Memory(size)`, deadlock scenario |
+| Memory pressure + preempt | `Memory(size)`, deadlock + waiting preempt tests |
 | Batch limits | `max_num_seqs`, `max_num_batched_tokens` |
+| PD read mode | `PDConfig(spawn_map=...)` auto-applies engine flags |
 | Custom eviction | `EvictionPolicy.pick_victims` |
-
-### Usable with caveats
-
-- **Eviction under load** — running requests pin blocks via `holders`; only unheld `RESIDENT` blocks evict. Pressure is often preemption-driven, not cache replacement. Fine for relative policy comparison if you understand the model.
-- **Prefix hits** — implicit via `best_resident`; no ref-counted block pool like vLLM.
-
-### Fix before trusting eviction/memory studies
-
-1. **`free_request()` on completion** — today `release_request()` leaves `RESIDENT` KV after finish, inflating `used_size`.
-2. **Metrics** — no built-in evict/pull/preempt counters yet (only `finish_time` from demos).
 
 ### Not implemented (distorts specific experiments)
 
 | Gap | Affects |
 |-----|---------|
-| Early decode wait | Async PD |
+| PD write mode (early spawn, D gates P) | Concurrent PD overlap |
 | `num_computed_blocks` bumped in `apply_batch` not at schedule | Tight memory timing |
+| Pull source refcount / consumption | Multi-consumer source memory |
 | Workload generator / metrics CLI | Large sweeps |
-
-**Suggested path to ~85% policy-lab ready:** (1) free KV on complete, (2) run metrics. Remaining gap vs vLLM is block-table/refcount fidelity.
 
 ## PD 1P1D
 
-Memories use instance keys, not roles:
-
 ```python
-memories = {
-    "npu-0:hbm": Memory(size=100),
-    "npu-1:hbm": Memory(size=100),
-}
-# spawn_decode={"npu-0": "npu-1"}  — decode request injected when prefill completes
+from pd import PDConfig
+
+sim = Simulator(
+    [npu0, npu1],
+    pool,
+    pd=PDConfig(spawn_map={"npu-0": "npu-1"}),
+)
+# PDConfig.validate_and_apply sets:
+#   npu-0.hold_kv_on_complete = True
+#   npu-1.remote_kv_wait = True  (requires pull_sources on decode policy)
 ```
 
-Typical timeline (`work=1`, large HBM, `finish_time≈11` for 3 prefix + 3 pull + 5 decode blocks):
+**PD read mode** (vLLM Mooncake pull-shaped):
 
-| Phase | Engine | What happens |
-|-------|--------|----------------|
-| Prefill | npu-0 | `schedule` → one `ForwardTask` for prefix blocks |
-| Transfer | npu-1 | chained pull `LoadTask`s on bandwidth |
-| Decode | npu-1 | one `ForwardTask` per step per output block |
-
-Pull requires source `RESIDENT` (decode spawned after prefill completes). No shared producer-task prereqs.
+1. P prefill completes → KV held on P (`finish_prefill_held`).
+2. Decode spawned on D → `WAITING_REMOTE_KV`: pre-alloc D slots + pull batch.
+3. Pull completes → promote to `RUNNING`, `free_request` on P.
+4. Decode output steps; `free_request` on D when done.
 
 ## vLLM divergences (intentional simplifications)
 
@@ -132,14 +115,12 @@ Pull requires source `RESIDENT` (decode spawned after prefill completes). No sha
 |------|------|-----------|
 | Unit of work | Tokens | Blocks (`block_size` tokens/block) |
 | Physical KV | Block table + refcounts | Content-keyed slots + holders |
-| Scheduler output | `num_scheduled_tokens` per req | `BatchEntry.num_scheduled_tokens` |
 | Preempt | `kv_cache_manager.free` | `free_request` + reset cursor |
-| PD | KV connector, async match | Spawn on prefill complete; pull if resident |
+| PD | KV connector, async match | Read mode: late spawn, `WAITING_REMOTE_KV`, deferred P release |
 | Eviction | LRU on physical blocks | Pluggable; default `FirstAvailableEviction` |
 
 ## Roadmap
 
-1. `free_request()` on normal completion
-2. Run metrics (evictions, pulls, computes, preemptions)
-3. Move cursor bump to schedule time
-4. Early decode wait; workload config file
+1. Run metrics (evictions, pulls, computes, preemptions)
+2. Move cursor bump to schedule time
+3. PD write mode (early spawn); workload config file

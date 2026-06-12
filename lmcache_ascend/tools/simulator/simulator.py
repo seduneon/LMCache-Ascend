@@ -1,4 +1,5 @@
 from engine import Engine
+from pd import PDConfig
 from request import Request, RequestPD, RequestStatus
 from tasks import Task, TaskPool, TaskStatus
 
@@ -12,10 +13,16 @@ class Simulator:
         engines: list[Engine],
         pool: TaskPool,
         spawn_decode: dict[str, str] | None = None,
+        pd: PDConfig | None = None,
     ):
         self.engines = {eng.engine_id: eng for eng in engines}
         self.pool = pool
-        self.spawn_decode = spawn_decode or {}
+        self.pd = pd
+        if pd and spawn_decode and spawn_decode != pd.spawn_map:
+            raise ValueError("spawn_decode conflicts with pd.spawn_map; use PDConfig only")
+        self.spawn_decode = pd.spawn_map if pd else (spawn_decode or {})
+        if pd is not None:
+            pd.validate_and_apply(self.engines)
         self.now = 0.0
 
     def _batch_done(self, tasks: list[Task]) -> bool:
@@ -71,10 +78,24 @@ class Simulator:
         self._drain_batch(step_tasks)
 
         completed_by_engine: dict[str, list[Request]] = {}
+        remote_kv_by_engine: dict[str, list[Request]] = {}
         for eng in self.engines.values():
-            completed_by_engine[eng.engine_id] = eng.apply_batch(
-                batches[eng.engine_id]
-            )
+            finished, remote_kv_done = eng.apply_batch(batches[eng.engine_id])
+            completed_by_engine[eng.engine_id] = finished
+            remote_kv_by_engine[eng.engine_id] = remote_kv_done
+
+        for eng_id, remote_done in remote_kv_by_engine.items():
+            for req in remote_done:
+                if req.prefill_engine_id is None:
+                    continue
+                prefill_eng = self.engines[req.prefill_engine_id]
+                prefill = next(
+                    (r for r in prefill_eng.completed if r.req_id == req.req_id),
+                    None,
+                )
+                if prefill is not None and prefill.kv_held_for_transfer:
+                    prefill_eng.release_held_kv(req.req_id)
+                    prefill.kv_held_for_transfer = False
 
         for eng in self.engines.values():
             for req in completed_by_engine[eng.engine_id]:
@@ -91,6 +112,7 @@ class Simulator:
                         RequestStatus.PENDING,
                         max_output_blocks=req.max_output_blocks,
                         prefix_block_count=req.prefix_block_count,
+                        prefill_engine_id=eng.engine_id,
                     )
                 )
 
@@ -103,204 +125,7 @@ class Simulator:
         return self.now
 
 
-def run_pd_demo() -> None:
-    from memory import Memory
-    from policies import LookupPolicy
-    from resource import BandwidthResource, ComputeResource
-
-    pool = TaskPool()
-    memories = {
-        "npu-0:hbm": Memory(size=100, name="npu-0:hbm"),
-        "npu-1:hbm": Memory(size=100, name="npu-1:hbm"),
-    }
-    prefill_requests = [
-        Request(
-            "r1",
-            0.0,
-            ["a", "b", "c"],
-            RequestPD.PREFILL,
-            RequestStatus.PENDING,
-            max_output_blocks=5,
-        ),
-    ]
-    npu0 = Engine(
-        engine_id="npu-0",
-        requests=prefill_requests,
-        pool=pool,
-        memories=memories,
-        local_memory="npu-0:hbm",
-        policy=LookupPolicy(local_memory="npu-0:hbm"),
-        compute_res=ComputeResource(base_speed=1.0),
-        work_per_block=1.0,
-    )
-    npu1 = Engine(
-        engine_id="npu-1",
-        requests=[],
-        pool=pool,
-        memories=memories,
-        local_memory="npu-1:hbm",
-        policy=LookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]),
-        compute_res=ComputeResource(base_speed=1.0),
-        bandwidth_res=BandwidthResource(base_speed=1.0),
-        work_per_block=1.0,
-        work_per_transfer=1.0,
-    )
-    sim = Simulator([npu0, npu1], pool, spawn_decode={"npu-0": "npu-1"})
-    finish = sim.run()
-    print(f"finish_time={finish}")
-    print(f"npu-0:hbm blocks={[b.hash for b in memories['npu-0:hbm'].list()]}")
-    print(f"npu-1:hbm blocks={[b.hash for b in memories['npu-1:hbm'].list()]}")
-    print(f"r1 prefill status={prefill_requests[0].status}")
-    decode_req = next((r for r in npu1.completed if r.req_id == "r1"), None)
-    if decode_req is not None:
-        print(
-            f"r1 decode status={decode_req.status} "
-            f"computed={decode_req.num_computed_blocks}/"
-            f"{decode_req.total_blocks()}"
-        )
-
-
-def run_deadlock_test() -> None:
-    """Two running requests fill memory; decode preemption must unblock progress."""
-    from memory import Memory
-    from policies import LookupPolicy
-    from resource import ComputeResource
-
-    pool = TaskPool()
-    hbm = Memory(size=6, name="npu-0:hbm")
-    memories = {"npu-0:hbm": hbm}
-    requests = [
-        Request(
-            "r1",
-            0.0,
-            ["a", "b", "c"],
-            RequestPD.DECODE,
-            RequestStatus.PENDING,
-            max_output_blocks=2,
-        ),
-        Request(
-            "r2",
-            0.0,
-            ["x", "y", "z"],
-            RequestPD.DECODE,
-            RequestStatus.PENDING,
-            max_output_blocks=1,
-        ),
-    ]
-    eng = Engine(
-        engine_id="npu-0",
-        requests=requests,
-        pool=pool,
-        memories=memories,
-        local_memory="npu-0:hbm",
-        policy=LookupPolicy(local_memory="npu-0:hbm"),
-        compute_res=ComputeResource(base_speed=1.0),
-        work_per_block=1.0,
-    )
-    sim = Simulator([eng], pool)
-    finish = sim.run()
-    by_id = {r.req_id: r for r in eng.completed}
-    assert finish < float("inf"), "simulation did not finish"
-    assert "r1" in by_id and "r2" in by_id, "both requests must complete"
-    assert by_id["r1"].status == RequestStatus.COMPLETE
-    assert by_id["r2"].status == RequestStatus.COMPLETE
-    total_preemptions = by_id["r1"].num_preemptions + by_id["r2"].num_preemptions
-    assert total_preemptions >= 1, "at least one request should be preempted"
-    print(f"deadlock_test finish_time={finish}")
-    print(f"r1 preemptions={by_id['r1'].num_preemptions} r2 preemptions={by_id['r2'].num_preemptions}")
-    print(f"r1 computed={by_id['r1'].num_computed_blocks}/{by_id['r1'].total_blocks()}")
-    print(f"r2 computed={by_id['r2'].num_computed_blocks}/{by_id['r2'].total_blocks()}")
-
-
-def run_limits_test() -> None:
-    """max_num_seqs and max_num_batched_tokens (vLLM scheduler limits)."""
-    from memory import Memory
-    from policies import LookupPolicy
-    from resource import ComputeResource
-    from scheduler import Scheduler
-
-    memories = {"hbm": Memory(size=100, name="hbm")}
-    policy = LookupPolicy(local_memory="hbm")
-    sched = Scheduler(
-        policy, memories, "hbm", max_num_seqs=1, max_num_batched_tokens=10, block_size=1
-    )
-    r1 = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
-    r2 = Request("r2", 0.0, ["b"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
-    r1.prefix_block_count = 1
-    r2.prefix_block_count = 1
-    sched.waiting.extend([r1, r2])
-    batch = sched.schedule()
-    assert len(batch.entries) == 1, "max_num_seqs=1 admits one waiting request"
-    assert len(sched.waiting) == 1
-    assert len(sched.running) == 1
-
-    sched2 = Scheduler(
-        policy, memories, "hbm", max_num_seqs=10, max_num_batched_tokens=2, block_size=1
-    )
-    for rid in ("r1", "r2", "r3"):
-        req = Request(
-            rid, 0.0, ["p"], RequestPD.DECODE, RequestStatus.RUNNING, max_output_blocks=2
-        )
-        req.prefix_block_count = 1
-        req.num_computed_blocks = 1
-        sched2.running.append(req)
-    batch2 = sched2.schedule()
-    assert len(batch2.entries) == 2, "token_budget=2 schedules two decode reqs"
-    assert batch2.total_num_scheduled_tokens == 2
-    print("limits_test ok")
-
-
-def run_chunked_prefill_test() -> None:
-    """Chunked prefill: partial prefix from WAITING and continuation in RUNNING."""
-    from memory import Memory
-    from policies import LookupPolicy
-    from resource import ComputeResource
-
-    memories = {"hbm": Memory(size=100, name="hbm")}
-    policy = LookupPolicy(local_memory="hbm")
-    pool = TaskPool()
-    eng = Engine(
-        engine_id="e0",
-        requests=[],
-        pool=pool,
-        memories=memories,
-        local_memory="hbm",
-        policy=policy,
-        compute_res=ComputeResource(base_speed=1.0),
-        block_size=1,
-        max_num_batched_tokens=2,
-        enable_chunked_prefill=True,
-        work_per_block=1.0,
-    )
-    prefix = [f"p{i}" for i in range(5)]
-    req = Request("r1", 0.0, list(prefix), RequestPD.PREFILL, RequestStatus.PENDING)
-    eng.schedule_request(req)
-
-    sim = Simulator([eng], pool)
-    steps = 0
-    while sim.step():
-        steps += 1
-
-    assert len(eng.completed) == 1
-    assert eng.completed[0].num_computed_blocks == len(prefix)
-    assert steps >= 3, "5 tokens with budget 2 needs multiple prefill steps"
-    print(f"chunked_prefill_test ok steps={steps}")
-
-
 if __name__ == "__main__":
-    import sys
+    from tests.run_tests import main
 
-    if len(sys.argv) > 1 and sys.argv[1] == "deadlock":
-        run_deadlock_test()
-    elif len(sys.argv) > 1 and sys.argv[1] == "limits":
-        run_limits_test()
-    elif len(sys.argv) > 1 and sys.argv[1] == "chunked":
-        run_chunked_prefill_test()
-    else:
-        run_pd_demo()
-        print()
-        run_deadlock_test()
-        print()
-        run_limits_test()
-        print()
-        run_chunked_prefill_test()
+    main()

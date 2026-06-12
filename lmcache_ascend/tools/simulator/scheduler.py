@@ -12,6 +12,7 @@ class BatchEntry:
     block_hashes: list[str]
     result: LookupResult
     num_scheduled_tokens: int = 0
+    remote_kv: bool = False
 
 
 @dataclass
@@ -34,6 +35,7 @@ class Scheduler:
         max_num_batched_tokens: int = 10_000,
         block_size: int = 1,
         enable_chunked_prefill: bool = False,
+        remote_kv_wait: bool = False,
     ):
         self.policy = policy
         self.memories = memories
@@ -42,6 +44,7 @@ class Scheduler:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.block_size = block_size
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.remote_kv_wait = remote_kv_wait
 
         self.pending: list[tuple[float, str, Request]] = []
         self.waiting: deque[Request] = deque()
@@ -55,10 +58,15 @@ class Scheduler:
         req.status = RequestStatus.PENDING
         heapq.heappush(self.pending, (req.arrival_time, req.req_id, req))
 
+    def _ensure_prefix_block_count(self, req: Request) -> None:
+        if req.prefix_block_count == 0 and req.block_hashes:
+            req.prefix_block_count = len(req.block_hashes)
+
     def release_arrivals(self, now: float) -> None:
         while self.pending and self.pending[0][0] <= now:
             _, _, req = heapq.heappop(self.pending)
             req.status = RequestStatus.WAITING
+            self._ensure_prefix_block_count(req)
             self.waiting.append(req)
 
     def next_arrival(self) -> float | None:
@@ -94,9 +102,87 @@ class Scheduler:
         return self._remaining_prefill_tokens(req)
 
     def _entry_scheduled_tokens(self, entry: BatchEntry) -> int:
+        if entry.remote_kv:
+            return 0
         if not any(action == "compute" for action in entry.result.blocks.values()):
             return 0
         return entry.num_scheduled_tokens
+
+    def _active_request_count(self) -> int:
+        remote_kv = sum(
+            1 for req in self.waiting if req.status == RequestStatus.WAITING_REMOTE_KV
+        )
+        return len(self.running) + remote_kv
+
+    def _prefix_block_hashes(self, req: Request) -> list[str]:
+        return list(req.block_hashes[: req.prefix_block_count])
+
+    def _needs_remote_kv(self, req: Request) -> bool:
+        if not self.remote_kv_wait:
+            return False
+        if req.pd != RequestPD.DECODE:
+            return False
+        if req.status == RequestStatus.WAITING_REMOTE_KV:
+            return False
+        if req.num_computed_blocks >= req.prefix_block_count:
+            return False
+        if not self.policy.pull_sources:
+            return False
+        local = self._local()
+        for block_hash in self._prefix_block_hashes(req):
+            if self.policy.local_satisfied(local, block_hash):
+                continue
+            return True
+        return False
+
+    def _try_admit_remote_kv(
+        self,
+        req: Request,
+        batch: Batch,
+        scheduled_ids: set[str],
+    ) -> bool:
+        block_hashes = self._prefix_block_hashes(req)
+        if not block_hashes:
+            return False
+
+        result = self._allocate_blocks(
+            req,
+            block_hashes,
+            scheduled_ids,
+            batch.preempted,
+            pull_only=True,
+        )
+        if result is None:
+            return False
+
+        entry = BatchEntry(
+            req,
+            block_hashes,
+            result,
+            num_scheduled_tokens=0,
+            remote_kv=True,
+        )
+        req.status = RequestStatus.WAITING_REMOTE_KV
+        batch.entries.append(entry)
+        scheduled_ids.add(req.req_id)
+        return True
+
+    def promote_remote_kv_complete(self, req: Request) -> None:
+        assert req.status == RequestStatus.WAITING_REMOTE_KV
+        self.waiting.remove(req)
+        req.status = RequestStatus.RUNNING
+        req.num_computed_blocks = req.prefix_block_count
+        self.running.append(req)
+
+    def finish_prefill_held(self, req: Request) -> None:
+        """Prefill compute done; keep KV resident until decode acknowledges transfer."""
+        if req not in self.running:
+            return
+        assert req.pd == RequestPD.PREFILL
+        req.status = RequestStatus.COMPLETE
+        req.kv_held_for_transfer = True
+        self.running.remove(req)
+        self.completed.append(req)
 
     def schedule(self) -> Batch:
         batch = Batch()
@@ -132,12 +218,31 @@ class Scheduler:
             idx += 1
 
         if not batch.preempted:
-            while self.waiting and token_budget > 0:
-                if len(self.running) >= self.max_num_seqs:
+            remote_kv_rotations = 0
+            max_rotations = len(self.waiting)
+
+            while self.waiting:
+                if self._active_request_count() >= self.max_num_seqs:
                     break
 
                 req = self.waiting[0]
-                req.prefix_block_count = len(req.block_hashes)
+                if req.status == RequestStatus.WAITING_REMOTE_KV:
+                    if remote_kv_rotations >= max_rotations:
+                        break
+                    self.waiting.popleft()
+                    self.waiting.append(req)
+                    remote_kv_rotations += 1
+                    continue
+
+                if self._needs_remote_kv(req):
+                    if self._try_admit_remote_kv(req, batch, scheduled_ids):
+                        break
+                    break
+
+                if token_budget <= 0:
+                    break
+
+                self._ensure_prefix_block_count(req)
                 prefix_tokens = self._waiting_prefix_tokens(req)
 
                 if not self.enable_chunked_prefill and prefix_tokens > token_budget:
@@ -152,18 +257,22 @@ class Scheduler:
                 if not block_hashes:
                     break
 
-                result = self.policy.lookup(self.memories, block_hashes)
+                result = self._allocate_blocks(
+                    req, block_hashes, scheduled_ids, batch.preempted
+                )
                 if result is None:
                     break
 
-                entry = BatchEntry(req, block_hashes, result, num_new_tokens)
-                scheduled = self._entry_scheduled_tokens(entry)
+                scheduled = self._entry_scheduled_tokens(
+                    BatchEntry(req, block_hashes, result, num_new_tokens)
+                )
                 if scheduled > token_budget:
                     break
 
                 self.waiting.popleft()
                 req.status = RequestStatus.RUNNING
                 self.running.append(req)
+                entry = BatchEntry(req, block_hashes, result, num_new_tokens)
                 batch.entries.append(entry)
                 scheduled_ids.add(req.req_id)
                 token_budget -= scheduled
@@ -189,9 +298,13 @@ class Scheduler:
         block_hashes: list[str],
         scheduled_ids: set[str],
         preempted: list[Request],
+        *,
+        pull_only: bool = False,
     ) -> LookupResult | None:
         local = self._local()
-        actions = self.policy.resolve_actions(self.memories, block_hashes)
+        actions = self.policy.resolve_actions(
+            self.memories, block_hashes, allow_compute=not pull_only
+        )
         if actions is None:
             return None
 
@@ -241,7 +354,9 @@ class Scheduler:
         self.waiting.appendleft(req)
 
     def finish_request(self, req: Request) -> None:
+        if req not in self.running:
+            return
         req.status = RequestStatus.COMPLETE
-        self._local().release_request(req.req_id)
+        self._local().free_request(req.req_id)
         self.running.remove(req)
         self.completed.append(req)

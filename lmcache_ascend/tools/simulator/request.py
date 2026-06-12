@@ -10,6 +10,7 @@ class RequestPD(StrEnum):
 class RequestStatus(StrEnum):
     PENDING = "pending"
     WAITING = "waiting"
+    WAITING_REMOTE_KV = "waiting_remote_kv"
     RUNNING = "running"
     COMPLETE = "complete"
 
@@ -26,6 +27,8 @@ class Request:
     prefix_block_count: int = 0
     num_preemptions: int = 0
     pending_block_hash: str | None = field(default=None, repr=False)
+    prefill_engine_id: str | None = None
+    kv_held_for_transfer: bool = False
 
     def total_blocks(self) -> int:
         return self.prefix_block_count + self.max_output_blocks

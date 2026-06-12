@@ -7,6 +7,9 @@ from memory import KVBlock, Memory
 BlockAction = Literal["compute"] | tuple[Literal["pull"], str]
 BlockActions = dict[str, BlockAction]
 
+_LOCAL = Literal["local"]
+BlockResolution = BlockAction | _LOCAL | None
+
 
 @dataclass
 class LookupResult:
@@ -58,7 +61,6 @@ class LookupPolicy:
         self.eviction_policy = eviction_policy or FirstAvailableEviction()
 
     def lookup(self, memories: dict[str, Memory], block_hashes: list[str]) -> LookupResult | None:
-        local = memories[self.local_memory]
         actions = self.resolve_actions(memories, block_hashes)
         if actions is None:
             return None
@@ -70,31 +72,51 @@ class LookupPolicy:
         return LookupResult(evicts=evicts, blocks=actions)
 
     def resolve_actions(
-        self, memories: dict[str, Memory], block_hashes: list[str]
+        self,
+        memories: dict[str, Memory],
+        block_hashes: list[str],
+        *,
+        allow_compute: bool = True,
     ) -> BlockActions | None:
-        local = memories[self.local_memory]
         actions: BlockActions = {}
-
         for block_hash in block_hashes:
-            if self._local_satisfied(local, block_hash):
+            resolution = self._resolve_block(memories, block_hash, allow_compute=allow_compute)
+            if resolution is None:
+                return None
+            if resolution == "local":
                 continue
-
-            pulled = False
-            for src_key in self.pull_sources:
-                src = memories[src_key]
-                if src.inflight_incoming(block_hash) is not None:
-                    return None
-                if src.best_resident(block_hash) is not None:
-                    actions[block_hash] = ("pull", src_key)
-                    pulled = True
-                    break
-
-            if not pulled:
-                actions[block_hash] = "compute"
-
+            actions[block_hash] = resolution
         return actions
 
-    def _local_satisfied(self, local: Memory, block_hash: str) -> bool:
+    def resolve_pull_actions(
+        self, memories: dict[str, Memory], block_hashes: list[str]
+    ) -> BlockActions | None:
+        """Remote-KV admit: every non-local block must be pullable (no compute fallback)."""
+        return self.resolve_actions(memories, block_hashes, allow_compute=False)
+
+    def _resolve_block(
+        self,
+        memories: dict[str, Memory],
+        block_hash: str,
+        *,
+        allow_compute: bool,
+    ) -> BlockResolution:
+        local = memories[self.local_memory]
+        if self.local_satisfied(local, block_hash):
+            return "local"
+
+        for src_key in self.pull_sources:
+            src = memories[src_key]
+            if src.inflight_incoming(block_hash) is not None:
+                return None
+            if src.best_resident(block_hash) is not None:
+                return ("pull", src_key)
+
+        if allow_compute:
+            return "compute"
+        return None
+
+    def local_satisfied(self, local: Memory, block_hash: str) -> bool:
         return (
             local.best_resident(block_hash) is not None
             or local.inflight_incoming(block_hash) is not None
