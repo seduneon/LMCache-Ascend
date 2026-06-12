@@ -61,6 +61,7 @@ class LookupPolicy:
         self.eviction_policy = eviction_policy or FirstAvailableEviction()
 
     def lookup(self, memories: dict[str, Memory], block_hashes: list[str]) -> LookupResult | None:
+        local = memories[self.local_memory]
         actions = self.resolve_actions(memories, block_hashes)
         if actions is None:
             return None
