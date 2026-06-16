@@ -1,4 +1,5 @@
 from memory import KVBlock, Memory
+from policies import HBMOnly, HBMAndDRAM, PlacementPolicy
 from policies import LookupResult
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
@@ -51,6 +52,7 @@ class Engine:
         hold_kv_on_complete: bool = False,
         work_per_prefill_token: float | None = None,
         work_per_decode_req: float | None = None,
+        placement_policy: PlacementPolicy | None = None,
     ):
         self.engine_id = engine_id
         self.pool = pool
@@ -75,6 +77,7 @@ class Engine:
             work_per_decode_req if work_per_decode_req is not None else work_per_block
         )
         self.hold_kv_on_complete = hold_kv_on_complete
+        self.placement_policy = placement_policy or HBMOnly()
 
         policy.bind_resources(
             compute_res=self.compute_res,
@@ -148,6 +151,23 @@ class Engine:
         if _entry_has_compute(entry):
             metrics.forward_steps += 1
 
+    def _on_block_resident(self, block: KVBlock, req: Request, now: float) -> None:
+        self.placement_policy.place_copy(
+            self.memories,
+            local_memory=self.local_memory,
+            block=block,
+            req=req,
+            now=now,
+        )
+
+    def _on_hbm_evict(self, block: KVBlock, now: float) -> None:
+        self.placement_policy.spill_on_evict(
+            self.memories,
+            local_memory=self.local_memory,
+            block=block,
+            now=now,
+        )
+
     def execute_batch(self, batch: Batch, now: float = 0.0) -> list[Task]:
         """Reserve memory, run evictions/pulls, then one batched forward for all compute."""
         local = self._local()
@@ -155,6 +175,7 @@ class Engine:
         evict_tasks: list[Task] = []
         pull_tasks: list[Task] = []
         forward_blocks: list[KVBlock] = []
+        forward_block_req: dict[int, Request] = {}
 
         for entry in batch.entries:
             self._record_entry_actions(entry)
@@ -166,6 +187,7 @@ class Engine:
                     resource=self.compute_res,
                     memory=local,
                     block=victim,
+                    on_before_evict=lambda b, t, v=victim: self._on_hbm_evict(v, t),
                 )
                 self.pool.add(task, [])
                 evict_tasks.append(task)
@@ -186,6 +208,7 @@ class Engine:
 
                 if action == "compute":
                     forward_blocks.append(dst_block)
+                    forward_block_req[id(dst_block)] = entry.req
                     continue
 
                 if isinstance(action, tuple) and action[0] == "pull":
@@ -200,6 +223,7 @@ class Engine:
                         resource=link,
                         memory=local,
                         block=dst_block,
+                        on_resident=lambda b, t, r=entry.req: self._on_block_resident(b, r, t),
                     )
                     self.pool.add(task, prereqs_tail)
                     dst_block.task = task
@@ -215,7 +239,17 @@ class Engine:
                 work_per_prefill_token=self.work_per_prefill_token,
                 work_per_decode_req=self.work_per_decode_req,
             )
-            forward = ForwardTask(work, self.compute_res, forward_blocks)
+
+            def on_resident(block: KVBlock, t: float) -> None:
+                req = forward_block_req[id(block)]
+                self._on_block_resident(block, req, t)
+
+            forward = ForwardTask(
+                work,
+                self.compute_res,
+                forward_blocks,
+                on_resident=on_resident,
+            )
             self.pool.add(forward, evict_tasks + pull_tasks)
             all_tasks.append(forward)
 

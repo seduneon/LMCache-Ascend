@@ -28,7 +28,7 @@ python3.12 simulator.py stress-heavy              # larger stress run
 | `simulator.py` | Global clock, micro-step event loop, in-flight batches, PD spawn |
 | `sim_log.py` | Optional progress logging (`SimLogger`) |
 | `pd.py` | `PDConfig` — validates and applies read-mode flags to engines |
-| `policies.py` | `LookupPolicy` ABC + pull/compute implementations, `EvictionPolicy` |
+| `policies.py` | `LookupPolicy`, `EvictionPolicy`, `PlacementPolicy` — pull/compute, eviction, tier mirroring |
 | `tasks.py` | `ForwardTask` (batched compute), `LoadTask` (pull), `EvictTask` |
 | `memory.py` | Content-keyed slot budget, holders, block states |
 | `tests/run_tests.py` | Integration tests and CLI |
@@ -76,6 +76,30 @@ LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())
 ```
 
 Blocks record `last_touch` (simulation time) on local hit (`engine._reserve`), pull complete (`LoadTask`), and forward complete (`ForwardTask`).
+
+### Placement — `PlacementPolicy`
+
+| Class | Behavior |
+|-------|----------|
+| `HBMOnly` | Default. KV stays on local HBM only |
+| `HBMAndDRAM` | Mirror to DRAM on resident; **LRU-evict DRAM** when full; **spill to DRAM** on HBM evict |
+
+```python
+from policies import HBMAndDRAM, OrderedPullLookupPolicy
+
+Engine(
+    ...,
+    local_memory="npu-0:hbm",
+    placement_policy=HBMAndDRAM(dram_memory="npu-0:dram"),
+    policy=OrderedPullLookupPolicy(
+        local_memory="npu-0:hbm",
+        pull_sources=["npu-0:dram"],
+    ),
+    transfer_links={"npu-0:dram": BandwidthResource(base_speed=32.0)},
+)
+```
+
+Placement runs on forward/pull complete; `spill_on_evict` runs before HBM `EvictTask` removes the victim. Both use sync copies (zero transfer cost in v1). DRAM uses `LRUEviction` by default (`dram_eviction_policy=` to override).
 
 ### Pull / compute — `LookupPolicy`
 
@@ -141,10 +165,10 @@ These are the main blockers for LMCache-style **where to put KV** and **how many
 
 | Gap | Today | Needed for vLLM/LMCache alignment |
 |-----|-------|-----------------------------------|
-| Where computed KV goes | All new blocks land in `local_memory` (HBM) only | Policy chooses HBM / DRAM / SSD on compute complete |
-| Remote tiers | `pull_sources` are **read catalogs** — never written | Spill, promote, demote between tiers |
-| Per-tier capacity | Only local HBM has a slot budget | Independent `Memory(size=…)` pressure + eviction per tier |
-| Spill on evict | Victim is removed (`EvictTask`) | Option to spill HBM → slower tier instead of drop |
+| Where computed KV goes | **Partial:** `HBMAndDRAM` mirrors + spill-on-HBM-evict | SSD / multi-tier write TBD |
+| Remote tiers | DRAM tier with LRU eviction + pull source | SSD spill / remote plugins |
+| Per-tier capacity | HBM + DRAM independent `Memory(size=…)` | More tiers |
+| Spill on evict | **Partial:** `HBMAndDRAM.spill_on_evict` | Configurable spill vs drop policy |
 
 **Suggested hook:** `PlacementPolicy.on_block_resident(block_hash, req) → list[tier_keys]` and `on_evict_from(tier, block) → drop | spill_to`.
 
@@ -170,7 +194,7 @@ These are the main blockers for LMCache-style **where to put KV** and **how many
 | Prefix-aware scoring | Prefer evicting unshared / low-reuse | Not modeled |
 | Watermarks | Reserved blocks for decode vs prefill | Not modeled |
 | Eviction timing | Often synchronous at allocation | Async `EvictTask` on compute resource (distorts pressure timing) |
-| Eviction scope | Local HBM only in practice | Same — remote tiers never evict |
+| Eviction scope | HBM evict + DRAM LRU in `HBMAndDRAM` | More tiers / spill targets |
 
 **You can test today:** plug in custom `EvictionPolicy.pick_victims` (LRU, LFU, prefix-aware, etc.) for **HBM-only** victim choice.
 
@@ -319,11 +343,11 @@ Aggregation CLI / sweep reporting: **not implemented** (fields exist per request
 
 ### P0 — placement + duplicates
 
-1. `PlacementPolicy` on compute complete (write to 0..N tiers).
-2. Per-tier `Memory` with independent eviction and capacity.
+1. ~~`PlacementPolicy` on compute complete~~ (`HBMAndDRAM` + spill).
+2. ~~Per-tier `Memory` with independent eviction~~ (DRAM LRU in `HBMAndDRAM`).
 3. `RetentionPolicy`: max copies per hash per tier / globally.
-4. Spill-on-evict (HBM victim → DRAM/SSD or drop).
-5. ~~Touch order + `LRUEviction` default~~ (done)
+4. ~~Spill-on-evict (HBM victim → DRAM)~~ (`spill_on_evict`).
+5. ~~Touch order + `LRUEviction` default~~ (done).
 
 ### P1 — trustworthy pull vs recompute (remaining)
 

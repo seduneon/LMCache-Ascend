@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from memory import KVBlock, Memory
+from memory import BlockState, KVBlock, Memory
 from request import Request
 
 if TYPE_CHECKING:
@@ -68,6 +68,103 @@ class LRUEviction(EvictionPolicy):
                     candidates.append(block)
         candidates.sort(key=lambda block: block.last_touch)
         return candidates[:count]
+
+
+class PlacementPolicy(ABC):
+    """Where to retain KV copies when a block becomes resident on local HBM."""
+
+    @abstractmethod
+    def place_copy(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block: KVBlock,
+        req: Request,
+        now: float,
+    ) -> None:
+        """Synchronously mirror ``block`` to additional tier(s) if policy allows."""
+
+    def spill_on_evict(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block: KVBlock,
+        now: float,
+    ) -> None:
+        """Called before an HBM victim is removed. Default: drop (no spill)."""
+
+
+class HBMOnly(PlacementPolicy):
+    """Keep computed KV on local HBM only (default)."""
+
+    def place_copy(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block: KVBlock,
+        req: Request,
+        now: float,
+    ) -> None:
+        pass
+
+
+class HBMAndDRAM(PlacementPolicy):
+    """Mirror HBM residents to DRAM; spill on HBM evict; LRU-evict DRAM when full."""
+
+    def __init__(
+        self,
+        dram_memory: str,
+        *,
+        dram_eviction_policy: EvictionPolicy | None = None,
+    ):
+        self.dram_memory = dram_memory
+        self._dram_eviction = dram_eviction_policy or LRUEviction()
+
+    def _ensure_dram_resident(
+        self,
+        memories: dict[str, Memory],
+        block_hash: str,
+        now: float,
+    ) -> bool:
+        dram = memories[self.dram_memory]
+        if dram.best_resident(block_hash) is not None:
+            return True
+
+        exclude = {block_hash}
+        while dram.free_size() <= 0:
+            victims = self._dram_eviction.pick_victims(dram, 1, exclude)
+            if not victims:
+                return False
+            dram.remove_block(victims[0])
+
+        copy = KVBlock(block_hash, BlockState.RESIDENT)
+        dram.append(copy)
+        dram.touch(copy, now)
+        return True
+
+    def place_copy(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block: KVBlock,
+        req: Request,
+        now: float,
+    ) -> None:
+        self._ensure_dram_resident(memories, block.hash, now)
+
+    def spill_on_evict(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block: KVBlock,
+        now: float,
+    ) -> None:
+        self._ensure_dram_resident(memories, block.hash, now)
 
 
 def local_satisfied(local: Memory, block_hash: str) -> bool:

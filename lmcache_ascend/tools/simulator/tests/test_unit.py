@@ -7,6 +7,8 @@ from policies import (
     ComputeOnlyLookupPolicy,
     CostBasedPullLookupPolicy,
     FirstAvailableEviction,
+    HBMAndDRAM,
+    HBMOnly,
     LRUEviction,
     OrderedPullLookupPolicy,
     local_satisfied,
@@ -31,6 +33,160 @@ def _make_resident(memory: Memory, block_hash: str, req_id: str = "producer") ->
     block = memory.find_reserved_for(block_hash, req_id)
     assert block is not None
     block.state = BlockState.RESIDENT
+
+
+def test_hbm_and_dram_placement_creates_copy() -> None:
+    memories = {
+        "hbm": Memory(size=2, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    block = memories["hbm"].append_reserved("a", "r1")
+    block.state = BlockState.RESIDENT
+
+    HBMAndDRAM("dram").place_copy(
+        memories, local_memory="hbm", block=block, req=req, now=1.0
+    )
+
+    assert memories["dram"].best_resident("a") is not None
+
+    req2 = Request("r2", 0.0, ["b"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    block2 = memories["hbm"].append_reserved("b", "r2")
+    block2.state = BlockState.RESIDENT
+    HBMOnly().place_copy(
+        memories, local_memory="hbm", block=block2, req=req2, now=2.0
+    )
+    assert memories["dram"].best_resident("b") is None
+
+
+def test_dram_retains_block_after_hbm_eviction() -> None:
+    memories = {
+        "hbm": Memory(size=1, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    block = memories["hbm"].append_reserved("a", "r1")
+    block.state = BlockState.RESIDENT
+    HBMAndDRAM("dram").place_copy(
+        memories, local_memory="hbm", block=block, req=req, now=1.0
+    )
+
+    memories["hbm"].remove_block(block)
+    assert memories["hbm"].best_resident("a") is None
+
+    policy = OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"])
+    assert policy.resolve_actions(memories, ["a"], req=req)["a"] == ("pull", "dram")
+
+
+def test_placement_e2e_pull_from_dram() -> None:
+    from engine import Engine
+
+    pool = TaskPool()
+    memories = {
+        "hbm": Memory(size=2, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    eng = Engine(
+        "e0",
+        [],
+        pool,
+        memories,
+        "hbm",
+        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        ComputeResource(base_speed=8.0),
+        BandwidthResource(base_speed=8.0),
+        work_per_block=1.0,
+        placement_policy=HBMAndDRAM("dram"),
+    )
+    eng.schedule_request(
+        Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    eng.schedule_request(
+        Request("r2", 1.0, ["b"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    eng.schedule_request(
+        Request("r3", 2.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+
+    Simulator([eng], pool).run()
+
+    r3 = next(r for r in eng.completed if r.req_id == "r3")
+    assert r3.metrics.pulls == 1
+    assert memories["dram"].best_resident("a") is not None
+
+
+def test_dram_lru_eviction_when_tier_full() -> None:
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "dram": Memory(size=2, name="dram"),
+    }
+    req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    policy = HBMAndDRAM("dram")
+
+    for name, touch_t in (("a", 1.0), ("b", 2.0), ("c", 3.0)):
+        block = KVBlock(name, BlockState.RESIDENT)
+        memories["hbm"].append(block)
+        policy.place_copy(
+            memories, local_memory="hbm", block=block, req=req, now=touch_t
+        )
+
+    assert memories["dram"].best_resident("a") is None
+    assert memories["dram"].best_resident("b") is not None
+    assert memories["dram"].best_resident("c") is not None
+
+
+def test_spill_on_evict_without_prior_mirror() -> None:
+    memories = {
+        "hbm": Memory(size=2, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    block = KVBlock("a", BlockState.RESIDENT)
+    memories["hbm"].append(block)
+
+    HBMAndDRAM("dram").spill_on_evict(
+        memories, local_memory="hbm", block=block, now=5.0
+    )
+    memories["hbm"].remove_block(block)
+
+    assert memories["hbm"].best_resident("a") is None
+    assert memories["dram"].best_resident("a") is not None
+
+
+def test_spill_e2e_after_hbm_pressure() -> None:
+    from engine import Engine
+
+    pool = TaskPool()
+    memories = {
+        "hbm": Memory(size=1, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    eng = Engine(
+        "e0",
+        [],
+        pool,
+        memories,
+        "hbm",
+        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        ComputeResource(base_speed=8.0),
+        BandwidthResource(base_speed=8.0),
+        work_per_block=1.0,
+        placement_policy=HBMAndDRAM("dram"),
+    )
+    eng.schedule_request(
+        Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    eng.schedule_request(
+        Request("r2", 1.0, ["b"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    eng.schedule_request(
+        Request("r3", 2.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+
+    Simulator([eng], pool).run()
+
+    r3 = next(r for r in eng.completed if r.req_id == "r3")
+    assert r3.metrics.pulls == 1
+    assert memories["dram"].best_resident("a") is not None
 
 
 def test_lru_eviction_picks_oldest_touch() -> None:
@@ -433,6 +589,12 @@ def test_request_metrics_pd_decode() -> None:
 
 def run_unit_tests() -> None:
     tests = [
+        test_hbm_and_dram_placement_creates_copy,
+        test_dram_retains_block_after_hbm_eviction,
+        test_placement_e2e_pull_from_dram,
+        test_dram_lru_eviction_when_tier_full,
+        test_spill_on_evict_without_prior_mirror,
+        test_spill_e2e_after_hbm_pressure,
         test_lru_eviction_picks_oldest_touch,
         test_lru_eviction_skips_held_and_excluded,
         test_lru_eviction_under_allocate_pressure,

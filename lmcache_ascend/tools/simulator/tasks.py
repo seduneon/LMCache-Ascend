@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+
 from abc import ABC, abstractmethod
 from enum import StrEnum
 
@@ -158,9 +162,11 @@ class ForwardTask(Task):
         work_left: float,
         resource: Resource,
         blocks: list[KVBlock],
+        on_resident: Callable[[KVBlock, float], None] | None = None,
     ):
         super().__init__(work_left, resource)
         self.blocks = blocks
+        self._on_resident = on_resident
 
     def on_start(self) -> None:
         for block in self.blocks:
@@ -170,9 +176,22 @@ class ForwardTask(Task):
         for block in self.blocks:
             block.state = BlockState.RESIDENT
             block.touch(self.now)
+            if self._on_resident is not None:
+                self._on_resident(block, self.now)
 
 
 class LoadTask(MemoryTask):
+    def __init__(
+        self,
+        work_left: float,
+        resource: Resource,
+        memory: Memory,
+        block: KVBlock,
+        on_resident: Callable[[KVBlock, float], None] | None = None,
+    ):
+        super().__init__(work_left, resource, memory, block)
+        self._on_resident = on_resident
+
     def on_start(self) -> None:
         self.block.state = BlockState.LOADING
         self.block.task = self
@@ -181,10 +200,25 @@ class LoadTask(MemoryTask):
         self.block.state = BlockState.RESIDENT
         self.block.task = None
         self.memory.touch(self.block, self.now)
+        if self._on_resident is not None:
+            self._on_resident(self.block, self.now)
 
 
 class EvictTask(MemoryTask):
+    def __init__(
+        self,
+        work_left: float,
+        resource: Resource,
+        memory: Memory,
+        block: KVBlock,
+        on_before_evict: Callable[[KVBlock, float], None] | None = None,
+    ):
+        super().__init__(work_left, resource, memory, block)
+        self._on_before_evict = on_before_evict
+
     def on_start(self) -> None:
+        if self._on_before_evict is not None:
+            self._on_before_evict(self.block, self.now)
         self.block.state = BlockState.EVICTING
         self.block.task = self
 
