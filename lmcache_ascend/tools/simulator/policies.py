@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
 from memory import BlockState, KVBlock, Memory
@@ -101,6 +102,9 @@ class PlacementPolicy(ABC):
     ) -> None:
         """Called before an HBM victim is removed. Default: drop (no spill)."""
 
+    def bind_retention(self, retention: RetentionPolicy) -> None:
+        """Optional hook for tier mirrors to enforce copy caps (``HBMAndDRAM``)."""
+
 
 class HBMOnly(PlacementPolicy):
     """Keep computed KV on local HBM only (default)."""
@@ -128,6 +132,10 @@ class HBMAndDRAM(PlacementPolicy):
     ):
         self.dram_memory = dram_memory
         self._dram_eviction = dram_eviction_policy or LRUEviction()
+        self._retention: RetentionPolicy = UnboundedRetention()
+
+    def bind_retention(self, retention: RetentionPolicy) -> None:
+        self._retention = retention
 
     def _ensure_dram_resident(
         self,
@@ -149,6 +157,9 @@ class HBMAndDRAM(PlacementPolicy):
         copy = KVBlock(block_hash, BlockState.RESIDENT)
         dram.append(copy)
         dram.touch(copy, now)
+        self._retention.on_block_resident(
+            memories, tier_key=self.dram_memory, block=copy, now=now
+        )
         return True
 
     def place_copy(
@@ -171,6 +182,85 @@ class HBMAndDRAM(PlacementPolicy):
         now: float,
     ) -> None:
         self._ensure_dram_resident(memories, block.hash, now)
+
+
+# --- Retention ---
+
+
+class PullDisposition(StrEnum):
+    RETAIN = "retain"
+    CONSUME = "consume"
+
+
+class RetentionPolicy(ABC):
+    """Caps per-tier duplicate residents and post-pull source lifecycle."""
+
+    def max_copies(self, memory: Memory, block_hash: str) -> int | None:
+        """Max resident copies of ``block_hash`` in ``memory``; ``None`` = unbounded."""
+        return None
+
+    def pull_disposition(self) -> PullDisposition:
+        return PullDisposition.RETAIN
+
+    def on_block_resident(
+        self,
+        memories: dict[str, Memory],
+        *,
+        tier_key: str,
+        block: KVBlock,
+        now: float,
+    ) -> None:
+        memory = memories[tier_key]
+        cap = self.max_copies(memory, block.hash)
+        if cap is None:
+            return
+        self._trim_to_cap(memory, block.hash, cap)
+
+    def after_pull(
+        self,
+        memories: dict[str, Memory],
+        *,
+        src_key: str,
+        dst_key: str,
+        block_hash: str,
+        now: float,
+    ) -> None:
+        if self.pull_disposition() != PullDisposition.CONSUME:
+            return
+        src = memories[src_key]
+        src_block = src.best_resident(block_hash)
+        if src_block is None or not src.can_evict_block(src_block):
+            return
+        src.remove_block(src_block)
+
+    @staticmethod
+    def _trim_to_cap(memory: Memory, block_hash: str, cap: int) -> None:
+        copies = memory.resident_copies(block_hash)
+        while len(copies) > cap:
+            evictable = [b for b in copies if memory.can_evict_block(b)]
+            if not evictable:
+                break
+            victim = min(evictable, key=lambda block: block.last_touch)
+            memory.remove_block(victim)
+            copies = memory.resident_copies(block_hash)
+
+
+class UnboundedRetention(RetentionPolicy):
+    """Default: unlimited copies per hash; pull leaves source resident."""
+
+
+class SingleCopyPerTier(RetentionPolicy):
+    """At most one unheld resident copy per content hash per tier."""
+
+    def max_copies(self, memory: Memory, block_hash: str) -> int:
+        return 1
+
+
+class ConsumeOnPull(RetentionPolicy):
+    """Remove the pull source copy when it has no remaining holders."""
+
+    def pull_disposition(self) -> PullDisposition:
+        return PullDisposition.CONSUME
 
 
 # --- Lookup helpers ---

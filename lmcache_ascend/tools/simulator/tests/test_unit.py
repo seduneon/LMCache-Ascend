@@ -7,11 +7,14 @@ from memory import BlockState, KVBlock, Memory
 from policies import (
     ComputeOnlyLookupPolicy,
     CostBasedPullLookupPolicy,
+    ConsumeOnPull,
     FirstAvailableEviction,
     HBMAndDRAM,
     HBMOnly,
     LRUEviction,
     OrderedPullLookupPolicy,
+    SingleCopyPerTier,
+    UnboundedRetention,
     local_satisfied,
 )
 from request import Request, RequestPD, RequestStatus
@@ -184,6 +187,101 @@ def test_spill_e2e_after_hbm_pressure() -> None:
     r3 = next(r for r in eng.completed if r.req_id == "r3")
     assert r3.metrics.pulls == 1
     assert memories["dram"].best_resident("a") is not None
+
+
+def test_unbounded_retention_allows_duplicate_residents() -> None:
+    mem = Memory(size=10, name="hbm")
+    mem.append(KVBlock("a", BlockState.RESIDENT))
+    mem.append(KVBlock("a", BlockState.RESIDENT))
+
+    UnboundedRetention().on_block_resident(
+        {"hbm": mem}, tier_key="hbm", block=mem.resident_copies("a")[-1], now=1.0
+    )
+
+    assert len(mem.resident_copies("a")) == 2
+
+
+def test_single_copy_per_tier_trims_oldest_duplicate() -> None:
+    mem = Memory(size=10, name="hbm")
+    old = KVBlock("a", BlockState.RESIDENT)
+    newer = KVBlock("a", BlockState.RESIDENT)
+    mem.append(old)
+    mem.append(newer)
+    mem.touch(old, 1.0)
+    mem.touch(newer, 2.0)
+
+    SingleCopyPerTier().on_block_resident(
+        {"hbm": mem}, tier_key="hbm", block=newer, now=2.0
+    )
+
+    remaining = mem.resident_copies("a")
+    assert len(remaining) == 1
+    assert remaining[0] is newer
+
+
+def test_consume_on_pull_removes_unheld_source() -> None:
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    memories["dram"].append(KVBlock("a", BlockState.RESIDENT))
+
+    ConsumeOnPull().after_pull(
+        memories,
+        src_key="dram",
+        dst_key="hbm",
+        block_hash="a",
+        now=1.0,
+    )
+
+    assert memories["dram"].best_resident("a") is None
+
+
+def test_consume_on_pull_keeps_held_source() -> None:
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    held = KVBlock("a", BlockState.RESIDENT, holders={"r1"})
+    memories["dram"].append(held)
+
+    ConsumeOnPull().after_pull(
+        memories,
+        src_key="dram",
+        dst_key="hbm",
+        block_hash="a",
+        now=1.0,
+    )
+
+    assert memories["dram"].best_resident("a") is held
+
+
+def test_consume_on_pull_e2e() -> None:
+    pool = TaskPool()
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    memories["dram"].append(KVBlock("a", BlockState.RESIDENT))
+
+    eng = Engine(
+        "e0",
+        [Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)],
+        pool,
+        memories,
+        "hbm",
+        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        ComputeResource(base_speed=8.0),
+        BandwidthResource(base_speed=8.0),
+        work_per_block=1.0,
+        hold_kv_on_complete=True,
+        retention_policy=ConsumeOnPull(),
+    )
+
+    Simulator([eng], pool).run()
+
+    assert memories["hbm"].best_resident("a") is not None
+    assert memories["dram"].best_resident("a") is None
 
 
 def test_lru_eviction_picks_oldest_touch() -> None:
@@ -590,6 +688,12 @@ def run_unit_tests() -> None:
         test_dram_lru_eviction_when_tier_full,
         test_spill_on_evict_without_prior_mirror,
         test_spill_e2e_after_hbm_pressure,
+        # retention
+        test_unbounded_retention_allows_duplicate_residents,
+        test_single_copy_per_tier_trims_oldest_duplicate,
+        test_consume_on_pull_removes_unheld_source,
+        test_consume_on_pull_keeps_held_source,
+        test_consume_on_pull_e2e,
         # eviction
         test_lru_eviction_picks_oldest_touch,
         test_lru_eviction_skips_held_and_excluded,

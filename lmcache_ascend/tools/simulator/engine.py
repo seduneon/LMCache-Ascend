@@ -1,5 +1,12 @@
 from memory import KVBlock, Memory
-from policies import HBMOnly, LookupPolicy, LookupResult, PlacementPolicy
+from policies import (
+    HBMOnly,
+    LookupPolicy,
+    LookupResult,
+    PlacementPolicy,
+    RetentionPolicy,
+    UnboundedRetention,
+)
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
 from scheduler import Batch, BatchEntry, Scheduler
@@ -52,6 +59,7 @@ class Engine:
         work_per_prefill_token: float | None = None,
         work_per_decode_req: float | None = None,
         placement_policy: PlacementPolicy | None = None,
+        retention_policy: RetentionPolicy | None = None,
     ):
         self.engine_id = engine_id
         self.pool = pool
@@ -77,6 +85,8 @@ class Engine:
         )
         self.hold_kv_on_complete = hold_kv_on_complete
         self.placement_policy = placement_policy or HBMOnly()
+        self.retention_policy = retention_policy or UnboundedRetention()
+        self.placement_policy.bind_retention(self.retention_policy)
 
         policy.bind_resources(
             compute_res=self.compute_res,
@@ -158,6 +168,29 @@ class Engine:
             req=req,
             now=now,
         )
+        self.retention_policy.on_block_resident(
+            self.memories,
+            tier_key=self.local_memory,
+            block=block,
+            now=now,
+        )
+
+    def _on_pull_complete(
+        self,
+        block: KVBlock,
+        req: Request,
+        *,
+        src_key: str,
+        now: float,
+    ) -> None:
+        self._on_block_resident(block, req, now)
+        self.retention_policy.after_pull(
+            self.memories,
+            src_key=src_key,
+            dst_key=self.local_memory,
+            block_hash=block.hash,
+            now=now,
+        )
 
     def _on_hbm_evict(self, block: KVBlock, now: float) -> None:
         self.placement_policy.spill_on_evict(
@@ -222,7 +255,9 @@ class Engine:
                         resource=link,
                         memory=local,
                         block=dst_block,
-                        on_resident=lambda b, t, r=entry.req: self._on_block_resident(b, r, t),
+                        on_resident=lambda b, t, r=entry.req, s=src_key: self._on_pull_complete(
+                            b, r, src_key=s, now=t
+                        ),
                     )
                     self.pool.add(task, prereqs_tail)
                     dst_block.task = task

@@ -12,4 +12,6 @@ Core modules:
   pd          — prefill/decode read-mode config
   sim_log     — optional verbose logging (``SIM_LOG=1``)
   sim_progress — progress bar for long stress runs
+
+Policies in ``policies.py``: eviction, placement, retention, lookup.
 """

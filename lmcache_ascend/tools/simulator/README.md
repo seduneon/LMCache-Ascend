@@ -36,7 +36,7 @@ python3.12 simulator.py stress-heavy              # larger stress run
 
 | File | Role |
 |------|------|
-| `policies.py` | `EvictionPolicy`, `PlacementPolicy`, `LookupPolicy` and implementations |
+| `policies.py` | `EvictionPolicy`, `PlacementPolicy`, `RetentionPolicy`, `LookupPolicy` |
 | `request.py` | Request state, PD phase, per-request metrics |
 | `pd.py` | `PDConfig` — validates and applies read-mode flags to engines |
 
@@ -118,6 +118,23 @@ Engine(
 
 Placement runs on forward/pull complete; `spill_on_evict` runs before HBM `EvictTask` removes the victim. Both use sync copies (zero transfer cost in v1). DRAM uses `LRUEviction` by default (`dram_eviction_policy=` to override).
 
+### Retention — `RetentionPolicy`
+
+| Class | Behavior |
+|-------|----------|
+| `UnboundedRetention` | Default. Unlimited copies per hash; pull leaves source |
+| `SingleCopyPerTier` | Trim to one unheld resident copy per hash per tier |
+| `ConsumeOnPull` | Remove source copy after pull if it has no holders |
+
+```python
+Engine(
+    ...,
+    retention_policy=ConsumeOnPull(),
+)
+```
+
+`on_block_resident` runs after forward/pull (and DRAM mirrors via `HBMAndDRAM.bind_retention`). `after_pull` runs when a `LoadTask` completes.
+
 ### Pull / compute — `LookupPolicy`
 
 | Class | Behavior |
@@ -189,18 +206,16 @@ These are the main blockers for LMCache-style **where to put KV** and **how many
 
 Implemented via `PlacementPolicy.place_copy` and `PlacementPolicy.spill_on_evict`.
 
-### Duplicate retention (partial structure only)
+### Duplicate retention (partial)
 
-`Memory.blocks[hash]` is a **list** of physical copies, but nothing policy-driven uses that yet.
+`Memory.blocks[hash]` is a **list** of physical copies. `RetentionPolicy` enforces per-tier caps and pull source lifecycle.
 
 | Gap | Today | Needed |
 |-----|-------|--------|
-| Max copies per hash | Unbounded list append on reserve | Per-tier and global caps (0/1/N) |
-| Cross-tier duplicates | Not modeled | e.g. keep HBM + DRAM + SSD simultaneously |
-| Pull consumption | Source copy is never removed | Policy: retain vs consume vs clone |
-| Deduplication | Holders refcount shared blocks | Explicit “canonical copy” vs per-request copies |
-
-**Suggested hook:** `RetentionPolicy.max_copies(tier, block_hash)` and `should_retain_after_pull(src, dst)`.
+| Max copies per hash | **`SingleCopyPerTier`** (per tier) | Global caps, composable policies |
+| Cross-tier duplicates | Via placement + retention | e.g. HBM + DRAM + SSD simultaneously |
+| Pull consumption | **`ConsumeOnPull`** when source unheld | Move semantics with held sources |
+| Deduplication | Holders refcount shared blocks | Explicit canonical copy vs per-request copies |
 
 ### Eviction fidelity
 
@@ -362,7 +377,7 @@ Aggregation CLI / sweep reporting: **not implemented** (fields exist per request
 
 1. ~~`PlacementPolicy` on compute complete~~ (`HBMAndDRAM` + spill).
 2. ~~Per-tier `Memory` with independent eviction~~ (DRAM LRU in `HBMAndDRAM`).
-3. `RetentionPolicy`: max copies per hash per tier / globally.
+3. ~~`RetentionPolicy`: max copies per hash per tier / globally~~ (`SingleCopyPerTier`, `ConsumeOnPull`).
 4. ~~Spill-on-evict (HBM victim → DRAM)~~ (`spill_on_evict`).
 5. ~~Touch order + `LRUEviction` default~~ (done).
 

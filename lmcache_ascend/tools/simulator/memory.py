@@ -65,6 +65,9 @@ class Memory:
             None,
         )
 
+    def resident_copies(self, block_hash: str) -> list[KVBlock]:
+        return [b for b in self.get(block_hash) if b.state == BlockState.RESIDENT]
+
     def inflight_incoming(self, block_hash: str) -> KVBlock | None:
         return next(
             (
