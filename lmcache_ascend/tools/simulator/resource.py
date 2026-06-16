@@ -12,21 +12,17 @@ class Resource(ABC):
     def remove(self):
         self.works -= 1
 
-    @property
     @abstractmethod
-    def speed(self) -> float:
+    def speed(self, works: int | None = None) -> float:
+        """Effective throughput with ``works`` concurrent consumers (default: ``self.works``)."""
         pass
 
-    @property
-    @abstractmethod
-    def base_speed(self) -> float:
-        pass
-
-    def share_time(self, work: float, sharers: int) -> float:
-        """Wall time for ``work`` split evenly among ``sharers`` consumers."""
-        if self.base_speed <= 0 or sharers <= 0:
+    def time_for(self, work: float, works: int | None = None) -> float:
+        """Wall time to complete ``work`` at ``speed(works)``."""
+        rate = self.speed(works)
+        if rate <= 0:
             return float("inf")
-        return self.latency + work * sharers / self.base_speed
+        return self.latency + work / rate
 
 
 class ComputeResource(Resource):
@@ -38,9 +34,11 @@ class ComputeResource(Resource):
     def base_speed(self) -> float:
         return self._base_speed
 
-    @property
-    def speed(self) -> float:
-        return 0.0 if self.works == 0 else self._base_speed / self.works
+    def speed(self, works: int | None = None) -> float:
+        n = self.works if works is None else works
+        if n <= 0:
+            return 0.0
+        return self._base_speed / n
 
 
 class BandwidthResource(Resource):
@@ -52,6 +50,8 @@ class BandwidthResource(Resource):
     def base_speed(self) -> float:
         return self._base_speed
 
-    @property
-    def speed(self) -> float:
-        return 0.0 if self.works == 0 else self._base_speed / self.works
+    def speed(self, works: int | None = None) -> float:
+        n = self.works if works is None else works
+        if n <= 0:
+            return 0.0
+        return self._base_speed / n

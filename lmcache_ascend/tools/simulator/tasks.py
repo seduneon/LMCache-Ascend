@@ -38,7 +38,7 @@ class Task(ABC):
 
     def advance_to(self, time: float) -> None:
         assert self.status == TaskStatus.RUNNING
-        self.work_left -= (time - self.now) * self.resource.speed
+        self.work_left -= (time - self.now) * self.resource.speed()
         self.now = time
 
     def is_done(self) -> bool:
@@ -66,7 +66,7 @@ class Task(ABC):
 
     def estimated_end(self):
         assert self.status == TaskStatus.RUNNING
-        return self.now + self.resource.share_time(self.work_left, self.resource.works)
+        return self.now + self.resource.time_for(self.work_left)
 
 
 class TaskPool:

@@ -278,7 +278,7 @@ class CostBasedPullLookupPolicy(LookupPolicy):
                 continue
             pull_candidates.append(
                 (
-                    link.share_time(self._work_per_transfer, link.works + 1),
+                    link.time_for(self._work_per_transfer, link.works + 1),
                     order,
                     src_key,
                 )
@@ -299,7 +299,7 @@ class CostBasedPullLookupPolicy(LookupPolicy):
             return ("pull", best_pull[2])
 
         compute_res = self._compute_res
-        t_compute = compute_res.share_time(self._work_per_block, compute_res.works + 1)
+        t_compute = compute_res.time_for(self._work_per_block, compute_res.works + 1)
         t_pull = best_pull[0]
 
         if t_pull < t_compute:

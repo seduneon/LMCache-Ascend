@@ -72,13 +72,13 @@ LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())  # any subc
 `CostBasedPullLookupPolicy` uses `Engine.bind_resources()` (via `bind_resources` on the policy):
 
 ```text
-share_time(work, sharers) = latency + work * sharers / base_speed
-t_pull(src)  = link.share_time(work_per_transfer, link.works + 1)
-t_recompute  = compute.share_time(work_per_block, compute.works + 1)
+time_for(work, works) = latency + work / speed(works)
+t_pull(src)  = link.time_for(work_per_transfer, link.works + 1)
+t_recompute  = compute.time_for(work_per_block, compute.works + 1)
 action       = argmin(t_pull, t_recompute)   # tie → pull
 ```
 
-`+1` is passed by the policy (work not yet queued). Running tasks use `share_time(work_left, works)` in `Task.estimated_end()`.
+`speed(works)` is implementation-defined; default `speed()` uses `self.works`. Running tasks use `time_for(work_left)` in `Task.estimated_end()`.
 
 ```python
 fast = BandwidthResource(base_speed=100.0, latency=0.01)
