@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from memory import BlockState, Memory
-from policies import LookupPolicy
+from policies import (
+    ComputeOnlyLookupPolicy,
+    CostBasedPullLookupPolicy,
+    OrderedPullLookupPolicy,
+    local_satisfied,
+)
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
 from scheduler import Scheduler
@@ -27,7 +32,7 @@ def _make_resident(memory: Memory, block_hash: str, req_id: str = "producer") ->
 
 def test_lookup_compute() -> None:
     memories = {"hbm": Memory(size=10, name="hbm")}
-    policy = LookupPolicy(local_memory="hbm")
+    policy = ComputeOnlyLookupPolicy(local_memory="hbm")
     result = policy.lookup(memories, ["a"])
     assert result is not None
     assert result.blocks == {"a": "compute"}
@@ -41,7 +46,7 @@ def test_pull_only_rejects_compute_fallback() -> None:
     }
     _make_resident(memories["src"], "a")
     _make_resident(memories["src"], "b")
-    policy = LookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy = OrderedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
 
     assert policy.resolve_actions(memories, ["a", "b", "c"])["c"] == "compute"
     assert policy.resolve_actions(memories, ["a", "b", "c"], allow_compute=False) is None
@@ -68,7 +73,7 @@ def test_task_prereq_ordering() -> None:
 
 def test_prefix_block_count_on_arrival() -> None:
     memories = {"hbm": Memory(size=10, name="hbm")}
-    sched = Scheduler(LookupPolicy("hbm"), memories, "hbm")
+    sched = Scheduler(ComputeOnlyLookupPolicy("hbm"), memories, "hbm")
     req = Request("r1", 1.0, ["a", "b", "c"], RequestPD.PREFILL, RequestStatus.PENDING)
     sched.add_request(req)
     sched.release_arrivals(1.0)
@@ -78,7 +83,7 @@ def test_prefix_block_count_on_arrival() -> None:
 
 def test_finish_frees_kv() -> None:
     memories = {"hbm": Memory(size=10, name="hbm")}
-    sched = Scheduler(LookupPolicy("hbm"), memories, "hbm")
+    sched = Scheduler(ComputeOnlyLookupPolicy("hbm"), memories, "hbm")
     req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
     req.prefix_block_count = 1
     _make_resident(memories["hbm"], "a", "r1")
@@ -100,8 +105,8 @@ def test_cost_model_picks_faster_pull_source() -> None:
 
     fast_link = BandwidthResource(base_speed=10.0)
     slow_link = BandwidthResource(base_speed=1.0)
-    policy = LookupPolicy(local_memory="dst", pull_sources=["slow", "fast"])
-    policy.bind_cost_model(
+    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["slow", "fast"])
+    policy.bind_resources(
         compute_res=ComputeResource(base_speed=1.0),
         transfer_links={"fast": fast_link, "slow": slow_link},
         work_per_transfer=1.0,
@@ -123,8 +128,8 @@ def test_cost_model_prefers_compute_under_load() -> None:
     congested_link = BandwidthResource(base_speed=1.0)
     congested_link.works = 9
 
-    policy = LookupPolicy(local_memory="dst", pull_sources=["src"])
-    policy.bind_cost_model(
+    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy.bind_resources(
         compute_res=compute_res,
         transfer_links={"src": congested_link},
         work_per_transfer=1.0,
@@ -144,8 +149,8 @@ def test_cost_model_pull_only_ignores_compute() -> None:
     compute_res = ComputeResource(base_speed=100.0)
     slow_link = BandwidthResource(base_speed=0.1)
 
-    policy = LookupPolicy(local_memory="dst", pull_sources=["src"])
-    policy.bind_cost_model(
+    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy.bind_resources(
         compute_res=compute_res,
         transfer_links={"src": slow_link},
         work_per_transfer=1.0,
@@ -159,11 +164,11 @@ def test_cost_model_pull_only_ignores_compute() -> None:
 
 def test_local_satisfied_inflight() -> None:
     memories = {"hbm": Memory(size=10, name="hbm")}
-    policy = LookupPolicy("hbm")
     local = memories["hbm"]
     block = local.append_reserved("a", "r1")
     block.task = object()  # type: ignore[assignment]
-    assert policy.local_satisfied(local, "a")
+    assert local_satisfied(local, "a")
+    policy = ComputeOnlyLookupPolicy("hbm")
     assert policy.resolve_actions(memories, ["a"]) == {}
 
 

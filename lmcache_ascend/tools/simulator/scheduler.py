@@ -2,7 +2,7 @@ import heapq
 from collections import deque
 from dataclasses import dataclass, field
 
-from policies import LookupPolicy, LookupResult
+from policies import LookupPolicy, LookupResult, local_satisfied, slots_needed
 from request import Request, RequestPD, RequestStatus
 
 
@@ -130,7 +130,7 @@ class Scheduler:
             return False
         local = self._local()
         for block_hash in self._prefix_block_hashes(req):
-            if self.policy.local_satisfied(local, block_hash):
+            if local_satisfied(local, block_hash):
                 continue
             return True
         return False
@@ -311,7 +311,7 @@ class Scheduler:
         exclude = set(block_hashes)
         while True:
             evicts = self.policy.eviction_policy.plan(
-                local, self.policy.slots_needed(actions), exclude
+                local, slots_needed(actions), exclude
             )
             if evicts is not None:
                 return LookupResult(evicts=evicts, blocks=actions)

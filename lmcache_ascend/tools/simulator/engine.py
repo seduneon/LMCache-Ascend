@@ -76,7 +76,7 @@ class Engine:
         )
         self.hold_kv_on_complete = hold_kv_on_complete
 
-        policy.bind_cost_model(
+        policy.bind_resources(
             compute_res=self.compute_res,
             transfer_links=self.transfer_links,
             work_per_transfer=self.work_per_transfer,

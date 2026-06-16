@@ -13,7 +13,11 @@ from tasks import TaskPool
 
 def run_pd_demo() -> None:
     from memory import Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from resource import BandwidthResource, ComputeResource
 
     pool = TaskPool()
@@ -37,7 +41,7 @@ def run_pd_demo() -> None:
         pool=pool,
         memories=memories,
         local_memory="npu-0:hbm",
-        policy=LookupPolicy(local_memory="npu-0:hbm"),
+        policy=ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
         compute_res=ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
@@ -47,7 +51,9 @@ def run_pd_demo() -> None:
         pool=pool,
         memories=memories,
         local_memory="npu-1:hbm",
-        policy=LookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]),
+        policy=CostBasedPullLookupPolicy(
+            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
+        ),
         compute_res=ComputeResource(base_speed=1.0),
         bandwidth_res=BandwidthResource(base_speed=1.0),
         work_per_block=1.0,
@@ -76,7 +82,11 @@ def run_pd_demo() -> None:
 
 def run_deadlock_test() -> None:
     from memory import Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from resource import ComputeResource
 
     pool = TaskPool()
@@ -106,7 +116,7 @@ def run_deadlock_test() -> None:
         pool=pool,
         memories=memories,
         local_memory="npu-0:hbm",
-        policy=LookupPolicy(local_memory="npu-0:hbm"),
+        policy=ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
         compute_res=ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
@@ -128,12 +138,16 @@ def run_deadlock_test() -> None:
 
 def run_limits_test() -> None:
     from memory import Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from resource import ComputeResource
     from scheduler import Scheduler
 
     memories = {"hbm": Memory(size=100, name="hbm")}
-    policy = LookupPolicy(local_memory="hbm")
+    policy = ComputeOnlyLookupPolicy(local_memory="hbm")
     sched = Scheduler(
         policy, memories, "hbm", max_num_seqs=1, max_num_batched_tokens=10, block_size=1
     )
@@ -165,11 +179,15 @@ def run_limits_test() -> None:
 
 def run_chunked_prefill_test() -> None:
     from memory import Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from resource import ComputeResource
 
     memories = {"hbm": Memory(size=100, name="hbm")}
-    policy = LookupPolicy(local_memory="hbm")
+    policy = ComputeOnlyLookupPolicy(local_memory="hbm")
     pool = TaskPool()
     eng = Engine(
         engine_id="e0",
@@ -202,7 +220,11 @@ def run_chunked_prefill_test() -> None:
 
 def run_pd_read_test() -> None:
     from memory import Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from resource import BandwidthResource, ComputeResource
 
     pool = TaskPool()
@@ -224,7 +246,7 @@ def run_pd_read_test() -> None:
         pool=pool,
         memories=memories,
         local_memory="npu-0:hbm",
-        policy=LookupPolicy(local_memory="npu-0:hbm"),
+        policy=ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
         compute_res=ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
@@ -234,7 +256,9 @@ def run_pd_read_test() -> None:
         pool=pool,
         memories=memories,
         local_memory="npu-1:hbm",
-        policy=LookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]),
+        policy=CostBasedPullLookupPolicy(
+            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
+        ),
         compute_res=ComputeResource(base_speed=1.0),
         bandwidth_res=BandwidthResource(base_speed=1.0),
         work_per_block=1.0,
@@ -256,7 +280,11 @@ def run_pd_read_test() -> None:
 
 def run_remote_kv_admit_test() -> None:
     from memory import BlockState, Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from scheduler import Scheduler
 
     memories = {
@@ -268,7 +296,7 @@ def run_remote_kv_admit_test() -> None:
         block = memories["npu-0:hbm"].find_reserved_for(block_hash, "producer")
         block.state = BlockState.RESIDENT
 
-    policy = LookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
+    policy = OrderedPullLookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
     sched = Scheduler(
         policy,
         memories,
@@ -295,7 +323,11 @@ def run_remote_kv_admit_test() -> None:
 
 def run_pd_backpressure_test() -> None:
     from memory import BlockState, Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from scheduler import Scheduler
 
     memories = {
@@ -307,7 +339,7 @@ def run_pd_backpressure_test() -> None:
         block = memories["npu-0:hbm"].find_reserved_for(block_hash, "producer")
         block.state = BlockState.RESIDENT
 
-    policy = LookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
+    policy = OrderedPullLookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
     sched = Scheduler(
         policy,
         memories,
@@ -334,7 +366,11 @@ def run_pd_backpressure_test() -> None:
 
 def run_remote_kv_max_seqs_test() -> None:
     from memory import BlockState, Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from scheduler import Scheduler
 
     memories = {
@@ -346,7 +382,7 @@ def run_remote_kv_max_seqs_test() -> None:
         block = memories["npu-0:hbm"].find_reserved_for(block_hash, "producer")
         block.state = BlockState.RESIDENT
 
-    policy = LookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
+    policy = OrderedPullLookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
     sched = Scheduler(
         policy,
         memories,
@@ -369,11 +405,15 @@ def run_remote_kv_max_seqs_test() -> None:
 def run_remote_kv_queue_rotation_test() -> None:
     """WAITING_REMOTE_KV at head does not block unrelated waiting admits behind it."""
     from memory import Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from scheduler import Scheduler
 
     memories = {"hbm": Memory(size=100, name="hbm")}
-    policy = LookupPolicy(local_memory="hbm")
+    policy = ComputeOnlyLookupPolicy(local_memory="hbm")
     sched = Scheduler(policy, memories, "hbm", max_num_batched_tokens=10, remote_kv_wait=True)
 
     blocked = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
@@ -395,11 +435,15 @@ def run_remote_kv_queue_rotation_test() -> None:
 def run_waiting_preempt_test() -> None:
     """WAITING admit uses preempt path when HBM is full."""
     from memory import BlockState, Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from scheduler import Scheduler
 
     memories = {"hbm": Memory(size=4, name="hbm")}
-    policy = LookupPolicy(local_memory="hbm")
+    policy = ComputeOnlyLookupPolicy(local_memory="hbm")
     sched = Scheduler(policy, memories, "hbm", max_num_batched_tokens=10)
 
     running = Request("r1", 0.0, ["a", "b", "c"], RequestPD.DECODE, RequestStatus.RUNNING, max_output_blocks=1)
@@ -423,7 +467,11 @@ def run_waiting_preempt_test() -> None:
 
 def run_pd_config_validation_test() -> None:
     from memory import Memory
-    from policies import LookupPolicy
+    from policies import (
+        ComputeOnlyLookupPolicy,
+        CostBasedPullLookupPolicy,
+        OrderedPullLookupPolicy,
+    )
     from resource import ComputeResource
 
     pool = TaskPool()
@@ -434,7 +482,7 @@ def run_pd_config_validation_test() -> None:
         pool,
         memories,
         "p",
-        LookupPolicy(local_memory="p"),
+        ComputeOnlyLookupPolicy(local_memory="p"),
         ComputeResource(base_speed=1.0),
     )
     npu1 = Engine(
@@ -443,7 +491,7 @@ def run_pd_config_validation_test() -> None:
         pool,
         memories,
         "d",
-        LookupPolicy(local_memory="d"),
+        ComputeOnlyLookupPolicy(local_memory="d"),
         ComputeResource(base_speed=1.0),
     )
     try:

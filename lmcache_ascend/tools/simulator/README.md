@@ -21,7 +21,7 @@ python3.12 simulator.py unit       # unit tests only
 | `engine.py` | `execute_batch()` (reserve, tasks), `apply_batch()` (advance state) |
 | `simulator.py` | Global clock, multi-engine step, PD spawn |
 | `pd.py` | `PDConfig` — validates and applies read-mode flags to engines |
-| `policies.py` | `LookupPolicy` (pull/compute), `EvictionPolicy` |
+| `policies.py` | `LookupPolicy` ABC + pull/compute implementations, `EvictionPolicy` |
 | `tasks.py` | `ForwardTask` (batched compute), `LoadTask` (pull), `EvictTask` |
 | `memory.py` | Content-keyed slot budget, holders, block states |
 | `tests/run_tests.py` | Integration tests and CLI |
@@ -58,12 +58,18 @@ Engine knobs: `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `enable_ch
 class MyEviction(EvictionPolicy):
     def pick_victims(self, hbm, count, exclude) -> list[KVBlock]: ...
 
-LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())
+LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())  # any subclass
 ```
 
-### Pull / compute — `LookupPolicy`
+### Pull / compute — `LookupPolicy` implementations
 
-When `Engine` wires `transfer_links` and `compute_res`, resolution uses a **cost model**:
+| Class | Behavior |
+|-------|----------|
+| `ComputeOnlyLookupPolicy` | Local hit or recompute |
+| `OrderedPullLookupPolicy` | First `pull_sources` with a resident copy, else recompute |
+| `CostBasedPullLookupPolicy` | Min-cost pull source vs recompute using per-link bandwidth queues |
+
+`CostBasedPullLookupPolicy` uses `Engine.bind_resources()` (via `bind_resources` on the policy):
 
 ```text
 share_time(work, sharers) = latency + work * sharers / base_speed
@@ -74,14 +80,10 @@ action       = argmin(t_pull, t_recompute)   # tie → pull
 
 `+1` is passed by the policy (work not yet queued). Running tasks use `share_time(work_left, works)` in `Task.estimated_end()`.
 
-Among pull sources, pick the minimum `t_pull`. Each source has its own `BandwidthResource` queue so load on one link does not affect another.
-
-Without `transfer_links`, behavior is legacy: first `RESIDENT` source in `pull_sources` order, then `compute` (or `None` when `allow_compute=False` for remote-KV admit).
-
 ```python
 fast = BandwidthResource(base_speed=100.0, latency=0.01)
 slow = BandwidthResource(base_speed=1.0, latency=0.5)
-policy = LookupPolicy(
+policy = CostBasedPullLookupPolicy(
     local_memory="npu-1:hbm",
     pull_sources=["npu-0:ssd", "npu-0:dram"],
 )
@@ -93,7 +95,7 @@ Engine(
     work_per_transfer=1.0,
     work_per_block=1.0,
 )
-# Or one shared link for all sources (backward compatible):
+# Or one shared link for all sources:
 Engine(..., bandwidth_res=BandwidthResource(base_speed=10.0))
 ```
 

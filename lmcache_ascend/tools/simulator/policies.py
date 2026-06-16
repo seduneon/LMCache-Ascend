@@ -54,23 +54,62 @@ class FirstAvailableEviction(EvictionPolicy):
         return victims
 
 
-class LookupPolicy:
+def local_satisfied(local: Memory, block_hash: str) -> bool:
+    return (
+        local.best_resident(block_hash) is not None
+        or local.inflight_incoming(block_hash) is not None
+    )
+
+
+def slots_needed(actions: BlockActions) -> int:
+    return sum(
+        1
+        for action in actions.values()
+        if action == "compute" or (isinstance(action, tuple) and action[0] == "pull")
+    )
+
+
+def first_resident_pull_source(
+    memories: dict[str, Memory],
+    pull_sources: list[str],
+    block_hash: str,
+) -> str | None:
+    for src_key in pull_sources:
+        src = memories[src_key]
+        if src.inflight_incoming(block_hash) is not None:
+            return None
+        if src.best_resident(block_hash) is not None:
+            return src_key
+    return None
+
+
+class LookupPolicy(ABC):
+    """Resolve per-block actions: local hit, pull from a tier, or recompute."""
+
     def __init__(
         self,
         local_memory: str,
-        pull_sources: list[str] | None = None,
         eviction_policy: EvictionPolicy | None = None,
     ):
         self.local_memory = local_memory
-        self.pull_sources = pull_sources or []
         self.eviction_policy = eviction_policy or FirstAvailableEviction()
-        self._compute_res: ComputeResource | None = None
-        self._transfer_links: dict[str, BandwidthResource] = {}
-        self._work_per_transfer = 1.0
-        self._work_per_block = 1.0
-        self._use_cost_model = False
 
-    def bind_cost_model(
+    @property
+    @abstractmethod
+    def pull_sources(self) -> list[str]:
+        pass
+
+    @abstractmethod
+    def resolve_block(
+        self,
+        memories: dict[str, Memory],
+        block_hash: str,
+        *,
+        allow_compute: bool,
+    ) -> BlockResolution:
+        pass
+
+    def bind_resources(
         self,
         *,
         compute_res: ComputeResource | None,
@@ -78,19 +117,16 @@ class LookupPolicy:
         work_per_transfer: float,
         work_per_block: float,
     ) -> None:
-        self._compute_res = compute_res
-        self._transfer_links = transfer_links or {}
-        self._work_per_transfer = work_per_transfer
-        self._work_per_block = work_per_block
-        self._use_cost_model = bool(self._transfer_links and compute_res is not None)
+        """Optional hook for Engine to wire runtime resources (cost-based policies)."""
 
-    def lookup(self, memories: dict[str, Memory], block_hashes: list[str]) -> LookupResult | None:
-        local = memories[self.local_memory]
+    def lookup(
+        self, memories: dict[str, Memory], block_hashes: list[str]
+    ) -> LookupResult | None:
         actions = self.resolve_actions(memories, block_hashes)
         if actions is None:
             return None
         evicts = self.eviction_policy.plan(
-            local, self.slots_needed(actions), set(block_hashes)
+            memories[self.local_memory], slots_needed(actions), set(block_hashes)
         )
         if evicts is None:
             return None
@@ -105,7 +141,9 @@ class LookupPolicy:
     ) -> BlockActions | None:
         actions: BlockActions = {}
         for block_hash in block_hashes:
-            resolution = self._resolve_block(memories, block_hash, allow_compute=allow_compute)
+            resolution = self.resolve_block(
+                memories, block_hash, allow_compute=allow_compute
+            )
             if resolution is None:
                 return None
             if resolution == "local":
@@ -113,7 +151,15 @@ class LookupPolicy:
             actions[block_hash] = resolution
         return actions
 
-    def _resolve_block(
+
+class ComputeOnlyLookupPolicy(LookupPolicy):
+    """Local hit or recompute. No remote tiers."""
+
+    @property
+    def pull_sources(self) -> list[str]:
+        return []
+
+    def resolve_block(
         self,
         memories: dict[str, Memory],
         block_hash: str,
@@ -121,42 +167,106 @@ class LookupPolicy:
         allow_compute: bool,
     ) -> BlockResolution:
         local = memories[self.local_memory]
-        if self.local_satisfied(local, block_hash):
+        if local_satisfied(local, block_hash):
             return "local"
+        if allow_compute:
+            return "compute"
+        return None
 
-        if not self._use_cost_model:
-            return self._resolve_block_legacy(memories, block_hash, allow_compute=allow_compute)
 
-        return self._resolve_block_cost(memories, block_hash, allow_compute=allow_compute)
+class OrderedPullLookupPolicy(LookupPolicy):
+    """First ``pull_sources`` entry with a resident copy, else recompute."""
 
-    def _resolve_block_legacy(
+    def __init__(
+        self,
+        local_memory: str,
+        pull_sources: list[str],
+        eviction_policy: EvictionPolicy | None = None,
+    ):
+        super().__init__(local_memory, eviction_policy)
+        self._pull_sources = list(pull_sources)
+
+    @property
+    def pull_sources(self) -> list[str]:
+        return self._pull_sources
+
+    def resolve_block(
         self,
         memories: dict[str, Memory],
         block_hash: str,
         *,
         allow_compute: bool,
     ) -> BlockResolution:
-        for src_key in self.pull_sources:
-            src = memories[src_key]
-            if src.inflight_incoming(block_hash) is not None:
-                return None
-            if src.best_resident(block_hash) is not None:
-                return ("pull", src_key)
+        local = memories[self.local_memory]
+        if local_satisfied(local, block_hash):
+            return "local"
+
+        src_key = first_resident_pull_source(memories, self._pull_sources, block_hash)
+        if src_key is not None:
+            return ("pull", src_key)
 
         if allow_compute:
             return "compute"
         return None
 
-    def _resolve_block_cost(
+
+class CostBasedPullLookupPolicy(LookupPolicy):
+    """Pick min-cost pull source vs recompute using per-link bandwidth queues."""
+
+    def __init__(
+        self,
+        local_memory: str,
+        pull_sources: list[str],
+        eviction_policy: EvictionPolicy | None = None,
+    ):
+        super().__init__(local_memory, eviction_policy)
+        self._pull_sources = list(pull_sources)
+        self._compute_res: ComputeResource | None = None
+        self._transfer_links: dict[str, BandwidthResource] = {}
+        self._work_per_transfer = 1.0
+        self._work_per_block = 1.0
+
+    @property
+    def pull_sources(self) -> list[str]:
+        return self._pull_sources
+
+    def bind_resources(
+        self,
+        *,
+        compute_res: ComputeResource | None,
+        transfer_links: dict[str, BandwidthResource] | None,
+        work_per_transfer: float,
+        work_per_block: float,
+    ) -> None:
+        self._compute_res = compute_res
+        self._transfer_links = transfer_links or {}
+        self._work_per_transfer = work_per_transfer
+        self._work_per_block = work_per_block
+
+    def resolve_block(
         self,
         memories: dict[str, Memory],
         block_hash: str,
         *,
         allow_compute: bool,
     ) -> BlockResolution:
+        local = memories[self.local_memory]
+        if local_satisfied(local, block_hash):
+            return "local"
+
+        if not self._transfer_links or self._compute_res is None:
+            src_key = first_resident_pull_source(
+                memories, self._pull_sources, block_hash
+            )
+            if src_key is not None:
+                return ("pull", src_key)
+            if allow_compute:
+                return "compute"
+            return None
+
         pull_candidates: list[tuple[float, int, str]] = []
 
-        for order, src_key in enumerate(self.pull_sources):
+        for order, src_key in enumerate(self._pull_sources):
             src = memories[src_key]
             if src.inflight_incoming(block_hash) is not None:
                 return None
@@ -188,7 +298,6 @@ class LookupPolicy:
         if not allow_compute:
             return ("pull", best_pull[2])
 
-        assert self._compute_res is not None
         compute_res = self._compute_res
         t_compute = compute_res.share_time(self._work_per_block, compute_res.works + 1)
         t_pull = best_pull[0]
@@ -198,16 +307,3 @@ class LookupPolicy:
         if t_compute < t_pull:
             return "compute"
         return ("pull", best_pull[2])
-
-    def local_satisfied(self, local: Memory, block_hash: str) -> bool:
-        return (
-            local.best_resident(block_hash) is not None
-            or local.inflight_incoming(block_hash) is not None
-        )
-
-    def slots_needed(self, actions: BlockActions) -> int:
-        return sum(
-            1
-            for action in actions.values()
-            if action == "compute" or (isinstance(action, tuple) and action[0] == "pull")
-        )
