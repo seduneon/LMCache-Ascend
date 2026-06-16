@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import os
-import random
 import time
 from dataclasses import dataclass
+
+from sim_log import SimLogConfig, SimLogger
+from sim_progress import SimProgress, SimProgressConfig
+from simulator import Simulator
+from sweep import PRESETS, SimConfig, build_engines
+from tasks import TaskPool
+from workload import WorkloadConfig, generate_prefill_workload
 
 from engine import Engine
 from memory import Memory
 from pd import PDConfig
-from policies import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
 from request import Request, RequestPD, RequestStatus
-from resource import BandwidthResource, ComputeResource
-from sim_log import SimLogConfig, SimLogger
-from sim_progress import SimProgress, SimProgressConfig
-from simulator import Simulator
-from tasks import TaskPool
 
 
 # Default request-count sweep for benchmark / multi-seed stress runs.
@@ -46,48 +46,32 @@ class StressConfig:
     max_steps_per_request: int = 500
     quiet: bool = False
 
-
-def generate_prefill_workload(cfg: StressConfig) -> tuple[list[Request], list[str]]:
-    """Build many prefill requests with overlapping shared prefixes and unique tails."""
-    rng = random.Random(cfg.seed)
-    shared_pool = [f"shared:{i}" for i in range(cfg.shared_pool_size)]
-
-    requests: list[Request] = []
-    for i in range(cfg.num_requests):
-        prefix_len = rng.randint(cfg.min_prefix_blocks, cfg.max_prefix_blocks)
-        shared_count = rng.randint(prefix_len // 3, (2 * prefix_len) // 3)
-        shared_count = max(1, min(shared_count, prefix_len - 1))
-
-        blocks: list[str] = []
-        start = rng.randint(0, cfg.shared_pool_size - 1)
-        for j in range(shared_count):
-            blocks.append(shared_pool[(start + j) % cfg.shared_pool_size])
-        for j in range(prefix_len - shared_count):
-            blocks.append(f"req{i:04d}:u{j}")
-
-        arrival = i * cfg.arrival_spacing + rng.uniform(0.0, cfg.arrival_jitter)
-        output_blocks = rng.randint(cfg.min_output_blocks, cfg.max_output_blocks)
-        requests.append(
-            Request(
-                f"r{i:04d}",
-                arrival,
-                blocks,
-                RequestPD.PREFILL,
-                RequestStatus.PENDING,
-                max_output_blocks=output_blocks,
-            )
+    def to_workload(self) -> WorkloadConfig:
+        return WorkloadConfig(
+            num_requests=self.num_requests,
+            shared_pool_size=self.shared_pool_size,
+            min_prefix_blocks=self.min_prefix_blocks,
+            max_prefix_blocks=self.max_prefix_blocks,
+            min_output_blocks=self.min_output_blocks,
+            max_output_blocks=self.max_output_blocks,
+            arrival_spacing=self.arrival_spacing,
+            arrival_jitter=self.arrival_jitter,
+            seed=self.seed,
         )
 
-    return requests, shared_pool
+    def to_sim(self) -> SimConfig:
+        return SimConfig(
+            hbm_size=self.hbm_size,
+            max_num_seqs=self.max_num_seqs,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            max_steps=self.max_steps,
+            max_steps_per_request=self.max_steps_per_request,
+            wall_timeout_s=self.wall_timeout_s,
+            show_progress=self.show_progress,
+        )
 
 
-def _assert_idle(sim: Simulator, memories: dict[str, Memory]) -> None:
-    for eng in sim.engines.values():
-        sched = eng.scheduler
-        assert not sched.pending, f"{eng.engine_id} has pending arrivals"
-        assert not sched.waiting, f"{eng.engine_id} has waiting requests"
-        assert not sched.running, f"{eng.engine_id} has running requests"
-
+def _assert_idle(memories: dict[str, Memory]) -> None:
     for name, mem in memories.items():
         assert mem.used_size() == 0, f"{name} leaked KV blocks (used={mem.used_size()})"
 
@@ -133,46 +117,12 @@ def _assert_request_metrics(
 
 def run_stress_test(cfg: StressConfig | None = None) -> StressResult:
     cfg = cfg or StressConfig()
-    requests, shared_pool = generate_prefill_workload(cfg)
+    workload = cfg.to_workload()
+    requests, shared_pool = generate_prefill_workload(workload)
 
     pool = TaskPool()
-    memories = {
-        "npu-0:hbm": Memory(size=cfg.hbm_size, name="npu-0:hbm"),
-        "npu-1:hbm": Memory(size=cfg.hbm_size, name="npu-1:hbm"),
-    }
-    compute = ComputeResource(base_speed=64.0)
-    pull_link = BandwidthResource(base_speed=32.0, latency=0.01)
-
-    npu0 = Engine(
-        engine_id="npu-0",
-        requests=requests,
-        pool=pool,
-        memories=memories,
-        local_memory="npu-0:hbm",
-        policy=ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        compute_res=compute,
-        work_per_block=1.0,
-        max_num_seqs=cfg.max_num_seqs,
-        max_num_batched_tokens=cfg.max_num_batched_tokens,
-        enable_chunked_prefill=True,
-    )
-    npu1 = Engine(
-        engine_id="npu-1",
-        requests=[],
-        pool=pool,
-        memories=memories,
-        local_memory="npu-1:hbm",
-        policy=CostBasedPullLookupPolicy(
-            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
-        ),
-        compute_res=compute,
-        bandwidth_res=pull_link,
-        work_per_block=1.0,
-        work_per_transfer=1.0,
-        max_num_seqs=cfg.max_num_seqs,
-        max_num_batched_tokens=cfg.max_num_batched_tokens,
-        enable_chunked_prefill=True,
-        remote_kv_wait=True,
+    npu0, npu1, memories = build_engines(
+        requests, pool, PRESETS["baseline"], cfg.to_sim()
     )
 
     sim_log = SimLogger(
@@ -223,7 +173,12 @@ def run_stress_test(cfg: StressConfig | None = None) -> StressResult:
             f"(budget={step_budget}; possible livelock)"
         )
 
-    _assert_idle(sim, memories)
+    for eng in sim.engines.values():
+        sched = eng.scheduler
+        assert not sched.pending, f"{eng.engine_id} has pending arrivals"
+        assert not sched.waiting, f"{eng.engine_id} has waiting requests"
+        assert not sched.running, f"{eng.engine_id} has running requests"
+    _assert_idle(memories)
 
     prefill_done = {
         r.req_id for r in npu0.completed if r.pd == RequestPD.PREFILL and not r.kv_held_for_transfer
@@ -388,7 +343,7 @@ def run_stress_seed_sweep(
 
 
 def run_stress_heavy_test() -> None:
-    """Larger variant for explicit stress runs (`simulator.py stress heavy`)."""
+    """Larger variant for explicit stress runs (`simulator.py stress-heavy`)."""
     run_stress_test(
         StressConfig(
             num_requests=512,

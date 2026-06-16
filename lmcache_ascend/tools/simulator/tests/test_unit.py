@@ -679,6 +679,22 @@ def test_request_metrics_pd_decode() -> None:
     assert dm.engine_id == "npu-1"
 
 
+def test_sweep_smoke() -> None:
+    from sweep import SweepConfig, run_sweep
+
+    rows = run_sweep(
+        SweepConfig(
+            presets=("baseline", "ordered_pull"),
+            num_requests=8,
+            seeds=1,
+            base_seed=42,
+        )
+    )
+    assert len(rows) == 2
+    assert all(r.status == "ok" for r in rows)
+    assert rows[0].decode_p99_latency >= 0
+
+
 def run_unit_tests() -> None:
     tests = [
         # placement + spill
@@ -716,6 +732,7 @@ def run_unit_tests() -> None:
         # metrics
         test_request_metrics_phases,
         test_request_metrics_pd_decode,
+        test_sweep_smoke,
     ]
     for test in tests:
         test()

@@ -17,6 +17,10 @@ python3.12 simulator.py stress-seeds  # 10 random seeds × each size (32–512)
 python3.12 simulator.py stress-benchmark  # one run per size, with progress
 SIM_LOG_DETAIL=1 python3.12 simulator.py stress   # verbose per-batch logs
 python3.12 simulator.py stress-heavy              # larger stress run
+python3.12 simulator.py sweep                     # policy comparison (default presets × 3 seeds)
+python3.12 simulator.py sweep --list-presets        # catalog
+python3.12 simulator.py sweep --csv /tmp/sweep.csv  # write CSV
+python3.12 simulator.py sweep --presets baseline,dram_tier --requests 128 --seeds 5
 ```
 
 ## Architecture
@@ -36,6 +40,8 @@ python3.12 simulator.py stress-heavy              # larger stress run
 
 | File | Role |
 |------|------|
+| `workload.py` | Synthetic PD workload generator (shared by stress + sweep) |
+| `sweep.py` | Policy presets, engine factory, metrics aggregation, CSV export |
 | `cost_model.py` | Forward / recompute work units (SSOT for cost math) |
 | `policies.py` | `EvictionPolicy`, `PlacementPolicy`, `RetentionPolicy`, `LookupPolicy` |
 | `request.py` | Request state, PD phase, per-request metrics |
@@ -188,9 +194,9 @@ Engine(
 | Policy area | Readiness | Notes |
 |-------------|-----------|-------|
 | Pull vs recompute (read path) | **~85%** | Token-aware recompute + queued load on links/compute |
-| Placement / eviction / duplicates | **~30–40%** | HBM eviction + custom victims only; no write path or tier retention |
+| Placement / eviction / duplicates | **~60%** | HBM+DRAM placement, retention, spill; no SSD / composable policies |
 | vLLM scheduler shape | **~85%** | Batching, preempt, chunked prefill, PD read mode |
-| Sweep infrastructure | **~40%** | Per-request metrics exist; no trace replay or aggregation CLI |
+| Sweep infrastructure | **~70%** | `sweep` CLI + CSV; workload is synthetic only (no trace replay) |
 
 Use the gap sections below when designing experiments — running a sweep that assumes a missing feature will silently give wrong conclusions.
 
@@ -361,7 +367,41 @@ Each `Request` has `metrics: RequestMetrics` (simulation clock):
 | `computes`, `pulls`, `local_hits`, `evictions` | Per-request batch action counts |
 | `preemptions`, `remote_kv_admits`, `forward_steps` | Scheduler / batch counters |
 
-Aggregation CLI / sweep reporting: **not implemented** (fields exist per request).
+Aggregation CLI / sweep reporting: **`simulator.py sweep`** (see below).
+
+---
+
+## Policy sweep (`sweep`)
+
+Compare policies on the **same synthetic PD workload** (`workload.py`) with fixed seeds.
+
+```bash
+python3.12 simulator.py sweep
+python3.12 simulator.py sweep --presets baseline,ordered_pull,dram_tier,consume_on_pull
+python3.12 simulator.py sweep --requests 128 --seeds 10 --csv results.csv
+python3.12 simulator.py sweep --list-presets
+```
+
+| Preset | P engine | D engine | Extras |
+|--------|----------|----------|--------|
+| `baseline` | compute-only | cost-based pull from P HBM | stress default |
+| `ordered_pull` | compute-only | ordered pull (no cost model) | |
+| `dram_tier` | HBM+DRAM mirror/spill | cost-pull from DRAM then HBM | extra tier |
+| `consume_on_pull` | baseline | baseline | `ConsumeOnPull` |
+| `single_copy` | baseline | baseline | `SingleCopyPerTier` |
+
+CSV columns include decode P50/P99 latency, pull ratio, evictions, preemptions, and `tier_used_at_end` (leak check; all zeros when idle).
+
+**Blindspots (read before drawing conclusions):**
+
+- **Synthetic workload only** — shared-prefix random generator, not trace replay.
+- **`pull_ratio`** — decode `pulls / (pulls + computes)`; local hits excluded.
+- **No in-run peak memory / duplicate count** — `dram_slots_used` is occupancy at end (expected >0 for `dram_tier`); HBM tiers must be empty.
+- **PD read mode only** — same as stress tests.
+- **Preset = full stack** — lookup + placement + retention bundled; not isolated single-knob sweeps yet.
+- **Failed runs** — recorded in CSV with `status=fail` and `error`; CLI exits non-zero if any fail.
+
+Extend presets in `sweep.py` (`PRESETS` dict + `build_engines`).
 
 ---
 
@@ -394,9 +434,9 @@ Aggregation CLI / sweep reporting: **not implemented** (fields exist per request
 
 ### P2 — experiment infrastructure
 
-1. Workload / trace config (prefix length, sharing, arrivals).
-2. Metrics aggregation CLI (pull ratio, evictions/tier, duplicate count, P99 latency).
-3. Policy sweep harness (fixed seeds, compare policies).
+1. Workload / trace config (prefix length, sharing, arrivals) — **partial:** `WorkloadConfig` in `workload.py`.
+2. Metrics aggregation CLI — **partial:** `simulator.py sweep` + CSV.
+3. Policy sweep harness — **partial:** `sweep.py` presets; extend for isolated knob sweeps.
 
 ### P3 — scheduler fidelity
 

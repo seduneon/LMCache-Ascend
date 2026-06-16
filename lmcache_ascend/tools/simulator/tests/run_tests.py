@@ -566,6 +566,11 @@ def main(argv: list[str] | None = None) -> None:
         if key == "unit":
             run_unit_tests()
             return
+        if key == "sweep":
+            from sweep import main as sweep_main
+
+            sweep_main(argv[1:])
+            return
         if key not in _ALL:
             raise SystemExit(f"unknown test group: {key!r} (try: {', '.join(sorted(_ALL))})")
         for test in _ALL[key]:

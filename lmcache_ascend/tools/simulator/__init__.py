@@ -5,7 +5,8 @@ Core modules:
   engine      — batch execution, placement hooks
   scheduler   — RUNNING / WAITING batching
   policies    — eviction, placement, retention, lookup
-  cost_model  — forward / recompute work units
+  workload    — synthetic PD workload generator
+  sweep       — policy preset sweep + CSV export
   memory      — tier slot budgets
   tasks       — forward / load / evict tasks
   resource    — compute and bandwidth queues
