@@ -38,7 +38,7 @@ Each `Simulator.step()` advances `now` by **one discrete event**:
 
 1. `release_arrivals` at current `now`
 2. Per engine (if no in-flight batch): `schedule()` → `execute_batch()` → tasks registered in flight
-3. Start ready tasks; advance `now` to the next task completion **or** next arrival (whichever is sooner)
+3. Start ready tasks; `finish_done()` for zero-work tasks; advance `now` to the next task completion **or** next arrival
 4. When all tasks for a batch complete: `apply_batch()` at that event time; PD spawn uses the same `now`
 
 There is no hidden multi-event drain inside a step — `now` always means the current event time.
@@ -59,7 +59,7 @@ On normal completion, `finish_request()` calls `free_request()` so HBM is not le
 
 Engine knobs: `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `enable_chunked_prefill`.
 
-## Policy hooks
+## Policy hooks (today)
 
 ### Eviction — `EvictionPolicy`
 
@@ -67,10 +67,10 @@ Engine knobs: `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `enable_ch
 class MyEviction(EvictionPolicy):
     def pick_victims(self, hbm, count, exclude) -> list[KVBlock]: ...
 
-LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())  # any subclass
+LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())
 ```
 
-### Pull / compute — `LookupPolicy` implementations
+### Pull / compute — `LookupPolicy`
 
 | Class | Behavior |
 |-------|----------|
@@ -78,16 +78,14 @@ LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())  # any subc
 | `OrderedPullLookupPolicy` | First `pull_sources` with a resident copy, else recompute |
 | `CostBasedPullLookupPolicy` | Min-cost pull source vs recompute using per-link bandwidth queues |
 
-`CostBasedPullLookupPolicy` uses `Engine.bind_resources()` (via `bind_resources` on the policy):
+`CostBasedPullLookupPolicy` cost model (at **schedule** time):
 
 ```text
 time_for(work, works) = latency + work / speed(works)
-t_pull(src)  = link.time_for(work_per_transfer, link.works + 1)
-t_recompute  = compute.time_for(work_per_block, compute.works + 1)
-action       = argmin(t_pull, t_recompute)   # tie → pull
+t_pull      = link.time_for(work_per_transfer, link.works + 1)
+t_recompute = compute.time_for(work_per_block, compute.works + 1)
+action      = argmin(t_pull, t_recompute)   # tie → pull
 ```
-
-`speed(works)` is implementation-defined; default `speed()` uses `self.works`. Running tasks use `time_for(work_left)` in `Task.estimated_end()`.
 
 ```python
 fast = BandwidthResource(base_speed=100.0, latency=0.01)
@@ -104,37 +102,155 @@ Engine(
     work_per_transfer=1.0,
     work_per_block=1.0,
 )
-# Or one shared link for all sources:
-Engine(..., bandwidth_res=BandwidthResource(base_speed=10.0))
 ```
 
-## Policy experiment readiness
+## Experiment readiness (summary)
 
-Roughly **~80%** ready for evict/pull/compute policy sweeps.
+| Policy area | Readiness | Notes |
+|-------------|-----------|-------|
+| Pull vs recompute (read path) | **~70–80%** | Cost-based + ordered pull work on HBM + read-only remote tiers |
+| Placement / eviction / duplicates | **~30–40%** | HBM eviction + custom victims only; no write path or tier retention |
+| vLLM scheduler shape | **~85%** | Batching, preempt, chunked prefill, PD read mode |
+| Sweep infrastructure | **~40%** | Per-request metrics exist; no trace replay or aggregation CLI |
 
-### Ready now
+Use the gap sections below when designing experiments — running a sweep that assumes a missing feature will silently give wrong conclusions.
 
-| Experiment | Hook |
-|------------|------|
-| Pull vs recompute (load-aware) | `transfer_links`, `compute_res`, `work_per_transfer`, `work_per_block` |
-| Pull source tie-break | `pull_sources` list order when costs equal |
-| Compute vs transfer cost | `work_per_prefill_token`, `work_per_decode_req`, `work_per_transfer` |
-| Memory pressure + preempt | `Memory(size)`, deadlock + waiting preempt tests |
-| Batch limits | `max_num_seqs`, `max_num_batched_tokens` |
-| PD read mode | `PDConfig(spawn_map=...)` auto-applies engine flags |
-| Custom eviction | `EvictionPolicy.pick_victims` |
+---
 
-### Not implemented (distorts specific experiments)
+## Gaps: placement, eviction, duplicates
 
-| Gap | Affects |
-|-----|---------|
-| PD write mode (early spawn, D gates P) | Concurrent PD overlap |
-| `num_computed_blocks` bumped in `apply_batch` not at schedule | Tight memory timing |
-| Per-tier placement / duplicate caps | HBM vs DRAM vs SSD placement policy |
-| Pull source refcount / consumption | Multi-consumer source memory |
-| Workload generator / metrics CLI | Large sweeps |
+These are the main blockers for LMCache-style **where to put KV** and **how many copies to keep** experiments.
 
-## PD 1P1D
+### Write-side placement (not implemented)
+
+| Gap | Today | Needed for vLLM/LMCache alignment |
+|-----|-------|-----------------------------------|
+| Where computed KV goes | All new blocks land in `local_memory` (HBM) only | Policy chooses HBM / DRAM / SSD on compute complete |
+| Remote tiers | `pull_sources` are **read catalogs** — never written | Spill, promote, demote between tiers |
+| Per-tier capacity | Only local HBM has a slot budget | Independent `Memory(size=…)` pressure + eviction per tier |
+| Spill on evict | Victim is removed (`EvictTask`) | Option to spill HBM → slower tier instead of drop |
+
+**Suggested hook:** `PlacementPolicy.on_block_resident(block_hash, req) → list[tier_keys]` and `on_evict_from(tier, block) → drop | spill_to`.
+
+### Duplicate retention (partial structure only)
+
+`Memory.blocks[hash]` is a **list** of physical copies, but nothing policy-driven uses that yet.
+
+| Gap | Today | Needed |
+|-----|-------|--------|
+| Max copies per hash | Unbounded list append on reserve | Per-tier and global caps (0/1/N) |
+| Cross-tier duplicates | Not modeled | e.g. keep HBM + DRAM + SSD simultaneously |
+| Pull consumption | Source copy is never removed | Policy: retain vs consume vs clone |
+| Deduplication | Holders refcount shared blocks | Explicit “canonical copy” vs per-request copies |
+
+**Suggested hook:** `RetentionPolicy.max_copies(tier, block_hash)` and `should_retain_after_pull(src, dst)`.
+
+### Eviction fidelity
+
+| Gap | vLLM | Simulator |
+|-----|------|-----------|
+| Victim selection | LRU on physical blocks | Default `FirstAvailableEviction` (arbitrary order) |
+| Touch on access | Updates LRU on hit / use | No last-access tracking |
+| Prefix-aware scoring | Prefer evicting unshared / low-reuse | Not modeled |
+| Watermarks | Reserved blocks for decode vs prefill | Not modeled |
+| Eviction timing | Often synchronous at allocation | Async `EvictTask` on compute resource (distorts pressure timing) |
+| Eviction scope | Local HBM only in practice | Same — remote tiers never evict |
+
+**You can test today:** plug in custom `EvictionPolicy.pick_victims` (LRU, LFU, prefix-aware, etc.) for **HBM-only** victim choice.
+
+### Unified tier optimizer (not implemented)
+
+Real systems joint-optimize placement + eviction + pull. Here:
+
+- `LookupPolicy` decides pull / compute / local hit per block.
+- `EvictionPolicy` reacts only to local HBM slot deficit.
+
+Missing: expected reuse, tier pressure, and bandwidth jointly influencing **where to keep** and **what to evict**.
+
+---
+
+## Gaps: pull vs recompute
+
+These affect whether cost-based decisions match production behavior.
+
+### What works today
+
+- Per-block `resolve_block()` → local hit, `("pull", src)`, or `"compute"`.
+- Per-link `BandwidthResource` with shared `works` (concurrent load splits bandwidth).
+- `OrderedPullLookupPolicy` tier preference; `CostBasedPullLookupPolicy` min-cost vs recompute.
+- Pull tasks depend on evict tasks; forward depends on evict + pull (DAG in `TaskPool`).
+
+### Cost model gaps
+
+| Gap | Impact |
+|-----|--------|
+| **Schedule-time snapshot** | Cost uses `link.works + 1` when the batch is **built**, not when the pull starts. Under load, queued-but-not-started pulls are invisible. |
+| **Flat recompute cost in policy** | `CostBasedPullLookupPolicy` uses `work_per_block`; actual forward uses `work_per_prefill_token` / `work_per_decode_req` in `engine.forward_cost` but that is **not wired into the policy decision**. Long-prefill vs decode-token bias. |
+| **Per-block independence** | Each block gets its own pull/compute choice. No range pull, no amortized latency across a prefix chunk. |
+| **Tie-break** | Equal cost → pull. Production may prefer compute to avoid tier churn. |
+
+### Queue and interconnect gaps
+
+| Gap | Impact |
+|-----|--------|
+| **Planned vs running load** | `Resource.works` counts started tasks only. Scheduled pulls in the same batch don’t inflate `works` until `Task.start()`. |
+| **Multi-hop / PD link** | `pull_sources` can point at another engine’s memory, but no separate interconnect model (NVLink vs PCIe vs RDMA, metadata lookup delay). |
+| **Per-tier request queues** | No fairness, priority, or depth limits on pull queues per medium. |
+| **In-flight source block** | If source has `inflight_incoming(hash)`, `resolve_block` returns `None` → allocation fails → may preempt. vLLM often waits or shares in-flight loads. |
+| **Async prefetch** | No background prefetch, no overlap planning beyond the global task DAG. |
+
+### Pull vs recompute — suggested fixes (priority)
+
+1. Wire `forward_cost` (prefill tokens vs decode steps) into `CostBasedPullLookupPolicy`.
+2. Expose **scheduled + running** load per resource to policies.
+3. Range/batch `LoadTask` with latency amortized once per range.
+4. In-flight source sharing instead of hard `None`.
+5. Optional prefetch queue.
+
+---
+
+## Gaps: scheduler and simulation model
+
+Non-policy simplifications that still change measured outcomes.
+
+| Gap | vLLM / production | Simulator | Affects |
+|-----|-------------------|-----------|---------|
+| Work unit | Tokens | Blocks (`block_size` tokens/block) | Token-budget vs block-grain mismatch |
+| Physical KV | Block table + refcounts | Content-keyed hash + `holders` set | Hash collisions, non-prefix blocks not modeled |
+| Cursor advance | At schedule / output | `num_computed_blocks` bumped in `apply_batch` | Tight-memory timing skew |
+| Preempt | `kv_cache_manager.free` | `free_request` + reset cursor to 0 | Broadly similar; no partial rollback |
+| PD write mode | Early D spawn, D gates P | **Not implemented** | Concurrent P/D overlap experiments |
+| PD read mode | KV connector, async match | Late spawn, `WAITING_REMOTE_KV`, P holds KV until D done | Read-path only |
+| Extreme HBM pressure | Backpressure / scheduling | Very tight HBM can still head-of-line stall (separate from PD KV bug, which is fixed) | Stress configs only |
+| One in-flight batch per engine | vLLM pipeline overlap simplified | Batch must finish before next `schedule()` | Overlap undercount |
+
+---
+
+## Known bugs fixed (regression locked in tests)
+
+| Issue | Symptom | Fix / test |
+|-------|---------|------------|
+| PD KV released on pull complete | Decode preempted after pull → second pull deadlocks | P KV held until D finishes (`simulator._apply_completed_batches`); `critical` PD tests |
+| FP dust in task completion | `event time did not advance` at large n (e.g. stress n=512) | `_is_dust_work()` in `tasks.py`; `finish_done()` after `start_ready` in `step()` |
+| Micro-step time semantics | Hidden multi-event steps | One event per `step()`; `critical` micro-step tests |
+
+---
+
+## Honest test coverage limits
+
+| What tests prove | What they do **not** prove |
+|------------------|----------------------------|
+| Micro-step loop, monotonic time | Full vLLM scheduler parity |
+| PD KV hold/release, organic decode preemption (tight HBM) | All eviction / placement policies |
+| Stress n=16 seed=42 regression (old deadlock) | Optimality of pull vs recompute |
+| 50/50 pass on stress-seeds 32–512 | Extreme HBM configs or write-mode PD |
+| Per-request metrics invariants | Production trace replay accuracy |
+
+`Simulator.run(wall_timeout_s=…)` fails fast instead of spinning to `max_steps`.
+
+---
+
+## PD 1P1D (read mode)
 
 ```python
 from pd import PDConfig
@@ -156,15 +272,9 @@ sim = Simulator(
 3. Pull completes → promote to `RUNNING` (P KV stays held until D finishes).
 4. Decode completes → release held KV on P; `free_request` on D.
 
-## vLLM divergences (intentional simplifications)
+**Not implemented:** PD write mode (early spawn, decode gates prefill).
 
-| Area | vLLM | Simulator |
-|------|------|-----------|
-| Unit of work | Tokens | Blocks (`block_size` tokens/block) |
-| Physical KV | Block table + refcounts | Content-keyed slots + holders |
-| Preempt | `kv_cache_manager.free` | `free_request` + reset cursor |
-| PD | KV connector, async match | Read mode: late spawn, `WAITING_REMOTE_KV`, deferred P release |
-| Eviction | LRU on physical blocks | Pluggable; default `FirstAvailableEviction` |
+---
 
 ## Request metrics
 
@@ -177,19 +287,47 @@ Each `Request` has `metrics: RequestMetrics` (simulation clock):
 | `computes`, `pulls`, `local_hits`, `evictions` | Per-request batch action counts |
 | `preemptions`, `remote_kv_admits`, `forward_steps` | Scheduler / batch counters |
 
-## Test coverage
+Aggregation CLI / sweep reporting: **not implemented** (fields exist per request).
+
+---
+
+## Test groups
 
 | Group | What it proves |
 |-------|----------------|
 | `unit` | Policies, task DAG, basic metrics |
-| `critical` | Micro-step loop, PD KV hold/release, **organic decode preemption** (tight HBM), stress n=16 regression |
-| `stress` | Full PD workload + per-request metrics + wall/step budgets |
+| `critical` | Micro-step loop, PD KV hold/release, organic decode preemption, n=16 regression |
+| `stress` / `stress-seeds` | Full PD workload + metrics + wall/step budgets (32–512 requests) |
 | `deadlock`, `pd`, `waiting` | Scheduler edge cases |
 
-`Simulator.run(wall_timeout_s=...)` aborts with a clear error instead of spinning until `max_steps`.
+---
 
-## Roadmap
+## Roadmap (prioritized for policy work)
 
-1. Metrics CLI / workload sweeps (per-request fields exist; aggregation TBD)
-2. Move cursor bump to schedule time
-3. PD write mode (early spawn); workload config file
+### P0 — placement + duplicates
+
+1. `PlacementPolicy` on compute complete (write to 0..N tiers).
+2. Per-tier `Memory` with independent eviction and capacity.
+3. `RetentionPolicy`: max copies per hash per tier / globally.
+4. Spill-on-evict (HBM victim → DRAM/SSD or drop).
+5. Touch order + `LRUEviction` default.
+
+### P1 — trustworthy pull vs recompute
+
+1. Wire prefill/decode forward cost into `CostBasedPullLookupPolicy`.
+2. Resource load = scheduled + running (+ optional queued).
+3. Range/batch pull tasks with amortized latency.
+4. In-flight source sharing.
+5. Optional prefetch queue.
+
+### P2 — experiment infrastructure
+
+1. Workload / trace config (prefix length, sharing, arrivals).
+2. Metrics aggregation CLI (pull ratio, evictions/tier, duplicate count, P99 latency).
+3. Policy sweep harness (fixed seeds, compare policies).
+
+### P3 — scheduler fidelity
+
+1. Move cursor bump to schedule time.
+2. PD write mode (early spawn).
+3. Workload config file for stress / benchmark runs.
