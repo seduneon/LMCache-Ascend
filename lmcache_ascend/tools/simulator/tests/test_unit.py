@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from engine import Engine
 from memory import BlockState, KVBlock, Memory
 from policies import (
     ComputeOnlyLookupPolicy,
@@ -79,8 +80,6 @@ def test_dram_retains_block_after_hbm_eviction() -> None:
 
 
 def test_placement_e2e_pull_from_dram() -> None:
-    from engine import Engine
-
     pool = TaskPool()
     memories = {
         "hbm": Memory(size=2, name="hbm"),
@@ -153,8 +152,6 @@ def test_spill_on_evict_without_prior_mirror() -> None:
 
 
 def test_spill_e2e_after_hbm_pressure() -> None:
-    from engine import Engine
-
     pool = TaskPool()
     memories = {
         "hbm": Memory(size=1, name="hbm"),
@@ -499,8 +496,6 @@ def test_local_satisfied_inflight() -> None:
 
 
 def test_request_metrics_phases() -> None:
-    from engine import Engine
-
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
     req = Request("r1", 1.0, ["a", "b"], RequestPD.PREFILL, RequestStatus.PENDING)
@@ -529,7 +524,6 @@ def test_request_metrics_phases() -> None:
 
 
 def test_request_metrics_pd_decode() -> None:
-    from engine import Engine
     from pd import PDConfig
 
     pool = TaskPool()
@@ -589,15 +583,18 @@ def test_request_metrics_pd_decode() -> None:
 
 def run_unit_tests() -> None:
     tests = [
+        # placement + spill
         test_hbm_and_dram_placement_creates_copy,
         test_dram_retains_block_after_hbm_eviction,
         test_placement_e2e_pull_from_dram,
         test_dram_lru_eviction_when_tier_full,
         test_spill_on_evict_without_prior_mirror,
         test_spill_e2e_after_hbm_pressure,
+        # eviction
         test_lru_eviction_picks_oldest_touch,
         test_lru_eviction_skips_held_and_excluded,
         test_lru_eviction_under_allocate_pressure,
+        # lookup / cost model
         test_lookup_compute,
         test_pull_only_rejects_compute_fallback,
         test_cost_model_picks_faster_pull_source,
@@ -607,10 +604,12 @@ def run_unit_tests() -> None:
         test_cost_model_pending_pulls_in_allocation,
         test_cost_model_link_scheduled_load,
         test_cost_model_pull_only_ignores_compute,
+        # scheduler / tasks / memory
         test_task_prereq_ordering,
         test_prefix_block_count_on_arrival,
         test_finish_frees_kv,
         test_local_satisfied_inflight,
+        # metrics
         test_request_metrics_phases,
         test_request_metrics_pd_decode,
     ]

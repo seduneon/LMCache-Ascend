@@ -1,14 +1,14 @@
-"""Optional progress logging for Simulator runs."""
+"""Optional progress logging for Simulator runs (``SIM_LOG=1``)."""
 
 from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from request import RequestPD, RequestStatus
-from tasks import EvictTask, ForwardTask, LoadTask, Task, TaskStatus
+from request import RequestStatus
+from tasks import EvictTask, ForwardTask, LoadTask, Task
 
 if TYPE_CHECKING:
     from engine import Engine
@@ -28,7 +28,6 @@ class SimLogConfig:
     enabled: bool = False
     detail: bool = False
     step_interval: int = 100
-    stall_threshold: int = 50
 
 
 @dataclass
@@ -45,8 +44,6 @@ class SimLogger:
         self.config = config or SimLogConfig()
         self.stream = stream or sys.stderr
         self.step = 0
-        self._last_snapshot_now: float | None = None
-        self._stall_steps = 0
 
     def _write(self, msg: str) -> None:
         if not self.config.enabled:
@@ -167,34 +164,6 @@ class SimLogger:
             f"[sim] event {sim.now:.4f} -> {t_next:.4f} running_tasks={running}"
         )
 
-    def on_drain_begin(self, sim: Simulator, tasks: list[Task]) -> None:
-        if not self.config.enabled or not self.config.detail or not tasks:
-            return
-        running = sum(1 for t in tasks if t.status == TaskStatus.RUNNING)
-        pending = sum(1 for t in tasks if t.status == TaskStatus.PENDING)
-        self._write(
-            f"[sim] t={sim.now:.4f} drain begin tasks={len(tasks)} "
-            f"pending={pending} running={running}"
-        )
-
-    def on_drain_advance(self, sim: Simulator, t_next: float, running: int) -> None:
-        if not self.config.enabled or not self.config.detail:
-            return
-        self._write(
-            f"[sim] t={sim.now:.4f} drain advance -> {t_next:.4f} "
-            f"running_tasks={running}"
-        )
-
-    def on_drain_end(self, sim: Simulator, tasks: list[Task], iterations: int) -> None:
-        if not self.config.enabled or not tasks:
-            return
-        if not self.config.detail and iterations <= 1:
-            return
-        self._write(
-            f"[sim] t={sim.now:.4f} drain end iterations={iterations} "
-            f"now={sim.now:.4f}"
-        )
-
     def on_apply(
         self,
         engine_id: str,
@@ -230,22 +199,6 @@ class SimLogger:
             return
         self._write(f"[sim] t={sim.now:.4f} kv released {req_id} on {prefill_id}")
 
-    def on_drain_tick(
-        self,
-        sim: Simulator,
-        t: float,
-        t_next: float,
-        iterations: int,
-        running: int,
-        total: int,
-    ) -> None:
-        if not self.config.enabled or not self.config.detail:
-            return
-        self._write(
-            f"[sim] drain t={t:.4f}->{t_next:.4f} iter={iterations} "
-            f"running={running}/{total}"
-        )
-
     def on_wait_arrival(self, sim: Simulator, t_next: float) -> None:
         if not self.config.enabled:
             return
@@ -253,28 +206,6 @@ class SimLogger:
             f"[sim] t={sim.now:.4f} idle batch, jump to arrival @ {t_next:.4f} "
             f"{self._format_engines(sim.engines)}"
         )
-
-    def on_stall_warning(self, sim: Simulator) -> None:
-        if not self.config.enabled:
-            return
-        self._write(
-            f"[sim] WARN stall? step={self.step} now={sim.now:.4f} unchanged for "
-            f"{self._stall_steps} steps with no batch work "
-            f"{self._format_engines(sim.engines)}"
-        )
-
-    def note_no_batch_progress(self, sim: Simulator) -> None:
-        """Detect repeated steps with no batch at the same simulated time."""
-        if not self.config.enabled:
-            return
-        now = sim.now
-        if self._last_snapshot_now is not None and now == self._last_snapshot_now:
-            self._stall_steps += 1
-            if self._stall_steps == self.config.stall_threshold:
-                self.on_stall_warning(sim)
-        else:
-            self._last_snapshot_now = now
-            self._stall_steps = 0
 
     def milestone(self, sim: Simulator, msg: str) -> None:
         if not self.config.enabled:

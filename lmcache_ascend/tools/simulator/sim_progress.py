@@ -73,13 +73,6 @@ class SimProgress:
         )
         print(line, end="", file=self.stream, flush=True)
 
-    def on_drain_tick(self, sim: Simulator, drain_iterations: int) -> None:
-        """Refresh bar during long batch drains (sim step has not finished yet)."""
-        if drain_iterations % max(1, self.config.update_interval) != 0:
-            return
-        done = self._decode_done(sim)
-        self._render(sim, done)
-
     def on_step(self, sim: Simulator) -> None:
         self.step += 1
         done = self._decode_done(sim)

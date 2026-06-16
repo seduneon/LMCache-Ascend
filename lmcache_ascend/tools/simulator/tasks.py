@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from enum import StrEnum
 
 from memory import BlockState, KVBlock, Memory

@@ -1,6 +1,5 @@
 from memory import KVBlock, Memory
-from policies import HBMOnly, HBMAndDRAM, PlacementPolicy
-from policies import LookupResult
+from policies import HBMOnly, LookupPolicy, LookupResult, PlacementPolicy
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
 from scheduler import Batch, BatchEntry, Scheduler
@@ -37,7 +36,7 @@ class Engine:
         pool: TaskPool,
         memories: dict[str, Memory],
         local_memory: str,
-        policy,
+        policy: LookupPolicy,
         compute_res: ComputeResource,
         bandwidth_res: BandwidthResource | None = None,
         transfer_links: dict[str, BandwidthResource] | None = None,

@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import heapq
 from collections import deque
 from dataclasses import dataclass, field
 
+from memory import Memory
 from policies import LookupPolicy, LookupResult, local_satisfied, slots_needed
 from request import Request, RequestPD, RequestStatus
 
@@ -28,7 +31,7 @@ class Scheduler:
     def __init__(
         self,
         policy: LookupPolicy,
-        memories: dict,
+        memories: dict[str, Memory],
         local_memory: str,
         *,
         max_num_seqs: int = 10_000,

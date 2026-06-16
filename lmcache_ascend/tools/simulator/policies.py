@@ -23,6 +23,9 @@ class LookupResult:
     blocks: BlockActions = field(default_factory=dict)
 
 
+# --- Eviction ---
+
+
 class EvictionPolicy(ABC):
     @abstractmethod
     def pick_victims(self, hbm: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
@@ -68,6 +71,9 @@ class LRUEviction(EvictionPolicy):
                     candidates.append(block)
         candidates.sort(key=lambda block: block.last_touch)
         return candidates[:count]
+
+
+# --- Placement ---
 
 
 class PlacementPolicy(ABC):
@@ -167,6 +173,9 @@ class HBMAndDRAM(PlacementPolicy):
         self._ensure_dram_resident(memories, block.hash, now)
 
 
+# --- Lookup helpers ---
+
+
 def local_satisfied(local: Memory, block_hash: str) -> bool:
     return (
         local.best_resident(block_hash) is not None
@@ -210,6 +219,9 @@ def first_resident_pull_source(
         if src.best_resident(block_hash) is not None:
             return src_key
     return None
+
+
+# --- Lookup ---
 
 
 class LookupPolicy(ABC):

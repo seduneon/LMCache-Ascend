@@ -21,18 +21,35 @@ python3.12 simulator.py stress-heavy              # larger stress run
 
 ## Architecture
 
+### Event loop
+
 | File | Role |
 |------|------|
-| `scheduler.py` | Queues, `schedule()` → `Batch` (RUNNING → WAITING, unified allocate + preempt) |
-| `engine.py` | `execute_batch()` (reserve, tasks), `apply_batch()` (advance state) |
 | `simulator.py` | Global clock, micro-step event loop, in-flight batches, PD spawn |
-| `sim_log.py` | Optional progress logging (`SimLogger`) |
-| `pd.py` | `PDConfig` — validates and applies read-mode flags to engines |
-| `policies.py` | `LookupPolicy`, `EvictionPolicy`, `PlacementPolicy` — pull/compute, eviction, tier mirroring |
+| `engine.py` | `execute_batch()` (reserve, tasks), `apply_batch()` (advance state) |
+| `scheduler.py` | Queues, `schedule()` → `Batch` (RUNNING → WAITING, unified allocate + preempt) |
 | `tasks.py` | `ForwardTask` (batched compute), `LoadTask` (pull), `EvictTask` |
 | `memory.py` | Content-keyed slot budget, holders, block states |
+| `resource.py` | `ComputeResource` / `BandwidthResource` with `schedule/start/finish` |
+
+### Policies and config
+
+| File | Role |
+|------|------|
+| `policies.py` | `EvictionPolicy`, `PlacementPolicy`, `LookupPolicy` and implementations |
+| `request.py` | Request state, PD phase, per-request metrics |
+| `pd.py` | `PDConfig` — validates and applies read-mode flags to engines |
+
+### Observability and tests
+
+| File | Role |
+|------|------|
+| `sim_log.py` | Optional progress logging (`SimLogger`, `SIM_LOG=1`) |
+| `sim_progress.py` | Live decode-completion bar for stress runs |
 | `tests/run_tests.py` | Integration tests and CLI |
 | `tests/test_unit.py` | Policy, task, memory, scheduler unit tests |
+| `tests/test_critical.py` | Micro-step, PD KV, memory, task DAG tests |
+| `tests/test_stress.py` | PD stress and seed sweeps |
 
 Each `Simulator.step()` advances `now` by **one discrete event**:
 
@@ -161,7 +178,7 @@ Use the gap sections below when designing experiments — running a sweep that a
 
 These are the main blockers for LMCache-style **where to put KV** and **how many copies to keep** experiments.
 
-### Write-side placement (not implemented)
+### Write-side placement (partial)
 
 | Gap | Today | Needed for vLLM/LMCache alignment |
 |-----|-------|-----------------------------------|
@@ -170,7 +187,7 @@ These are the main blockers for LMCache-style **where to put KV** and **how many
 | Per-tier capacity | HBM + DRAM independent `Memory(size=…)` | More tiers |
 | Spill on evict | **Partial:** `HBMAndDRAM.spill_on_evict` | Configurable spill vs drop policy |
 
-**Suggested hook:** `PlacementPolicy.on_block_resident(block_hash, req) → list[tier_keys]` and `on_evict_from(tier, block) → drop | spill_to`.
+Implemented via `PlacementPolicy.place_copy` and `PlacementPolicy.spill_on_evict`.
 
 ### Duplicate retention (partial structure only)
 
