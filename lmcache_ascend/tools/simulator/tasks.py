@@ -15,7 +15,6 @@ _TERMINAL = frozenset({TaskStatus.COMPLETED})
 _WORK_EPS = 1e-12
 # Remaining work whose completion time is below this cannot advance ``float`` time.
 _TIME_EPS = 1e-9
-_MAX_DRAIN_ITERS = 1_000_000
 
 
 class Task(ABC):
@@ -24,6 +23,13 @@ class Task(ABC):
         self.work_left = work_left
         self.resource = resource
         self.status = TaskStatus.PENDING
+        self._resource_reserved = False
+
+    def reserve_resource(self) -> None:
+        if self._resource_reserved:
+            return
+        self.resource.schedule()
+        self._resource_reserved = True
 
     def is_ready(self) -> bool:
         if self.status != TaskStatus.PENDING:
@@ -35,10 +41,11 @@ class Task(ABC):
     def start(self, time: float) -> None:
         assert self.status == TaskStatus.PENDING
         assert self.is_ready()
+        assert self._resource_reserved, "task.start() without reserve_resource()"
         self.status = TaskStatus.RUNNING
         # Latency elapses before work begins (matches time_for used at schedule time).
         self.now = time + self.resource.latency
-        self.resource.add()
+        self.resource.start()
         self.on_start()
 
     def _is_dust_work(self) -> bool:
@@ -69,7 +76,7 @@ class Task(ABC):
     def complete(self) -> None:
         assert self.status == TaskStatus.RUNNING
         assert self.work_left == 0
-        self.resource.remove()
+        self.resource.finish()
         self.on_end()
         self.status = TaskStatus.COMPLETED
 
@@ -102,6 +109,7 @@ class TaskPool:
 
     def add(self, task: Task, prereqs: list[Task]) -> None:
         task.prereqs = self.filter(prereqs)
+        task.reserve_resource()
         self.tasks.append(task)
 
     def compact(self) -> None:
@@ -127,83 +135,6 @@ class TaskPool:
         for task in list(self.running()):
             if task.is_done():
                 task.finish()
-
-
-def start_ready_tasks(tasks: list[Task], now: float) -> None:
-    for task in tasks:
-        if task.is_ready():
-            task.start(now)
-
-
-def _drain_status(tasks: list[Task]) -> str:
-    pending = sum(1 for t in tasks if t.status == TaskStatus.PENDING)
-    running = sum(1 for t in tasks if t.status == TaskStatus.RUNNING)
-    done = sum(1 for t in tasks if t.status in _TERMINAL)
-    return f"pending={pending} running={running} done={done}/{len(tasks)}"
-
-
-def drain_tasks(
-    tasks: list[Task],
-    now: float,
-    *,
-    on_tick=None,
-) -> tuple[float, int]:
-    """Run a batch-local task DAG until done. Returns (finish_time, drain_iterations)."""
-    if not tasks:
-        return now, 0
-
-    start_ready_tasks(tasks, now)
-    iterations = 0
-    t = now
-
-    while not all(task.status in _TERMINAL for task in tasks):
-        running = [task for task in tasks if task.status == TaskStatus.RUNNING]
-        if not running:
-            start_ready_tasks(tasks, t)
-            running = [task for task in tasks if task.status == TaskStatus.RUNNING]
-            if not running:
-                pending = [task for task in tasks if task.status == TaskStatus.PENDING]
-                raise RuntimeError(
-                    "drain deadlock: no runnable tasks. "
-                    f"{_drain_status(tasks)} pending_blocked={len(pending)}"
-                )
-
-        t_next = min(task.estimated_end() for task in running)
-        if t_next <= t:
-            stuck = [
-                task
-                for task in running
-                if not task.is_done() and task.estimated_end() <= t + _WORK_EPS
-            ]
-            if stuck:
-                raise RuntimeError(
-                    "drain stuck: running tasks make no time progress at "
-                    f"t={t:.6f} ({_drain_status(tasks)})"
-                )
-            for task in running:
-                if task.is_done():
-                    task.finish()
-            start_ready_tasks(tasks, t)
-            continue
-
-        iterations += 1
-        if iterations > _MAX_DRAIN_ITERS:
-            raise RuntimeError(
-                f"drain exceeded {_MAX_DRAIN_ITERS} iterations at t={t:.4f} "
-                f"({_drain_status(tasks)})"
-            )
-        if on_tick is not None:
-            on_tick(t, t_next, iterations, len(running), len(tasks))
-
-        for task in running:
-            task.advance_to(t_next)
-        for task in running:
-            if task.is_done():
-                task.finish()
-        t = t_next
-        start_ready_tasks(tasks, t)
-
-    return t, iterations
 
 
 class MemoryTask(Task):

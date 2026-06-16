@@ -3,18 +3,47 @@ from abc import ABC, abstractmethod
 
 class Resource(ABC):
     def __init__(self, latency: float = 0.0):
-        self.works = 0
+        self._running = 0
+        self._scheduled = 0
         self.latency = latency
 
-    def add(self):
-        self.works += 1
+    @property
+    def running(self) -> int:
+        return self._running
 
-    def remove(self):
-        self.works -= 1
+    @property
+    def scheduled(self) -> int:
+        return self._scheduled
+
+    @property
+    def works(self) -> int:
+        """Running tasks (alias kept for ``speed()`` and existing tests)."""
+        return self._running
+
+    def queued_load(self) -> int:
+        """Running plus reserved (pool-pending) consumers."""
+        return self._running + self._scheduled
+
+    def schedule(self) -> None:
+        """Reserve this resource for a task not yet running."""
+        self._scheduled += 1
+
+    def start(self) -> None:
+        """Move one reserved slot to running."""
+        if self._scheduled <= 0:
+            raise RuntimeError("resource.start() called without schedule()")
+        self._scheduled -= 1
+        self._running += 1
+
+    def finish(self) -> None:
+        """Release one running slot."""
+        if self._running <= 0:
+            raise RuntimeError("resource.finish() called without a running task")
+        self._running -= 1
 
     @abstractmethod
     def speed(self, works: int | None = None) -> float:
-        """Effective throughput with ``works`` concurrent consumers (default: ``self.works``)."""
+        """Effective throughput with ``works`` concurrent consumers (default: ``self.running``)."""
         pass
 
     def time_for(self, work: float, works: int | None = None) -> float:
@@ -35,7 +64,7 @@ class ComputeResource(Resource):
         return self._base_speed
 
     def speed(self, works: int | None = None) -> float:
-        n = self.works if works is None else works
+        n = self._running if works is None else works
         if n <= 0:
             return 0.0
         return self._base_speed / n
@@ -51,7 +80,7 @@ class BandwidthResource(Resource):
         return self._base_speed
 
     def speed(self, works: int | None = None) -> float:
-        n = self.works if works is None else works
+        n = self._running if works is None else works
         if n <= 0:
             return 0.0
         return self._base_speed / n

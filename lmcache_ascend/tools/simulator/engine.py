@@ -81,6 +81,9 @@ class Engine:
             transfer_links=self.transfer_links,
             work_per_transfer=self.work_per_transfer,
             work_per_block=self.work_per_block,
+            work_per_prefill_token=self.work_per_prefill_token,
+            work_per_decode_req=self.work_per_decode_req,
+            block_size=self.block_size,
         )
 
         self.scheduler = Scheduler(

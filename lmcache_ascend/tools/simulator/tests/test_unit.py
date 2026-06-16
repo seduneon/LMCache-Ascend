@@ -127,12 +127,128 @@ def test_cost_model_prefers_compute_under_load() -> None:
 
     compute_res = ComputeResource(base_speed=10.0)
     congested_link = BandwidthResource(base_speed=1.0)
-    congested_link.works = 9
+    for _ in range(9):
+        congested_link.schedule()
+        congested_link.start()
 
     policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
     policy.bind_resources(
         compute_res=compute_res,
         transfer_links={"src": congested_link},
+        work_per_transfer=1.0,
+        work_per_block=1.0,
+    )
+
+    assert policy.resolve_actions(memories, ["a"])["a"] == "compute"
+
+
+def test_cost_model_prefill_recompute_expensive() -> None:
+    memories = {
+        "src": Memory(size=10, name="src"),
+        "dst": Memory(size=10, name="dst"),
+    }
+    _make_resident(memories["src"], "a")
+
+    req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 1
+
+    compute_res = ComputeResource(base_speed=1.0)
+    link = BandwidthResource(base_speed=10.0, latency=0.0)
+    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy.bind_resources(
+        compute_res=compute_res,
+        transfer_links={"src": link},
+        work_per_transfer=1.0,
+        work_per_block=1.0,
+        work_per_prefill_token=100.0,
+        work_per_decode_req=1.0,
+        block_size=4,
+    )
+
+    assert policy.resolve_actions(memories, ["a"], req=req, block_size=4)["a"] == (
+        "pull",
+        "src",
+    )
+
+
+def test_cost_model_decode_recompute_cheap() -> None:
+    memories = {
+        "src": Memory(size=10, name="src"),
+        "dst": Memory(size=10, name="dst"),
+    }
+    _make_resident(memories["src"], "a")
+
+    req = Request(
+        "r1",
+        0.0,
+        ["p"],
+        RequestPD.DECODE,
+        RequestStatus.RUNNING,
+        max_output_blocks=1,
+    )
+    req.prefix_block_count = 1
+    req.num_computed_blocks = 1
+
+    compute_res = ComputeResource(base_speed=100.0)
+    slow_link = BandwidthResource(base_speed=1.0, latency=0.5)
+    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy.bind_resources(
+        compute_res=compute_res,
+        transfer_links={"src": slow_link},
+        work_per_transfer=1.0,
+        work_per_block=1.0,
+        work_per_prefill_token=100.0,
+        work_per_decode_req=0.01,
+        block_size=1,
+    )
+
+    assert policy.resolve_actions(memories, ["a"], req=req)["a"] == "compute"
+
+
+def test_cost_model_pending_pulls_in_allocation() -> None:
+    memories = {
+        "src": Memory(size=10, name="src"),
+        "dst": Memory(size=10, name="dst"),
+    }
+    _make_resident(memories["src"], "a")
+    _make_resident(memories["src"], "b")
+
+    req = Request("r1", 0.0, ["a", "b"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 2
+
+    compute_res = ComputeResource(base_speed=100.0)
+    link = BandwidthResource(base_speed=1.0, latency=0.0)
+    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy.bind_resources(
+        compute_res=compute_res,
+        transfer_links={"src": link},
+        work_per_transfer=1.0,
+        work_per_block=1.0,
+        work_per_prefill_token=100.0,
+        block_size=1,
+    )
+
+    actions = policy.resolve_actions(memories, ["a", "b"], req=req, block_size=1)
+    assert actions["a"] == ("pull", "src")
+    assert actions["b"] == "compute"
+
+
+def test_cost_model_link_scheduled_load() -> None:
+    memories = {
+        "src": Memory(size=10, name="src"),
+        "dst": Memory(size=10, name="dst"),
+    }
+    _make_resident(memories["src"], "a")
+
+    compute_res = ComputeResource(base_speed=10.0)
+    link = BandwidthResource(base_speed=2.0, latency=0.0)
+    for _ in range(4):
+        link.schedule()
+
+    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy.bind_resources(
+        compute_res=compute_res,
+        transfer_links={"src": link},
         work_per_transfer=1.0,
         work_per_block=1.0,
     )
@@ -268,6 +384,10 @@ def run_unit_tests() -> None:
         test_pull_only_rejects_compute_fallback,
         test_cost_model_picks_faster_pull_source,
         test_cost_model_prefers_compute_under_load,
+        test_cost_model_prefill_recompute_expensive,
+        test_cost_model_decode_recompute_cheap,
+        test_cost_model_pending_pulls_in_allocation,
+        test_cost_model_link_scheduled_load,
         test_cost_model_pull_only_ignores_compute,
         test_task_prereq_ordering,
         test_prefix_block_count_on_arrival,

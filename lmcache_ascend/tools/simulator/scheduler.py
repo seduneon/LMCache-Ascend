@@ -198,6 +198,7 @@ class Scheduler:
         self.completed.append(req)
 
     def schedule(self, now: float | None = None, *, engine_id: str | None = None) -> Batch:
+        self.policy.begin_allocate_batch()
         batch = Batch()
         scheduled_ids: set[str] = set()
         token_budget = self.max_num_batched_tokens
@@ -321,7 +322,11 @@ class Scheduler:
     ) -> LookupResult | None:
         local = self._local()
         actions = self.policy.resolve_actions(
-            self.memories, block_hashes, allow_compute=not pull_only
+            self.memories,
+            block_hashes,
+            allow_compute=not pull_only,
+            req=req,
+            block_size=self.block_size,
         )
         if actions is None:
             return None

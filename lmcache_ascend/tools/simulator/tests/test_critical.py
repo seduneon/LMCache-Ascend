@@ -9,7 +9,7 @@ from resource import BandwidthResource, ComputeResource
 from scheduler import Batch, BatchEntry
 from sim_log import SimLogConfig
 from simulator import Simulator
-from tasks import Task, TaskPool, TaskStatus, drain_tasks
+from tasks import Task, TaskPool, TaskStatus
 
 
 class _SimpleTask(Task):
@@ -395,6 +395,7 @@ def test_parallel_pull_tasks_start_together() -> None:
 def test_task_latency_before_work() -> None:
     res = ComputeResource(base_speed=2.0, latency=0.25)
     task = _SimpleTask(1.0, res)
+    task.reserve_resource()
     task.start(1.0)
     assert task.now == 1.25
     assert task.estimated_end() == 1.25 + 0.5
@@ -424,33 +425,6 @@ def test_shared_block_survives_partial_free() -> None:
     assert mem.used_size() == 0
 
 
-def test_drain_tasks_completes_dag() -> None:
-    res = ComputeResource(base_speed=1.0)
-    first = _SimpleTask(1.0, res)
-    second = _SimpleTask(1.0, res)
-    second.prereqs = [first]
-    tasks = [first, second]
-
-    finish, iters = drain_tasks(tasks, 0.0)
-    assert finish == 2.0
-    assert iters == 2
-    assert all(t.status == TaskStatus.COMPLETED for t in tasks)
-
-
-def test_drain_tasks_detects_deadlock() -> None:
-    res = ComputeResource(base_speed=1.0)
-    a = _SimpleTask(1.0, res)
-    b = _SimpleTask(1.0, res)
-    a.prereqs = [b]
-    b.prereqs = [a]
-
-    try:
-        drain_tasks([a, b], 0.0)
-        raise AssertionError("expected RuntimeError for cyclic prereqs")
-    except RuntimeError as exc:
-        assert "deadlock" in str(exc).lower()
-
-
 def run_critical_tests() -> None:
     tests = [
         test_micro_step_waits_for_arrival,
@@ -466,8 +440,6 @@ def run_critical_tests() -> None:
         test_task_latency_before_work,
         test_held_blocks_not_evictable,
         test_shared_block_survives_partial_free,
-        test_drain_tasks_completes_dag,
-        test_drain_tasks_detects_deadlock,
     ]
     for test in tests:
         test()

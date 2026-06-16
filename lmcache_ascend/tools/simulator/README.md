@@ -81,11 +81,20 @@ LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())
 `CostBasedPullLookupPolicy` cost model (at **schedule** time):
 
 ```text
-time_for(work, works) = latency + work / speed(works)
-t_pull      = link.time_for(work_per_transfer, link.works + 1)
-t_recompute = compute.time_for(work_per_block, compute.works + 1)
+time_for(work, load) = latency + work / speed(load)
+load(link)   = link.queued_load() + pending_pulls_in_this_allocation + 1
+load(compute)= compute.queued_load() + (1 if forward not yet reserved else 0) + 1
+
+recompute_work = work_per_prefill_token * block_size   (prefill chunk)
+              | work_per_decode_req                    (decode step)
+              | work_per_block                         (fallback)
+
+t_pull      = link.time_for(work_per_transfer, load(link))
+t_recompute = compute.time_for(recompute_work, load(compute))  # 0 if forward already reserved
 action      = argmin(t_pull, t_recompute)   # tie → pull
 ```
+
+`Resource.queued_load()` = `running` + `scheduled`. Tasks call `schedule()` via `TaskPool.add` / `Task.reserve_resource()`, then `start()` / `finish()` on the resource at task lifecycle transitions.
 
 ```python
 fast = BandwidthResource(base_speed=100.0, latency=0.01)
@@ -108,7 +117,7 @@ Engine(
 
 | Policy area | Readiness | Notes |
 |-------------|-----------|-------|
-| Pull vs recompute (read path) | **~70–80%** | Cost-based + ordered pull work on HBM + read-only remote tiers |
+| Pull vs recompute (read path) | **~85%** | Token-aware recompute + queued load on links/compute |
 | Placement / eviction / duplicates | **~30–40%** | HBM eviction + custom victims only; no write path or tier retention |
 | vLLM scheduler shape | **~85%** | Batching, preempt, chunked prefill, PD read mode |
 | Sweep infrastructure | **~40%** | Per-request metrics exist; no trace replay or aggregation CLI |
@@ -176,16 +185,16 @@ These affect whether cost-based decisions match production behavior.
 ### What works today
 
 - Per-block `resolve_block()` → local hit, `("pull", src)`, or `"compute"`.
-- Per-link `BandwidthResource` with shared `works` (concurrent load splits bandwidth).
+- Token-aware recompute cost (prefill tokens vs decode steps) in `CostBasedPullLookupPolicy`.
+- Per-link `BandwidthResource` with `queued_load()` = running + scheduled pool tasks.
+- Pending pulls / forward reservation tracked within one `resolve_actions` call.
 - `OrderedPullLookupPolicy` tier preference; `CostBasedPullLookupPolicy` min-cost vs recompute.
 - Pull tasks depend on evict tasks; forward depends on evict + pull (DAG in `TaskPool`).
 
-### Cost model gaps
+### Cost model gaps (remaining)
 
 | Gap | Impact |
 |-----|--------|
-| **Schedule-time snapshot** | Cost uses `link.works + 1` when the batch is **built**, not when the pull starts. Under load, queued-but-not-started pulls are invisible. |
-| **Flat recompute cost in policy** | `CostBasedPullLookupPolicy` uses `work_per_block`; actual forward uses `work_per_prefill_token` / `work_per_decode_req` in `engine.forward_cost` but that is **not wired into the policy decision**. Long-prefill vs decode-token bias. |
 | **Per-block independence** | Each block gets its own pull/compute choice. No range pull, no amortized latency across a prefix chunk. |
 | **Tie-break** | Equal cost → pull. Production may prefer compute to avoid tier churn. |
 
@@ -193,7 +202,6 @@ These affect whether cost-based decisions match production behavior.
 
 | Gap | Impact |
 |-----|--------|
-| **Planned vs running load** | `Resource.works` counts started tasks only. Scheduled pulls in the same batch don’t inflate `works` until `Task.start()`. |
 | **Multi-hop / PD link** | `pull_sources` can point at another engine’s memory, but no separate interconnect model (NVLink vs PCIe vs RDMA, metadata lookup delay). |
 | **Per-tier request queues** | No fairness, priority, or depth limits on pull queues per medium. |
 | **In-flight source block** | If source has `inflight_incoming(hash)`, `resolve_block` returns `None` → allocation fails → may preempt. vLLM often waits or shares in-flight loads. |
@@ -201,11 +209,9 @@ These affect whether cost-based decisions match production behavior.
 
 ### Pull vs recompute — suggested fixes (priority)
 
-1. Wire `forward_cost` (prefill tokens vs decode steps) into `CostBasedPullLookupPolicy`.
-2. Expose **scheduled + running** load per resource to policies.
-3. Range/batch `LoadTask` with latency amortized once per range.
-4. In-flight source sharing instead of hard `None`.
-5. Optional prefetch queue.
+1. Range/batch `LoadTask` with latency amortized once per range.
+2. In-flight source sharing instead of hard `None`.
+3. Optional prefetch queue.
 
 ---
 
@@ -312,13 +318,11 @@ Aggregation CLI / sweep reporting: **not implemented** (fields exist per request
 4. Spill-on-evict (HBM victim → DRAM/SSD or drop).
 5. Touch order + `LRUEviction` default.
 
-### P1 — trustworthy pull vs recompute
+### P1 — trustworthy pull vs recompute (remaining)
 
-1. Wire prefill/decode forward cost into `CostBasedPullLookupPolicy`.
-2. Resource load = scheduled + running (+ optional queued).
-3. Range/batch pull tasks with amortized latency.
-4. In-flight source sharing.
-5. Optional prefetch queue.
+1. Range/batch pull tasks with amortized latency.
+2. In-flight source sharing.
+3. Optional prefetch queue.
 
 ### P2 — experiment infrastructure
 

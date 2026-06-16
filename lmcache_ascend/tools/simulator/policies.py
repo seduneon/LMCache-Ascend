@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from memory import KVBlock, Memory
+from request import Request
 
 if TYPE_CHECKING:
     from resource import BandwidthResource, ComputeResource
@@ -69,6 +70,22 @@ def slots_needed(actions: BlockActions) -> int:
     )
 
 
+def recompute_work(
+    req: Request | None,
+    *,
+    block_size: int,
+    work_per_prefill_token: float,
+    work_per_decode_req: float,
+    work_per_block: float,
+) -> float:
+    """Work units for one recompute decision (matches ``engine.forward_cost`` per block)."""
+    if req is None:
+        return work_per_block
+    if req.is_prefill_chunk():
+        return work_per_prefill_token * block_size
+    return work_per_decode_req
+
+
 def first_resident_pull_source(
     memories: dict[str, Memory],
     pull_sources: list[str],
@@ -106,6 +123,8 @@ class LookupPolicy(ABC):
         block_hash: str,
         *,
         allow_compute: bool,
+        req: Request | None = None,
+        block_size: int = 1,
     ) -> BlockResolution:
         pass
 
@@ -116,8 +135,14 @@ class LookupPolicy(ABC):
         transfer_links: dict[str, BandwidthResource] | None,
         work_per_transfer: float,
         work_per_block: float,
+        work_per_prefill_token: float | None = None,
+        work_per_decode_req: float | None = None,
+        block_size: int = 1,
     ) -> None:
         """Optional hook for Engine to wire runtime resources (cost-based policies)."""
+
+    def begin_allocate_batch(self) -> None:
+        """Reset per-batch reservation state before ``schedule()`` allocations."""
 
     def lookup(
         self, memories: dict[str, Memory], block_hashes: list[str]
@@ -138,11 +163,17 @@ class LookupPolicy(ABC):
         block_hashes: list[str],
         *,
         allow_compute: bool = True,
+        req: Request | None = None,
+        block_size: int = 1,
     ) -> BlockActions | None:
         actions: BlockActions = {}
         for block_hash in block_hashes:
             resolution = self.resolve_block(
-                memories, block_hash, allow_compute=allow_compute
+                memories,
+                block_hash,
+                allow_compute=allow_compute,
+                req=req,
+                block_size=block_size,
             )
             if resolution is None:
                 return None
@@ -165,6 +196,8 @@ class ComputeOnlyLookupPolicy(LookupPolicy):
         block_hash: str,
         *,
         allow_compute: bool,
+        req: Request | None = None,
+        block_size: int = 1,
     ) -> BlockResolution:
         local = memories[self.local_memory]
         if local_satisfied(local, block_hash):
@@ -196,6 +229,8 @@ class OrderedPullLookupPolicy(LookupPolicy):
         block_hash: str,
         *,
         allow_compute: bool,
+        req: Request | None = None,
+        block_size: int = 1,
     ) -> BlockResolution:
         local = memories[self.local_memory]
         if local_satisfied(local, block_hash):
@@ -225,6 +260,13 @@ class CostBasedPullLookupPolicy(LookupPolicy):
         self._transfer_links: dict[str, BandwidthResource] = {}
         self._work_per_transfer = 1.0
         self._work_per_block = 1.0
+        self._work_per_prefill_token = 1.0
+        self._work_per_decode_req = 1.0
+        self._block_size = 1
+        self._pending_pulls: dict[str, int] = {}
+        self._forward_reserved_in_alloc = False
+        self._alloc_req: Request | None = None
+        self._alloc_block_size = 1
 
     @property
     def pull_sources(self) -> list[str]:
@@ -237,11 +279,78 @@ class CostBasedPullLookupPolicy(LookupPolicy):
         transfer_links: dict[str, BandwidthResource] | None,
         work_per_transfer: float,
         work_per_block: float,
+        work_per_prefill_token: float | None = None,
+        work_per_decode_req: float | None = None,
+        block_size: int = 1,
     ) -> None:
         self._compute_res = compute_res
         self._transfer_links = transfer_links or {}
         self._work_per_transfer = work_per_transfer
         self._work_per_block = work_per_block
+        self._work_per_prefill_token = (
+            work_per_prefill_token
+            if work_per_prefill_token is not None
+            else work_per_block
+        )
+        self._work_per_decode_req = (
+            work_per_decode_req if work_per_decode_req is not None else work_per_block
+        )
+        self._block_size = block_size
+
+    def begin_allocate_batch(self) -> None:
+        self._pending_pulls = {}
+        self._forward_reserved_in_alloc = False
+
+    def resolve_actions(
+        self,
+        memories: dict[str, Memory],
+        block_hashes: list[str],
+        *,
+        allow_compute: bool = True,
+        req: Request | None = None,
+        block_size: int = 1,
+    ) -> BlockActions | None:
+        self._alloc_req = req
+        self._alloc_block_size = block_size
+        return super().resolve_actions(
+            memories,
+            block_hashes,
+            allow_compute=allow_compute,
+            req=req,
+            block_size=block_size,
+        )
+
+    def _pull_time(self, link: BandwidthResource, src_key: str) -> float:
+        pending = self._pending_pulls.get(src_key, 0)
+        return link.time_for(
+            self._work_per_transfer,
+            link.queued_load() + pending + 1,
+        )
+
+    def _compute_time(self) -> float:
+        if self._forward_reserved_in_alloc:
+            return 0.0
+        compute_res = self._compute_res
+        assert compute_res is not None
+        work = recompute_work(
+            self._alloc_req,
+            block_size=self._alloc_block_size,
+            work_per_prefill_token=self._work_per_prefill_token,
+            work_per_decode_req=self._work_per_decode_req,
+            work_per_block=self._work_per_block,
+        )
+        pending_forward = 1
+        return compute_res.time_for(
+            work,
+            compute_res.queued_load() + pending_forward,
+        )
+
+    def _note_resolution(self, resolution: BlockResolution) -> None:
+        if isinstance(resolution, tuple) and resolution[0] == "pull":
+            src_key = resolution[1]
+            self._pending_pulls[src_key] = self._pending_pulls.get(src_key, 0) + 1
+        elif resolution == "compute":
+            self._forward_reserved_in_alloc = True
 
     def resolve_block(
         self,
@@ -249,6 +358,8 @@ class CostBasedPullLookupPolicy(LookupPolicy):
         block_hash: str,
         *,
         allow_compute: bool,
+        req: Request | None = None,
+        block_size: int = 1,
     ) -> BlockResolution:
         local = memories[self.local_memory]
         if local_satisfied(local, block_hash):
@@ -259,9 +370,13 @@ class CostBasedPullLookupPolicy(LookupPolicy):
                 memories, self._pull_sources, block_hash
             )
             if src_key is not None:
-                return ("pull", src_key)
+                resolution: BlockResolution = ("pull", src_key)
+                self._note_resolution(resolution)
+                return resolution
             if allow_compute:
-                return "compute"
+                resolution = "compute"
+                self._note_resolution(resolution)
+                return resolution
             return None
 
         pull_candidates: list[tuple[float, int, str]] = []
@@ -278,7 +393,7 @@ class CostBasedPullLookupPolicy(LookupPolicy):
                 continue
             pull_candidates.append(
                 (
-                    link.time_for(self._work_per_transfer, link.works + 1),
+                    self._pull_time(link, src_key),
                     order,
                     src_key,
                 )
@@ -292,18 +407,24 @@ class CostBasedPullLookupPolicy(LookupPolicy):
 
         if best_pull is None:
             if allow_compute:
-                return "compute"
+                resolution = "compute"
+                self._note_resolution(resolution)
+                return resolution
             return None
 
         if not allow_compute:
-            return ("pull", best_pull[2])
+            resolution = ("pull", best_pull[2])
+            self._note_resolution(resolution)
+            return resolution
 
-        compute_res = self._compute_res
-        t_compute = compute_res.time_for(self._work_per_block, compute_res.works + 1)
+        t_compute = self._compute_time()
         t_pull = best_pull[0]
 
         if t_pull < t_compute:
-            return ("pull", best_pull[2])
-        if t_compute < t_pull:
-            return "compute"
-        return ("pull", best_pull[2])
+            resolution = ("pull", best_pull[2])
+        elif t_compute < t_pull:
+            resolution = "compute"
+        else:
+            resolution = ("pull", best_pull[2])
+        self._note_resolution(resolution)
+        return resolution
