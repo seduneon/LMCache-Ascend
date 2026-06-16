@@ -13,6 +13,8 @@ class TaskStatus(StrEnum):
 
 _TERMINAL = frozenset({TaskStatus.COMPLETED})
 _WORK_EPS = 1e-12
+# Remaining work whose completion time is below this cannot advance ``float`` time.
+_TIME_EPS = 1e-9
 _MAX_DRAIN_ITERS = 1_000_000
 
 
@@ -39,17 +41,25 @@ class Task(ABC):
         self.resource.add()
         self.on_start()
 
+    def _is_dust_work(self) -> bool:
+        if self.work_left <= _WORK_EPS:
+            return True
+        rate = self.resource.speed()
+        if rate <= 0:
+            return False
+        return self.work_left / rate <= _TIME_EPS
+
     def advance_to(self, time: float) -> None:
         assert self.status == TaskStatus.RUNNING
         if time <= self.now:
             return
         self.work_left -= (time - self.now) * self.resource.speed()
         self.now = time
-        if self.work_left <= _WORK_EPS:
+        if self._is_dust_work():
             self.work_left = 0.0
 
     def is_done(self) -> bool:
-        return self.work_left <= _WORK_EPS
+        return self._is_dust_work()
 
     def finish(self) -> None:
         assert self.work_left <= 0
@@ -74,9 +84,12 @@ class Task(ABC):
     def estimated_end(self):
         assert self.status == TaskStatus.RUNNING
         rate = self.resource.speed()
-        if rate <= 0 or self.work_left <= _WORK_EPS:
+        if rate <= 0 or self._is_dust_work():
             return self.now
-        return self.now + self.work_left / rate
+        end = self.now + self.work_left / rate
+        if end <= self.now:
+            return self.now + _TIME_EPS
+        return end
 
 
 class TaskPool:

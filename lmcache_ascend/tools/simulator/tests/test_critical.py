@@ -7,6 +7,7 @@ from policies import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
 from scheduler import Batch, BatchEntry
+from sim_log import SimLogConfig
 from simulator import Simulator
 from tasks import Task, TaskPool, TaskStatus, drain_tasks
 
@@ -210,8 +211,8 @@ def test_pd_kv_held_after_remote_kv_promote() -> None:
     assert prefill_done.kv_held_for_transfer
 
 
-def test_pd_kv_survives_decode_preemption() -> None:
-    """If D is preempted after a prefix pull, P must still hold blocks for re-pull."""
+def test_pd_kv_survives_manual_preemption() -> None:
+    """Narrow: scheduler preempt hook after remote-KV promote; sim must recover."""
     sim, npu0, npu1, memories, _ = _pd_engines(
         prefill_requests=[
             Request(
@@ -263,6 +264,59 @@ def test_pd_kv_survives_decode_preemption() -> None:
     assert not prefill.kv_held_for_transfer
     assert memories["npu-0:hbm"].used_size() == 0
     assert memories["npu-1:hbm"].used_size() == 0
+
+
+def test_pd_organic_decode_preemption_e2e() -> None:
+    """Tight decode HBM forces real scheduler preemption; full PD path must finish."""
+    blocks = ["a", "b", "c", "d"]
+    sim, npu0, npu1, memories, _ = _pd_engines(
+        prefill_requests=[
+            Request(
+                f"r{i}",
+                i * 0.05,
+                blocks,
+                RequestPD.PREFILL,
+                RequestStatus.PENDING,
+                max_output_blocks=2,
+            )
+            for i in range(3)
+        ],
+        decode_hbm=6,
+        max_num_seqs=3,
+    )
+
+    sim.run(wall_timeout_s=30.0)
+
+    assert len(npu0.completed) == 3
+    assert len(npu1.completed) == 3
+    decode_preemptions = sum(r.metrics.preemptions for r in npu1.completed)
+    assert decode_preemptions >= 1, (
+        "expected organic decode-side preemption under tight HBM"
+    )
+    preempted = next(r for r in npu1.completed if r.metrics.preemptions >= 1)
+    assert preempted.metrics.pulls + preempted.metrics.local_hits >= 1
+    for req_id in ("r0", "r1", "r2"):
+        prefill = next(r for r in npu0.completed if r.req_id == req_id)
+        decode = next(r for r in npu1.completed if r.req_id == req_id)
+        assert not prefill.kv_held_for_transfer
+        assert decode.metrics.finished_at is not None
+        assert decode.metrics.computes >= 2
+    assert memories["npu-0:hbm"].used_size() == 0
+    assert memories["npu-1:hbm"].used_size() == 0
+
+
+def test_stress_n16_seed42_regression() -> None:
+    """Regression for the n=16 PD deadlock (early P KV release + decode preempt)."""
+    from tests.test_stress import StressConfig, run_stress_test
+
+    run_stress_test(
+        StressConfig(
+            num_requests=16,
+            seed=42,
+            show_progress=False,
+            log=SimLogConfig(enabled=False),
+        )
+    )
 
 
 def test_pd_kv_released_only_on_decode_complete() -> None:
@@ -404,7 +458,9 @@ def run_critical_tests() -> None:
         test_in_flight_blocks_reschedule,
         test_time_monotonic_across_steps,
         test_pd_kv_held_after_remote_kv_promote,
-        test_pd_kv_survives_decode_preemption,
+        test_pd_kv_survives_manual_preemption,
+        test_pd_organic_decode_preemption_e2e,
+        test_stress_n16_seed42_regression,
         test_pd_kv_released_only_on_decode_complete,
         test_parallel_pull_tasks_start_together,
         test_task_latency_before_work,

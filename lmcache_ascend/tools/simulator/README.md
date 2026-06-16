@@ -13,6 +13,8 @@ python3.12 simulator.py waiting    # waiting preempt + queue rotation
 python3.12 simulator.py unit       # unit tests only
 python3.12 simulator.py critical   # micro-step, PD KV, memory, task DAG tests
 python3.12 simulator.py stress     # PD stress test (progress logs on stderr)
+python3.12 simulator.py stress-seeds  # 10 random seeds × each size (32–512)
+python3.12 simulator.py stress-benchmark  # one run per size, with progress
 SIM_LOG_DETAIL=1 python3.12 simulator.py stress   # verbose per-batch logs
 python3.12 simulator.py stress-heavy              # larger stress run
 ```
@@ -151,8 +153,8 @@ sim = Simulator(
 
 1. P prefill completes → KV held on P (`finish_prefill_held`).
 2. Decode spawned on D → `WAITING_REMOTE_KV`: pre-alloc D slots + pull batch.
-3. Pull completes → promote to `RUNNING`, `free_request` on P.
-4. Decode output steps; `free_request` on D when done.
+3. Pull completes → promote to `RUNNING` (P KV stays held until D finishes).
+4. Decode completes → release held KV on P; `free_request` on D.
 
 ## vLLM divergences (intentional simplifications)
 
@@ -164,8 +166,30 @@ sim = Simulator(
 | PD | KV connector, async match | Read mode: late spawn, `WAITING_REMOTE_KV`, deferred P release |
 | Eviction | LRU on physical blocks | Pluggable; default `FirstAvailableEviction` |
 
+## Request metrics
+
+Each `Request` has `metrics: RequestMetrics` (simulation clock):
+
+| Field | Meaning |
+|-------|---------|
+| `queue_time`, `run_time`, `remote_kv_time` | Accumulated phase time |
+| `latency` | `finished_at - released_at` |
+| `computes`, `pulls`, `local_hits`, `evictions` | Per-request batch action counts |
+| `preemptions`, `remote_kv_admits`, `forward_steps` | Scheduler / batch counters |
+
+## Test coverage
+
+| Group | What it proves |
+|-------|----------------|
+| `unit` | Policies, task DAG, basic metrics |
+| `critical` | Micro-step loop, PD KV hold/release, **organic decode preemption** (tight HBM), stress n=16 regression |
+| `stress` | Full PD workload + per-request metrics + wall/step budgets |
+| `deadlock`, `pd`, `waiting` | Scheduler edge cases |
+
+`Simulator.run(wall_timeout_s=...)` aborts with a clear error instead of spinning until `max_steps`.
+
 ## Roadmap
 
-1. Run metrics (evictions, pulls, computes, preemptions)
+1. Metrics CLI / workload sweeps (per-request fields exist; aggregation TBD)
 2. Move cursor bump to schedule time
 3. PD write mode (early spawn); workload config file

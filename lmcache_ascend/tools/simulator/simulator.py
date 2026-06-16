@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from engine import Engine
@@ -56,7 +57,7 @@ class Simulator:
         for eng in self.engines.values():
             if eng.engine_id in self._in_flight:
                 continue
-            batch = eng.schedule()
+            batch = eng.schedule(self.now)
             if self.log:
                 self.log.on_schedule(eng.engine_id, self, batch)
             if not batch.entries:
@@ -112,7 +113,7 @@ class Simulator:
                 continue
 
             eng = self.engines[eng_id]
-            finished, remote_kv_done = eng.apply_batch(inflight.batch)
+            finished, remote_kv_done = eng.apply_batch(inflight.batch, self.now)
             completed_by_engine[eng_id] = finished
             remote_kv_by_engine[eng_id] = remote_kv_done
             del self._in_flight[eng_id]
@@ -181,6 +182,7 @@ class Simulator:
 
         self._schedule_engines()
         self.pool.start_ready(self.now)
+        self.pool.finish_done()
 
         t_next = self._next_event_time()
         if t_next is None:
@@ -203,7 +205,12 @@ class Simulator:
         self._apply_completed_batches()
         return True
 
-    def run(self, max_steps: int = 100_000) -> float:
+    def run(
+        self,
+        max_steps: int = 100_000,
+        *,
+        wall_timeout_s: float | None = None,
+    ) -> float:
         if self.log:
             self.log.on_run_start(self)
         if self.progress:
@@ -212,7 +219,16 @@ class Simulator:
         steps = 0
         hit_max_steps = True
         self.event_steps = 0
+        wall_start = time.perf_counter() if wall_timeout_s is not None else None
         for _ in range(max_steps):
+            if wall_timeout_s is not None and wall_start is not None:
+                elapsed = time.perf_counter() - wall_start
+                if elapsed > wall_timeout_s:
+                    raise RuntimeError(
+                        f"simulation exceeded wall_timeout_s={wall_timeout_s:.1f} "
+                        f"after {self.event_steps} event-steps at now={self.now:.4f} "
+                        f"(possible livelock; elapsed={elapsed:.1f}s)"
+                    )
             steps += 1
             if not self.step():
                 hit_max_steps = False

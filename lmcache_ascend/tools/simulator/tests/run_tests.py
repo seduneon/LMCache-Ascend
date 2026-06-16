@@ -536,9 +536,16 @@ def run_stress_benchmark_cli() -> None:
     run_stress_benchmark()
 
 
+def run_stress_seed_sweep_cli() -> None:
+    from tests.test_stress import run_stress_seed_sweep
+
+    run_stress_seed_sweep()
+
+
 _ALL["stress"] = [run_stress_test]
 _ALL["stress-heavy"] = [run_stress_heavy_test]
 _ALL["stress-benchmark"] = [run_stress_benchmark_cli]
+_ALL["stress-seeds"] = [run_stress_seed_sweep_cli]
 
 
 def run_critical_tests_cli() -> None:

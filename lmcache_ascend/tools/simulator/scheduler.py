@@ -67,6 +67,7 @@ class Scheduler:
             _, _, req = heapq.heappop(self.pending)
             req.status = RequestStatus.WAITING
             self._ensure_prefix_block_count(req)
+            req.metrics.enter_waiting(now)
             self.waiting.append(req)
 
     def next_arrival(self) -> float | None:
@@ -140,6 +141,9 @@ class Scheduler:
         req: Request,
         batch: Batch,
         scheduled_ids: set[str],
+        *,
+        now: float | None = None,
+        engine_id: str | None = None,
     ) -> bool:
         block_hashes = self._prefix_block_hashes(req)
         if not block_hashes:
@@ -151,6 +155,7 @@ class Scheduler:
             scheduled_ids,
             batch.preempted,
             pull_only=True,
+            now=now,
         )
         if result is None:
             return False
@@ -163,28 +168,36 @@ class Scheduler:
             remote_kv=True,
         )
         req.status = RequestStatus.WAITING_REMOTE_KV
+        if now is not None:
+            req.metrics.enter_remote_kv(now, engine_id=engine_id)
         batch.entries.append(entry)
         scheduled_ids.add(req.req_id)
         return True
 
-    def promote_remote_kv_complete(self, req: Request) -> None:
+    def promote_remote_kv_complete(
+        self, req: Request, *, now: float | None = None, engine_id: str | None = None
+    ) -> None:
         assert req.status == RequestStatus.WAITING_REMOTE_KV
         self.waiting.remove(req)
         req.status = RequestStatus.RUNNING
         req.num_computed_blocks = req.prefix_block_count
+        if now is not None:
+            req.metrics.enter_running(now, engine_id=engine_id)
         self.running.append(req)
 
-    def finish_prefill_held(self, req: Request) -> None:
+    def finish_prefill_held(self, req: Request, *, now: float | None = None) -> None:
         """Prefill compute done; keep KV resident until decode acknowledges transfer."""
         if req not in self.running:
             return
         assert req.pd == RequestPD.PREFILL
         req.status = RequestStatus.COMPLETE
         req.kv_held_for_transfer = True
+        if now is not None:
+            req.metrics.finish(now)
         self.running.remove(req)
         self.completed.append(req)
 
-    def schedule(self) -> Batch:
+    def schedule(self, now: float | None = None, *, engine_id: str | None = None) -> Batch:
         batch = Batch()
         scheduled_ids: set[str] = set()
         token_budget = self.max_num_batched_tokens
@@ -203,7 +216,7 @@ class Scheduler:
                 continue
 
             result = self._allocate_blocks(
-                req, block_hashes, scheduled_ids, batch.preempted
+                req, block_hashes, scheduled_ids, batch.preempted, now=now
             )
             if result is None:
                 idx += 1
@@ -235,7 +248,9 @@ class Scheduler:
                     continue
 
                 if self._needs_remote_kv(req):
-                    if self._try_admit_remote_kv(req, batch, scheduled_ids):
+                    if self._try_admit_remote_kv(
+                        req, batch, scheduled_ids, now=now, engine_id=engine_id
+                    ):
                         break
                     break
 
@@ -258,7 +273,7 @@ class Scheduler:
                     break
 
                 result = self._allocate_blocks(
-                    req, block_hashes, scheduled_ids, batch.preempted
+                    req, block_hashes, scheduled_ids, batch.preempted, now=now
                 )
                 if result is None:
                     break
@@ -271,6 +286,8 @@ class Scheduler:
 
                 self.waiting.popleft()
                 req.status = RequestStatus.RUNNING
+                if now is not None:
+                    req.metrics.enter_running(now, engine_id=engine_id)
                 self.running.append(req)
                 entry = BatchEntry(req, block_hashes, result, num_new_tokens)
                 batch.entries.append(entry)
@@ -300,6 +317,7 @@ class Scheduler:
         preempted: list[Request],
         *,
         pull_only: bool = False,
+        now: float | None = None,
     ) -> LookupResult | None:
         local = self._local()
         actions = self.policy.resolve_actions(
@@ -320,7 +338,7 @@ class Scheduler:
             if victim is None:
                 return None
 
-            self._preempt_request(victim)
+            self._preempt_request(victim, now=now)
             preempted.append(victim)
             if victim.req_id == req.req_id:
                 return None
@@ -339,7 +357,7 @@ class Scheduler:
             return protected
         return None
 
-    def _preempt_request(self, req: Request) -> None:
+    def _preempt_request(self, req: Request, *, now: float | None = None) -> None:
         """Free KV and return to waiting. No task cancel — batches drain before re-schedule."""
         assert req in self.running
         self._local().free_request(req.req_id)
@@ -347,16 +365,20 @@ class Scheduler:
         req.num_computed_blocks = 0
         req.pending_block_hash = None
         req.block_hashes = req.block_hashes[: req.prefix_block_count]
-        req.num_preemptions += 1
+        req.metrics.preemptions += 1
         req.status = RequestStatus.WAITING
+        if now is not None:
+            req.metrics.enter_waiting(now)
 
         self.running.remove(req)
         self.waiting.appendleft(req)
 
-    def finish_request(self, req: Request) -> None:
+    def finish_request(self, req: Request, *, now: float | None = None) -> None:
         if req not in self.running:
             return
         req.status = RequestStatus.COMPLETE
+        if now is not None:
+            req.metrics.finish(now)
         self._local().free_request(req.req_id)
         self.running.remove(req)
         self.completed.append(req)

@@ -128,8 +128,22 @@ class Engine:
     def next_arrival(self) -> float | None:
         return self.scheduler.next_arrival()
 
-    def schedule(self) -> Batch:
-        return self.scheduler.schedule()
+    def schedule(self, now: float) -> Batch:
+        return self.scheduler.schedule(now, engine_id=self.engine_id)
+
+    def _record_entry_actions(self, entry: BatchEntry) -> None:
+        metrics = entry.req.metrics
+        metrics.evictions += len(entry.result.evicts)
+        for block_hash in entry.block_hashes:
+            action = entry.result.blocks.get(block_hash)
+            if action == "compute":
+                metrics.computes += 1
+            elif isinstance(action, tuple) and action[0] == "pull":
+                metrics.pulls += 1
+            elif action is None:
+                metrics.local_hits += 1
+        if _entry_has_compute(entry):
+            metrics.forward_steps += 1
 
     def execute_batch(self, batch: Batch) -> list[Task]:
         """Reserve memory, run evictions/pulls, then one batched forward for all compute."""
@@ -140,6 +154,7 @@ class Engine:
         forward_blocks: list[KVBlock] = []
 
         for entry in batch.entries:
+            self._record_entry_actions(entry)
             self._reserve(entry.req, entry.result, entry.block_hashes)
 
             for victim in entry.result.evicts:
@@ -203,7 +218,7 @@ class Engine:
 
         return all_tasks
 
-    def apply_batch(self, batch: Batch) -> tuple[list[Request], list[Request]]:
+    def apply_batch(self, batch: Batch, now: float) -> tuple[list[Request], list[Request]]:
         """Advance state after the batch finishes (vLLM update_from_output)."""
         finished: list[Request] = []
         remote_kv_done: list[Request] = []
@@ -211,7 +226,9 @@ class Engine:
         for entry in batch.entries:
             req = entry.req
             if entry.remote_kv:
-                self.scheduler.promote_remote_kv_complete(req)
+                self.scheduler.promote_remote_kv_complete(
+                    req, now=now, engine_id=self.engine_id
+                )
                 remote_kv_done.append(req)
                 continue
 
@@ -224,9 +241,9 @@ class Engine:
 
             if req.num_computed_blocks >= req.blocks_target():
                 if req.pd == RequestPD.PREFILL and self.hold_kv_on_complete:
-                    self.scheduler.finish_prefill_held(req)
+                    self.scheduler.finish_prefill_held(req, now=now)
                 else:
-                    self.scheduler.finish_request(req)
+                    self.scheduler.finish_request(req, now=now)
                 finished.append(req)
 
         return finished, remote_kv_done

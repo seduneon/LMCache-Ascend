@@ -16,6 +16,85 @@ class RequestStatus(StrEnum):
 
 
 @dataclass
+class RequestMetrics:
+    """Per-request counters and phase timings (simulation clock)."""
+
+    released_at: float | None = None
+    first_active_at: float | None = None
+    finished_at: float | None = None
+
+    queue_time: float = 0.0
+    remote_kv_time: float = 0.0
+    run_time: float = 0.0
+
+    evictions: int = 0
+    pulls: int = 0
+    computes: int = 0
+    local_hits: int = 0
+    preemptions: int = 0
+    remote_kv_admits: int = 0
+    forward_steps: int = 0
+
+    engine_id: str | None = None
+    _phase: str = field(default="pending", repr=False)
+    _phase_since: float | None = field(default=None, repr=False)
+
+    def _close_phase(self, now: float) -> None:
+        if self._phase_since is None:
+            return
+        elapsed = now - self._phase_since
+        if self._phase == "waiting":
+            self.queue_time += elapsed
+        elif self._phase == "remote_kv":
+            self.remote_kv_time += elapsed
+        elif self._phase == "running":
+            self.run_time += elapsed
+        self._phase_since = None
+
+    def enter_waiting(self, now: float) -> None:
+        self._close_phase(now)
+        if self.released_at is None:
+            self.released_at = now
+        self._phase = "waiting"
+        self._phase_since = now
+
+    def enter_remote_kv(self, now: float, *, engine_id: str | None = None) -> None:
+        self._close_phase(now)
+        if self.first_active_at is None:
+            self.first_active_at = now
+        if engine_id is not None:
+            self.engine_id = engine_id
+        self.remote_kv_admits += 1
+        self._phase = "remote_kv"
+        self._phase_since = now
+
+    def enter_running(self, now: float, *, engine_id: str | None = None) -> None:
+        self._close_phase(now)
+        if self.first_active_at is None:
+            self.first_active_at = now
+        if engine_id is not None:
+            self.engine_id = engine_id
+        self._phase = "running"
+        self._phase_since = now
+
+    def finish(self, now: float) -> None:
+        self._close_phase(now)
+        self.finished_at = now
+        self._phase = "done"
+        self._phase_since = None
+
+    @property
+    def latency(self) -> float | None:
+        if self.released_at is None or self.finished_at is None:
+            return None
+        return self.finished_at - self.released_at
+
+    @property
+    def active_time(self) -> float:
+        return self.run_time + self.remote_kv_time
+
+
+@dataclass
 class Request:
     req_id: str
     arrival_time: float
@@ -25,10 +104,18 @@ class Request:
     max_output_blocks: int = 0
     num_computed_blocks: int = 0
     prefix_block_count: int = 0
-    num_preemptions: int = 0
     pending_block_hash: str | None = field(default=None, repr=False)
     prefill_engine_id: str | None = None
     kv_held_for_transfer: bool = False
+    metrics: RequestMetrics = field(default_factory=RequestMetrics)
+
+    @property
+    def num_preemptions(self) -> int:
+        return self.metrics.preemptions
+
+    @num_preemptions.setter
+    def num_preemptions(self, value: int) -> None:
+        self.metrics.preemptions = value
 
     def total_blocks(self) -> int:
         return self.prefix_block_count + self.max_output_blocks

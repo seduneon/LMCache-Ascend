@@ -12,6 +12,7 @@ from policies import (
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
 from scheduler import Scheduler
+from simulator import Simulator
 from tasks import Task, TaskPool, TaskStatus
 
 
@@ -172,6 +173,95 @@ def test_local_satisfied_inflight() -> None:
     assert policy.resolve_actions(memories, ["a"]) == {}
 
 
+def test_request_metrics_phases() -> None:
+    from engine import Engine
+
+    pool = TaskPool()
+    memories = {"hbm": Memory(size=10, name="hbm")}
+    req = Request("r1", 1.0, ["a", "b"], RequestPD.PREFILL, RequestStatus.PENDING)
+    eng = Engine(
+        "e0",
+        [req],
+        pool,
+        memories,
+        "hbm",
+        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        ComputeResource(base_speed=1.0),
+        work_per_block=1.0,
+    )
+    sim = Simulator([eng], pool)
+
+    sim.run()
+    m = req.metrics
+    assert m.released_at == 1.0
+    assert m.finished_at is not None
+    assert m.finished_at >= m.released_at
+    assert m.latency == m.finished_at - 1.0
+    assert m.computes == 2
+    assert m.forward_steps >= 1
+    assert m.run_time > 0
+    assert m.engine_id == "e0"
+
+
+def test_request_metrics_pd_decode() -> None:
+    from engine import Engine
+    from pd import PDConfig
+
+    pool = TaskPool()
+    memories = {
+        "npu-0:hbm": Memory(size=10, name="npu-0:hbm"),
+        "npu-1:hbm": Memory(size=10, name="npu-1:hbm"),
+    }
+    prefill = Request(
+        "r1",
+        0.0,
+        ["a", "b", "c"],
+        RequestPD.PREFILL,
+        RequestStatus.PENDING,
+        max_output_blocks=1,
+    )
+    npu0 = Engine(
+        "npu-0",
+        [prefill],
+        pool,
+        memories,
+        "npu-0:hbm",
+        ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
+        ComputeResource(base_speed=4.0),
+        work_per_block=1.0,
+    )
+    npu1 = Engine(
+        "npu-1",
+        [],
+        pool,
+        memories,
+        "npu-1:hbm",
+        CostBasedPullLookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]),
+        ComputeResource(base_speed=4.0),
+        BandwidthResource(base_speed=4.0),
+        work_per_transfer=1.0,
+        work_per_block=1.0,
+        remote_kv_wait=True,
+    )
+    sim = Simulator([npu0, npu1], pool, pd=PDConfig(spawn_map={"npu-0": "npu-1"}))
+    sim.run()
+
+    decode = next(r for r in npu1.completed if r.req_id == "r1")
+    pm = prefill.metrics
+    dm = decode.metrics
+
+    assert pm.computes == 3
+    assert pm.pulls == 0
+    assert pm.finished_at is not None
+
+    assert dm.remote_kv_admits == 1
+    assert dm.pulls == 3
+    assert dm.remote_kv_time >= 0
+    assert dm.computes == 1
+    assert dm.finished_at is not None
+    assert dm.engine_id == "npu-1"
+
+
 def run_unit_tests() -> None:
     tests = [
         test_lookup_compute,
@@ -183,6 +273,8 @@ def run_unit_tests() -> None:
         test_prefix_block_count_on_arrival,
         test_finish_frees_kv,
         test_local_satisfied_inflight,
+        test_request_metrics_phases,
+        test_request_metrics_pd_decode,
     ]
     for test in tests:
         test()

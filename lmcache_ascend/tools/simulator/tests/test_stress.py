@@ -19,6 +19,10 @@ from simulator import Simulator
 from tasks import TaskPool
 
 
+# Default request-count sweep for benchmark / multi-seed stress runs.
+STRESS_SIZES: tuple[int, ...] = (32, 64, 128, 256, 512)
+
+
 @dataclass(frozen=True)
 class StressConfig:
     num_requests: int = 16
@@ -38,6 +42,9 @@ class StressConfig:
     log_interval: int = 200
     show_progress: bool = True
     stall_step_limit: int = 2_000
+    wall_timeout_s: float | None = None
+    max_steps_per_request: int = 500
+    quiet: bool = False
 
 
 def generate_prefill_workload(cfg: StressConfig) -> tuple[list[Request], list[str]]:
@@ -92,6 +99,36 @@ class StressResult:
     finish_time: float
     preemptions: int
     wall_seconds: float
+    seed: int = 0
+
+
+def _assert_request_metrics(
+    requests: list[Request],
+    npu0: Engine,
+    npu1: Engine,
+) -> None:
+    for req in requests:
+        prefill = next(r for r in npu0.completed if r.req_id == req.req_id)
+        decode = next(r for r in npu1.completed if r.req_id == req.req_id)
+        pm, dm = prefill.metrics, decode.metrics
+
+        assert pm.finished_at is not None, f"{req.req_id} prefill missing finished_at"
+        assert dm.finished_at is not None, f"{req.req_id} decode missing finished_at"
+        assert dm.latency is not None and dm.latency >= 0, f"{req.req_id} bad latency"
+        assert pm.computes + pm.local_hits >= prefill.prefix_block_count, (
+            f"{req.req_id} prefill computes={pm.computes} local={pm.local_hits} "
+            f"prefix={prefill.prefix_block_count}"
+        )
+        assert dm.remote_kv_admits >= 1 or dm.local_hits >= 1 or dm.pulls >= 1, (
+            f"{req.req_id} decode has no prefix resolution path "
+            f"(pulls={dm.pulls} local_hits={dm.local_hits} "
+            f"remote_kv={dm.remote_kv_admits})"
+        )
+        assert dm.computes >= req.max_output_blocks, (
+            f"{req.req_id} decode computes={dm.computes} "
+            f"output={req.max_output_blocks}"
+        )
+        assert dm.engine_id == "npu-1", f"{req.req_id} decode engine_id={dm.engine_id}"
 
 
 def run_stress_test(cfg: StressConfig | None = None) -> StressResult:
@@ -167,13 +204,23 @@ def run_stress_test(cfg: StressConfig | None = None) -> StressResult:
 
     sim_log.milestone(sim, f"stress begin requests={cfg.num_requests}")
 
+    wall_timeout = cfg.wall_timeout_s
+    if wall_timeout is None:
+        wall_timeout = max(30.0, cfg.num_requests * 2.0)
+
     t0 = time.perf_counter()
-    finish = sim.run(max_steps=cfg.max_steps)
+    finish = sim.run(max_steps=cfg.max_steps, wall_timeout_s=wall_timeout)
     wall_seconds = time.perf_counter() - t0
     steps = sim.event_steps
     if steps >= cfg.max_steps:
         raise AssertionError(
             f"stress test exceeded max_steps={cfg.max_steps} (possible livelock)"
+        )
+    step_budget = cfg.num_requests * cfg.max_steps_per_request
+    if steps > step_budget:
+        raise AssertionError(
+            f"stress test took {steps} steps for {cfg.num_requests} requests "
+            f"(budget={step_budget}; possible livelock)"
         )
 
     _assert_idle(sim, memories)
@@ -204,29 +251,34 @@ def run_stress_test(cfg: StressConfig | None = None) -> StressResult:
     if cfg.num_requests >= 8:
         assert preemptions > 0, "expected memory pressure to cause at least one preemption"
 
-    print(
-        "stress_test ok "
-        f"requests={cfg.num_requests} "
-        f"shared_pool={len(shared_pool)} "
-        f"steps={steps} "
-        f"wall_s={wall_seconds:.3f} "
-        f"finish_time={finish:.2f} "
-        f"preemptions={preemptions} "
-        f"hbm={cfg.hbm_size} "
-        f"max_seqs={cfg.max_num_seqs} "
-        f"token_budget={cfg.max_num_batched_tokens}"
-    )
+    _assert_request_metrics(requests, npu0, npu1)
+
+    if not cfg.quiet:
+        print(
+            "stress_test ok "
+            f"requests={cfg.num_requests} "
+            f"seed={cfg.seed} "
+            f"shared_pool={len(shared_pool)} "
+            f"steps={steps} "
+            f"wall_s={wall_seconds:.3f} "
+            f"finish_time={finish:.2f} "
+            f"preemptions={preemptions} "
+            f"hbm={cfg.hbm_size} "
+            f"max_seqs={cfg.max_num_seqs} "
+            f"token_budget={cfg.max_num_batched_tokens}"
+        )
     return StressResult(
         num_requests=cfg.num_requests,
         steps=steps,
         finish_time=finish,
         preemptions=preemptions,
         wall_seconds=wall_seconds,
+        seed=cfg.seed,
     )
 
 
 def run_stress_benchmark(
-    sizes: tuple[int, ...] = (4, 8, 16, 32, 64),
+    sizes: tuple[int, ...] = STRESS_SIZES,
 ) -> None:
     """Sweep request counts and print wall time / step scaling."""
     print("stress benchmark (PD read, chunked prefill, tight HBM)", flush=True)
@@ -254,6 +306,85 @@ def run_stress_benchmark(
         )
         prev_wall = result.wall_seconds
     print("stress_benchmark ok")
+
+
+def run_stress_seed_sweep(
+    sizes: tuple[int, ...] = STRESS_SIZES,
+    *,
+    seeds_per_size: int = 10,
+    base_seed: int = 1000,
+) -> None:
+    """Run many random workloads per request count to catch seed-specific bugs."""
+    print(
+        "stress seed sweep (PD read, chunked prefill, tight HBM)",
+        flush=True,
+    )
+    print(
+        f"sizes={list(sizes)} seeds_per_size={seeds_per_size} "
+        f"base_seed={base_seed}",
+        flush=True,
+    )
+    print(
+        f"{'requests':>8}  {'seeds':>5}  {'pass':>5}  "
+        f"{'max_wall':>8}  {'max_steps':>9}  {'max_preempt':>11}  "
+        f"{'max_sim_t':>9}",
+        flush=True,
+    )
+
+    total_runs = 0
+    total_pass = 0
+    t0 = time.perf_counter()
+
+    for n in sizes:
+        passed = 0
+        max_wall = 0.0
+        max_steps = 0
+        max_preempt = 0
+        max_sim_t = 0.0
+
+        for i in range(seeds_per_size):
+            seed = base_seed + i
+            total_runs += 1
+            try:
+                result = run_stress_test(
+                    StressConfig(
+                        num_requests=n,
+                        seed=seed,
+                        log=SimLogConfig(enabled=False),
+                        show_progress=False,
+                        quiet=True,
+                    )
+                )
+            except Exception as exc:
+                print(
+                    f"  FAIL n={n} seed={seed}: {exc}",
+                    flush=True,
+                )
+                continue
+
+            passed += 1
+            total_pass += 1
+            max_wall = max(max_wall, result.wall_seconds)
+            max_steps = max(max_steps, result.steps)
+            max_preempt = max(max_preempt, result.preemptions)
+            max_sim_t = max(max_sim_t, result.finish_time)
+
+        print(
+            f"{n:8d}  {seeds_per_size:5d}  {passed:5d}  "
+            f"{max_wall:8.3f}  {max_steps:9d}  {max_preempt:11d}  "
+            f"{max_sim_t:9.2f}",
+            flush=True,
+        )
+        if passed != seeds_per_size:
+            raise AssertionError(
+                f"stress seed sweep: n={n} passed {passed}/{seeds_per_size}"
+            )
+
+    wall = time.perf_counter() - t0
+    print(
+        f"stress_seed_sweep ok runs={total_pass}/{total_runs} wall_s={wall:.2f}",
+        flush=True,
+    )
 
 
 def run_stress_heavy_test() -> None:
