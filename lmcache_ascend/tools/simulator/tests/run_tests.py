@@ -270,7 +270,7 @@ def run_pd_read_test() -> None:
     decode = next((r for r in npu1.completed if r.req_id == "r1"), None)
     assert decode is not None
     assert decode.num_computed_blocks == decode.total_blocks()
-    assert not prefill.kv_held_for_transfer, "P KV released after D pull"
+    assert not prefill.kv_held_for_transfer, "P KV released after D completes"
     assert memories["npu-0:hbm"].used_size() == 0, "P prefix freed after transfer"
     assert memories["npu-1:hbm"].used_size() == 0, "D KV freed after decode"
     assert npu1.remote_kv_wait is True
@@ -518,6 +518,38 @@ _ALL = {
 }
 
 
+def run_stress_test() -> None:
+    from tests.test_stress import run_stress_test as _run
+
+    _run()
+
+
+def run_stress_heavy_test() -> None:
+    from tests.test_stress import run_stress_heavy_test as _run
+
+    _run()
+
+
+def run_stress_benchmark_cli() -> None:
+    from tests.test_stress import run_stress_benchmark
+
+    run_stress_benchmark()
+
+
+_ALL["stress"] = [run_stress_test]
+_ALL["stress-heavy"] = [run_stress_heavy_test]
+_ALL["stress-benchmark"] = [run_stress_benchmark_cli]
+
+
+def run_critical_tests_cli() -> None:
+    from tests.test_critical import run_critical_tests
+
+    run_critical_tests()
+
+
+_ALL["critical"] = [run_critical_tests_cli]
+
+
 def main(argv: list[str] | None = None) -> None:
     from tests.test_unit import run_unit_tests
 
@@ -528,12 +560,16 @@ def main(argv: list[str] | None = None) -> None:
             run_unit_tests()
             return
         if key not in _ALL:
-            raise SystemExit(f"unknown test group: {key!r}")
+            raise SystemExit(f"unknown test group: {key!r} (try: {', '.join(sorted(_ALL))})")
         for test in _ALL[key]:
             test()
         return
 
     run_unit_tests()
+    print()
+    from tests.test_critical import run_critical_tests
+
+    run_critical_tests()
     print()
     run_pd_demo()
     print()

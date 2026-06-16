@@ -1,18 +1,32 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 from engine import Engine
 from pd import PDConfig
 from request import Request, RequestPD, RequestStatus
+from scheduler import Batch
+from sim_log import SimLogger
+from sim_progress import SimProgress
 from tasks import Task, TaskPool, TaskStatus
 
 
-_TERMINAL = frozenset({TaskStatus.COMPLETED})
+@dataclass
+class InFlightBatch:
+    batch: Batch
+    tasks: list[Task]
 
 
 class Simulator:
+    """Discrete-event sim: each step() advances ``now`` by exactly one event."""
+
     def __init__(
         self,
         engines: list[Engine],
         pool: TaskPool,
         pd: PDConfig | None = None,
+        log: SimLogger | None = None,
+        progress: SimProgress | None = None,
     ):
         self.engines = {eng.engine_id: eng for eng in engines}
         self.pool = pool
@@ -21,82 +35,115 @@ class Simulator:
         if pd is not None:
             pd.validate_and_apply(self.engines)
         self.now = 0.0
-
-    def _batch_done(self, tasks: list[Task]) -> bool:
-        return not tasks or all(t.status in _TERMINAL for t in tasks)
-
-    def _drain_batch(self, tasks: list[Task]) -> None:
-        self.pool.start_ready(self.now)
-        while not self._batch_done(tasks):
-            running = [t for t in tasks if t.status == TaskStatus.RUNNING]
-            if not running:
-                self.pool.start_ready(self.now)
-                running = [t for t in tasks if t.status == TaskStatus.RUNNING]
-            if not running:
-                break
-
-            t_next = min(t.estimated_end() for t in running)
-            if t_next < self.now:
-                break
-
-            self.pool.advance_running_to(t_next)
-            self.pool.finish_done()
-            self.now = t_next
-            self.pool.start_ready(self.now)
+        self.log = log
+        self.progress = progress
+        self._in_flight: dict[str, InFlightBatch] = {}
+        self.event_steps = 0
 
     def _idle(self) -> bool:
         for eng in self.engines.values():
             if eng.waiting or eng.running or eng.scheduler.pending:
                 return False
-        return not self.pool.running()
+        return not self.pool.running() and not self.pool.ready()
 
-    def step(self) -> bool:
-        for eng in self.engines.values():
-            eng.release_arrivals(self.now)
+    def _count_new_arrivals(self, before: dict[str, int]) -> int:
+        total = 0
+        for eng_id, eng in self.engines.items():
+            total += before[eng_id] - len(eng.scheduler.pending)
+        return total
 
-        batches = {}
-        step_tasks: list[Task] = []
+    def _schedule_engines(self) -> None:
         for eng in self.engines.values():
+            if eng.engine_id in self._in_flight:
+                continue
             batch = eng.schedule()
-            batches[eng.engine_id] = batch
-            if batch.entries:
-                step_tasks.extend(eng.execute_batch(batch))
+            if self.log:
+                self.log.on_schedule(eng.engine_id, self, batch)
+            if not batch.entries:
+                continue
+            tasks = eng.execute_batch(batch)
+            if self.log:
+                self.log.on_execute(eng.engine_id, self, tasks)
+            self._in_flight[eng.engine_id] = InFlightBatch(batch=batch, tasks=tasks)
 
-        if not step_tasks:
-            if self._idle():
-                return False
-            t_arrivals = [eng.next_arrival() for eng in self.engines.values()]
-            arrivals = [t for t in t_arrivals if t is not None]
-            if arrivals:
-                self.now = min(arrivals)
-                return True
-            return False
+    def _next_event_time(self) -> float | None:
+        running = self.pool.running()
+        if running:
+            return min(task.estimated_end() for task in running)
 
-        self._drain_batch(step_tasks)
+        if self._idle():
+            return None
 
+        arrivals = [
+            t
+            for eng in self.engines.values()
+            if (t := eng.next_arrival()) is not None
+        ]
+        if arrivals:
+            return min(arrivals)
+
+        self.pool.start_ready(self.now)
+        running = self.pool.running()
+        if running:
+            return min(task.estimated_end() for task in running)
+
+        raise RuntimeError(
+            f"simulation stuck at now={self.now:.4f}: "
+            "queues non-empty but no runnable tasks and no pending arrivals"
+        )
+
+    def _advance_to(self, t_next: float) -> None:
+        if self.log:
+            self.log.on_time_advance(self, t_next, len(self.pool.running()))
+        self.now = t_next
+        self.pool.advance_running_to(self.now)
+        self.pool.finish_done()
+        self.pool.start_ready(self.now)
+        self.pool.compact()
+
+    def _apply_completed_batches(self) -> bool:
+        """Apply batches whose tasks finished; spawn PD decodes. Returns True if any applied."""
+        applied = False
         completed_by_engine: dict[str, list[Request]] = {}
         remote_kv_by_engine: dict[str, list[Request]] = {}
-        for eng in self.engines.values():
-            finished, remote_kv_done = eng.apply_batch(batches[eng.engine_id])
-            completed_by_engine[eng.engine_id] = finished
-            remote_kv_by_engine[eng.engine_id] = remote_kv_done
 
-        for eng_id, remote_done in remote_kv_by_engine.items():
-            for req in remote_done:
-                if req.prefill_engine_id is None:
-                    continue
-                prefill_eng = self.engines[req.prefill_engine_id]
-                prefill = next(
-                    (r for r in prefill_eng.completed if r.req_id == req.req_id),
-                    None,
+        for eng_id, inflight in list(self._in_flight.items()):
+            if not all(task.status == TaskStatus.COMPLETED for task in inflight.tasks):
+                continue
+
+            eng = self.engines[eng_id]
+            finished, remote_kv_done = eng.apply_batch(inflight.batch)
+            completed_by_engine[eng_id] = finished
+            remote_kv_by_engine[eng_id] = remote_kv_done
+            del self._in_flight[eng_id]
+            applied = True
+
+            if self.log and (finished or remote_kv_done):
+                self.log.on_apply(
+                    eng_id,
+                    self,
+                    finished=finished,
+                    remote_kv_done=remote_kv_done,
                 )
-                if prefill is not None and prefill.kv_held_for_transfer:
-                    prefill_eng.release_held_kv(req.req_id)
-                    prefill.kv_held_for_transfer = False
 
-        for eng in self.engines.values():
-            for req in completed_by_engine[eng.engine_id]:
-                decode_id = self.spawn_map.get(eng.engine_id)
+        for eng_id, finished in completed_by_engine.items():
+            for req in finished:
+                if req.pd == RequestPD.DECODE and req.prefill_engine_id is not None:
+                    prefill_eng = self.engines.get(req.prefill_engine_id)
+                    if prefill_eng is not None:
+                        prefill = next(
+                            (r for r in prefill_eng.completed if r.req_id == req.req_id),
+                            None,
+                        )
+                        if prefill is not None and prefill.kv_held_for_transfer:
+                            prefill_eng.release_held_kv(req.req_id)
+                            prefill.kv_held_for_transfer = False
+                            if self.log:
+                                self.log.on_kv_released(
+                                    self, prefill_eng.engine_id, req.req_id
+                                )
+
+                decode_id = self.spawn_map.get(eng_id)
                 if decode_id is None or req.pd != RequestPD.PREFILL:
                     continue
                 decode_eng = self.engines[decode_id]
@@ -109,16 +156,76 @@ class Simulator:
                         RequestStatus.PENDING,
                         max_output_blocks=req.max_output_blocks,
                         prefix_block_count=req.prefix_block_count,
-                        prefill_engine_id=eng.engine_id,
+                        prefill_engine_id=eng_id,
                     )
                 )
+                if self.log:
+                    self.log.on_pd_spawn(self, eng_id, decode_id, req.req_id)
 
+        return applied
+
+    def step(self) -> bool:
+        if self.log:
+            self.log.on_step_begin(self)
+
+        pending_before = {
+            eng_id: len(eng.scheduler.pending) for eng_id, eng in self.engines.items()
+        }
+
+        for eng in self.engines.values():
+            eng.release_arrivals(self.now)
+
+        if self.log:
+            released = self._count_new_arrivals(pending_before)
+            self.log.on_arrivals_released(self, released)
+
+        self._schedule_engines()
+        self.pool.start_ready(self.now)
+
+        t_next = self._next_event_time()
+        if t_next is None:
+            return False
+
+        if not self.pool.running():
+            if self.log:
+                self.log.on_wait_arrival(self, t_next)
+            self._advance_to(t_next)
+            self._apply_completed_batches()
+            return True
+
+        if t_next <= self.now:
+            raise RuntimeError(
+                f"event time did not advance at now={self.now:.6f} "
+                f"(next={t_next:.6f}, running={len(self.pool.running())})"
+            )
+
+        self._advance_to(t_next)
+        self._apply_completed_batches()
         return True
 
     def run(self, max_steps: int = 100_000) -> float:
+        if self.log:
+            self.log.on_run_start(self)
+        if self.progress:
+            self.progress.begin()
+
+        steps = 0
+        hit_max_steps = True
+        self.event_steps = 0
         for _ in range(max_steps):
+            steps += 1
             if not self.step():
+                hit_max_steps = False
                 break
+            self.event_steps += 1
+            if self.progress:
+                self.progress.on_step(self)
+
+        if self.progress:
+            self.progress.finish(self, hit_max_steps=hit_max_steps)
+        if self.log:
+            self.log.on_run_end(self, steps=steps, hit_max_steps=hit_max_steps)
+
         return self.now
 
 

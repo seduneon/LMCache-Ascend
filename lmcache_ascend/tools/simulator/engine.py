@@ -187,7 +187,6 @@ class Engine:
                     dst_block.task = task
                     pull_tasks.append(task)
                     all_tasks.append(task)
-                    prereqs_tail = list(evict_tasks) + pull_tasks
                     continue
 
                 raise NotImplementedError(f"unsupported action {action!r}")

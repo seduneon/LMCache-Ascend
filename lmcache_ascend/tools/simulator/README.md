@@ -11,6 +11,10 @@ python3.12 simulator.py chunked    # chunked prefill test
 python3.12 simulator.py pd         # PD read-mode + remote-KV tests
 python3.12 simulator.py waiting    # waiting preempt + queue rotation
 python3.12 simulator.py unit       # unit tests only
+python3.12 simulator.py critical   # micro-step, PD KV, memory, task DAG tests
+python3.12 simulator.py stress     # PD stress test (progress logs on stderr)
+SIM_LOG_DETAIL=1 python3.12 simulator.py stress   # verbose per-batch logs
+python3.12 simulator.py stress-heavy              # larger stress run
 ```
 
 ## Architecture
@@ -19,7 +23,8 @@ python3.12 simulator.py unit       # unit tests only
 |------|------|
 | `scheduler.py` | Queues, `schedule()` → `Batch` (RUNNING → WAITING, unified allocate + preempt) |
 | `engine.py` | `execute_batch()` (reserve, tasks), `apply_batch()` (advance state) |
-| `simulator.py` | Global clock, multi-engine step, PD spawn |
+| `simulator.py` | Global clock, micro-step event loop, in-flight batches, PD spawn |
+| `sim_log.py` | Optional progress logging (`SimLogger`) |
 | `pd.py` | `PDConfig` — validates and applies read-mode flags to engines |
 | `policies.py` | `LookupPolicy` ABC + pull/compute implementations, `EvictionPolicy` |
 | `tasks.py` | `ForwardTask` (batched compute), `LoadTask` (pull), `EvictTask` |
@@ -27,14 +32,16 @@ python3.12 simulator.py unit       # unit tests only
 | `tests/run_tests.py` | Integration tests and CLI |
 | `tests/test_unit.py` | Policy, task, memory, scheduler unit tests |
 
-Each `Simulator.step()`:
+Each `Simulator.step()` advances `now` by **one discrete event**:
 
-1. `release_arrivals`
-2. Per engine: `batch = schedule()` → `execute_batch(batch)`
-3. Drain all batch tasks
-4. `apply_batch(batch)`; spawn decode on prefill complete
+1. `release_arrivals` at current `now`
+2. Per engine (if no in-flight batch): `schedule()` → `execute_batch()` → tasks registered in flight
+3. Start ready tasks; advance `now` to the next task completion **or** next arrival (whichever is sooner)
+4. When all tasks for a batch complete: `apply_batch()` at that event time; PD spawn uses the same `now`
 
-Preemption frees KV and resets the request; it does not touch the task pool — the step drains before the next `schedule()`.
+There is no hidden multi-event drain inside a step — `now` always means the current event time.
+
+Preemption frees KV and resets the request; the next schedule happens after the in-flight batch finishes.
 
 ## Scheduling (vLLM-shaped)
 
