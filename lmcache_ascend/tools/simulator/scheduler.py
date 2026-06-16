@@ -5,7 +5,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from memory import Memory
-from policies import LookupPolicy, LookupResult, local_satisfied, slots_needed
+from policies import LookupPolicy, LookupResult, local_satisfied
 from request import Request, RequestPD, RequestStatus
 
 
@@ -323,24 +323,16 @@ class Scheduler:
         pull_only: bool = False,
         now: float | None = None,
     ) -> LookupResult | None:
-        local = self._local()
-        actions = self.policy.resolve_actions(
-            self.memories,
-            block_hashes,
-            allow_compute=not pull_only,
-            req=req,
-            block_size=self.block_size,
-        )
-        if actions is None:
-            return None
-
-        exclude = set(block_hashes)
         while True:
-            evicts = self.policy.eviction_policy.plan(
-                local, slots_needed(actions), exclude
+            result = self.policy.lookup(
+                self.memories,
+                block_hashes,
+                allow_compute=not pull_only,
+                req=req,
+                block_size=self.block_size,
             )
-            if evicts is not None:
-                return LookupResult(evicts=evicts, blocks=actions)
+            if result is not None:
+                return result
 
             victim = self._pick_preemption_victim(req, scheduled_ids)
             if victim is None:

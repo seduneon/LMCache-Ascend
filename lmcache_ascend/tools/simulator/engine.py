@@ -1,3 +1,4 @@
+from cost_model import batch_forward_work, entry_has_compute
 from memory import KVBlock, Memory
 from policies import (
     HBMOnly,
@@ -11,28 +12,6 @@ from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
 from scheduler import Batch, BatchEntry, Scheduler
 from tasks import EvictTask, ForwardTask, LoadTask, Task, TaskPool
-
-
-def _entry_has_compute(entry: BatchEntry) -> bool:
-    return any(action == "compute" for action in entry.result.blocks.values())
-
-
-def forward_cost(
-    batch: Batch,
-    *,
-    work_per_prefill_token: float,
-    work_per_decode_req: float,
-) -> float:
-    prefill_tokens = 0
-    decode_reqs = 0
-    for entry in batch.entries:
-        if not _entry_has_compute(entry):
-            continue
-        if entry.req.is_prefill_chunk():
-            prefill_tokens += entry.num_scheduled_tokens
-        else:
-            decode_reqs += 1
-    return work_per_prefill_token * prefill_tokens + work_per_decode_req * decode_reqs
 
 
 class Engine:
@@ -157,7 +136,7 @@ class Engine:
                 metrics.pulls += 1
             elif action is None:
                 metrics.local_hits += 1
-        if _entry_has_compute(entry):
+        if entry_has_compute(entry):
             metrics.forward_steps += 1
 
     def _on_block_resident(self, block: KVBlock, req: Request, now: float) -> None:
@@ -268,7 +247,7 @@ class Engine:
                 raise NotImplementedError(f"unsupported action {action!r}")
 
         if forward_blocks:
-            work = forward_cost(
+            work = batch_forward_work(
                 batch,
                 work_per_prefill_token=self.work_per_prefill_token,
                 work_per_decode_req=self.work_per_decode_req,

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
+from cost_model import block_recompute_work
 from memory import BlockState, KVBlock, Memory
 from request import Request
 
@@ -281,22 +282,6 @@ def slots_needed(actions: BlockActions) -> int:
     )
 
 
-def recompute_work(
-    req: Request | None,
-    *,
-    block_size: int,
-    work_per_prefill_token: float,
-    work_per_decode_req: float,
-    work_per_block: float,
-) -> float:
-    """Work units for one recompute decision (matches ``engine.forward_cost`` per block)."""
-    if req is None:
-        return work_per_block
-    if req.is_prefill_chunk():
-        return work_per_prefill_token * block_size
-    return work_per_decode_req
-
-
 def first_resident_pull_source(
     memories: dict[str, Memory],
     pull_sources: list[str],
@@ -359,9 +344,22 @@ class LookupPolicy(ABC):
         """Reset per-batch reservation state before ``schedule()`` allocations."""
 
     def lookup(
-        self, memories: dict[str, Memory], block_hashes: list[str]
+        self,
+        memories: dict[str, Memory],
+        block_hashes: list[str],
+        *,
+        allow_compute: bool = True,
+        req: Request | None = None,
+        block_size: int = 1,
     ) -> LookupResult | None:
-        actions = self.resolve_actions(memories, block_hashes)
+        """Try to allocate ``block_hashes`` without preemption (SSOT for actions + evicts)."""
+        actions = self.resolve_actions(
+            memories,
+            block_hashes,
+            allow_compute=allow_compute,
+            req=req,
+            block_size=block_size,
+        )
         if actions is None:
             return None
         evicts = self.eviction_policy.plan(
@@ -546,7 +544,7 @@ class CostBasedPullLookupPolicy(LookupPolicy):
             return 0.0
         compute_res = self._compute_res
         assert compute_res is not None
-        work = recompute_work(
+        work = block_recompute_work(
             self._alloc_req,
             block_size=self._alloc_block_size,
             work_per_prefill_token=self._work_per_prefill_token,

@@ -36,6 +36,7 @@ python3.12 simulator.py stress-heavy              # larger stress run
 
 | File | Role |
 |------|------|
+| `cost_model.py` | Forward / recompute work units (SSOT for cost math) |
 | `policies.py` | `EvictionPolicy`, `PlacementPolicy`, `RetentionPolicy`, `LookupPolicy` |
 | `request.py` | Request state, PD phase, per-request metrics |
 | `pd.py` | `PDConfig` — validates and applies read-mode flags to engines |
@@ -150,12 +151,16 @@ time_for(work, load) = latency + work / speed(load)
 load(link)   = link.queued_load() + pending_pulls_in_this_allocation + 1
 load(compute)= compute.queued_load() + (1 if forward not yet reserved else 0) + 1
 
-recompute_work = work_per_prefill_token * block_size   (prefill chunk)
-              | work_per_decode_req                    (decode step)
-              | work_per_block                         (fallback)
+recompute_work = block_recompute_work(req, block_size=…)   # see cost_model.py
+              | work_per_block                         (req is None)
+
+batch work     = batch_forward_work(batch, …)              # ForwardTask
+
+`LookupPolicy.lookup()` is the SSOT for allocate-time block actions + eviction;
+``Scheduler._allocate_blocks`` retries with preemption when lookup returns ``None``.
 
 t_pull      = link.time_for(work_per_transfer, load(link))
-t_recompute = compute.time_for(recompute_work, load(compute))  # 0 if forward already reserved
+t_recompute = compute.time_for(block_recompute_work(...), load(compute))  # 0 if forward reserved
 action      = argmin(t_pull, t_recompute)   # tie → pull
 ```
 
