@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from memory import BlockState, Memory
+from memory import BlockState, KVBlock, Memory
 from policies import (
     ComputeOnlyLookupPolicy,
     CostBasedPullLookupPolicy,
+    FirstAvailableEviction,
+    LRUEviction,
     OrderedPullLookupPolicy,
     local_satisfied,
 )
@@ -29,6 +31,57 @@ def _make_resident(memory: Memory, block_hash: str, req_id: str = "producer") ->
     block = memory.find_reserved_for(block_hash, req_id)
     assert block is not None
     block.state = BlockState.RESIDENT
+
+
+def test_lru_eviction_picks_oldest_touch() -> None:
+    mem = Memory(size=4, name="hbm")
+    old = KVBlock("a", BlockState.RESIDENT)
+    mid = KVBlock("b", BlockState.RESIDENT)
+    recent = KVBlock("c", BlockState.RESIDENT)
+    for block, t in ((old, 1.0), (mid, 5.0), (recent, 9.0)):
+        mem.append(block)
+        mem.touch(block, t)
+
+    policy = LRUEviction()
+    victims = policy.pick_victims(mem, 2, exclude=set())
+    assert [v.hash for v in victims] == ["a", "b"]
+
+
+def test_lru_eviction_skips_held_and_excluded() -> None:
+    mem = Memory(size=4, name="hbm")
+    held = KVBlock("held", BlockState.RESIDENT, holders={"r1"})
+    old = KVBlock("a", BlockState.RESIDENT)
+    newer = KVBlock("b", BlockState.RESIDENT)
+    mem.append(held)
+    mem.append(old)
+    mem.append(newer)
+    mem.touch(old, 1.0)
+    mem.touch(newer, 2.0)
+
+    policy = LRUEviction()
+    victims = policy.pick_victims(mem, 1, exclude={"b"})
+    assert victims == [old]
+
+
+def test_lru_eviction_under_allocate_pressure() -> None:
+    memories = {"hbm": Memory(size=2, name="hbm")}
+    policy = ComputeOnlyLookupPolicy(local_memory="hbm")
+    assert isinstance(policy.eviction_policy, LRUEviction)
+    sched = Scheduler(policy, memories, "hbm")
+
+    for name, touch_t in (("old", 1.0), ("mid", 5.0)):
+        block = KVBlock(name, BlockState.RESIDENT)
+        memories["hbm"].append(block)
+        memories["hbm"].touch(block, touch_t)
+
+    req = Request("r1", 0.0, ["new"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 1
+    sched.running.append(req)
+
+    result = sched._allocate_blocks(req, ["new"], set(), [], now=10.0)
+    assert result is not None
+    assert len(result.evicts) == 1
+    assert result.evicts[0].hash == "old"
 
 
 def test_lookup_compute() -> None:
@@ -380,6 +433,9 @@ def test_request_metrics_pd_decode() -> None:
 
 def run_unit_tests() -> None:
     tests = [
+        test_lru_eviction_picks_oldest_touch,
+        test_lru_eviction_skips_held_and_excluded,
+        test_lru_eviction_under_allocate_pressure,
         test_lookup_compute,
         test_pull_only_rejects_compute_fallback,
         test_cost_model_picks_faster_pull_source,

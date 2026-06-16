@@ -62,7 +62,7 @@ class Simulator:
                 self.log.on_schedule(eng.engine_id, self, batch)
             if not batch.entries:
                 continue
-            tasks = eng.execute_batch(batch)
+            tasks = eng.execute_batch(batch, self.now)
             if self.log:
                 self.log.on_execute(eng.engine_id, self, tasks)
             self._in_flight[eng.engine_id] = InFlightBatch(batch=batch, tasks=tasks)

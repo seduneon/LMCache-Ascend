@@ -63,12 +63,19 @@ Engine knobs: `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `enable_ch
 
 ### Eviction — `EvictionPolicy`
 
+| Class | Behavior |
+|-------|----------|
+| `LRUEviction` | Default. Evict unheld resident blocks with oldest `last_touch` |
+| `FirstAvailableEviction` | Arbitrary order (legacy / deterministic tests) |
+
 ```python
 class MyEviction(EvictionPolicy):
     def pick_victims(self, hbm, count, exclude) -> list[KVBlock]: ...
 
 LookupPolicy(local_memory="npu-0:hbm", eviction_policy=MyEviction())
 ```
+
+Blocks record `last_touch` (simulation time) on local hit (`engine._reserve`), pull complete (`LoadTask`), and forward complete (`ForwardTask`).
 
 ### Pull / compute — `LookupPolicy`
 
@@ -158,8 +165,8 @@ These are the main blockers for LMCache-style **where to put KV** and **how many
 
 | Gap | vLLM | Simulator |
 |-----|------|-----------|
-| Victim selection | LRU on physical blocks | Default `FirstAvailableEviction` (arbitrary order) |
-| Touch on access | Updates LRU on hit / use | No last-access tracking |
+| Victim selection | LRU on physical blocks | Default `LRUEviction` |
+| Touch on access | Updates LRU on hit / use | `Memory.touch` on local hit, pull/forward complete |
 | Prefix-aware scoring | Prefer evicting unshared / low-reuse | Not modeled |
 | Watermarks | Reserved blocks for decode vs prefill | Not modeled |
 | Eviction timing | Often synchronous at allocation | Async `EvictTask` on compute resource (distorts pressure timing) |
@@ -316,7 +323,7 @@ Aggregation CLI / sweep reporting: **not implemented** (fields exist per request
 2. Per-tier `Memory` with independent eviction and capacity.
 3. `RetentionPolicy`: max copies per hash per tier / globally.
 4. Spill-on-evict (HBM victim → DRAM/SSD or drop).
-5. Touch order + `LRUEviction` default.
+5. ~~Touch order + `LRUEviction` default~~ (done)
 
 ### P1 — trustworthy pull vs recompute (remaining)
 

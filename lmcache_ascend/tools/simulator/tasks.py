@@ -169,6 +169,7 @@ class ForwardTask(Task):
     def on_end(self) -> None:
         for block in self.blocks:
             block.state = BlockState.RESIDENT
+            block.touch(self.now)
 
 
 class LoadTask(MemoryTask):
@@ -179,6 +180,7 @@ class LoadTask(MemoryTask):
     def on_end(self) -> None:
         self.block.state = BlockState.RESIDENT
         self.block.task = None
+        self.memory.touch(self.block, self.now)
 
 
 class EvictTask(MemoryTask):

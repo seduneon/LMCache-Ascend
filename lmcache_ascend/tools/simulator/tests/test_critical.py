@@ -151,9 +151,9 @@ def test_in_flight_blocks_reschedule() -> None:
 
     original = eng.execute_batch
 
-    def guarded_execute(batch: Batch):
+    def guarded_execute(batch: Batch, now: float = 0.0):
         assert "e0" not in sim._in_flight, "execute_batch while batch still in flight"
-        return original(batch)
+        return original(batch, now)
 
     eng.execute_batch = guarded_execute  # type: ignore[method-assign]
 

@@ -55,6 +55,21 @@ class FirstAvailableEviction(EvictionPolicy):
         return victims
 
 
+class LRUEviction(EvictionPolicy):
+    """Evict resident, unheld blocks with the oldest ``last_touch`` first."""
+
+    def pick_victims(self, hbm: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+        candidates: list[KVBlock] = []
+        for block_hash, copies in hbm.blocks.items():
+            if block_hash in exclude:
+                continue
+            for block in copies:
+                if hbm.can_evict_block(block):
+                    candidates.append(block)
+        candidates.sort(key=lambda block: block.last_touch)
+        return candidates[:count]
+
+
 def local_satisfied(local: Memory, block_hash: str) -> bool:
     return (
         local.best_resident(block_hash) is not None
@@ -109,7 +124,7 @@ class LookupPolicy(ABC):
         eviction_policy: EvictionPolicy | None = None,
     ):
         self.local_memory = local_memory
-        self.eviction_policy = eviction_policy or FirstAvailableEviction()
+        self.eviction_policy = eviction_policy or LRUEviction()
 
     @property
     @abstractmethod

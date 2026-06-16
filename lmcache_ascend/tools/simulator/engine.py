@@ -148,7 +148,7 @@ class Engine:
         if _entry_has_compute(entry):
             metrics.forward_steps += 1
 
-    def execute_batch(self, batch: Batch) -> list[Task]:
+    def execute_batch(self, batch: Batch, now: float = 0.0) -> list[Task]:
         """Reserve memory, run evictions/pulls, then one batched forward for all compute."""
         local = self._local()
         all_tasks: list[Task] = []
@@ -158,7 +158,7 @@ class Engine:
 
         for entry in batch.entries:
             self._record_entry_actions(entry)
-            self._reserve(entry.req, entry.result, entry.block_hashes)
+            self._reserve(entry.req, entry.result, entry.block_hashes, now=now)
 
             for victim in entry.result.evicts:
                 task = EvictTask(
@@ -254,7 +254,14 @@ class Engine:
     def release_held_kv(self, req_id: str) -> None:
         self._local().free_request(req_id)
 
-    def _reserve(self, req: Request, result: LookupResult, block_hashes: list[str]) -> None:
+    def _reserve(
+        self,
+        req: Request,
+        result: LookupResult,
+        block_hashes: list[str],
+        *,
+        now: float = 0.0,
+    ) -> None:
         local = self._local()
 
         for block_hash in block_hashes:
@@ -265,6 +272,7 @@ class Engine:
             resident = local.best_resident(block_hash)
             if resident is not None:
                 resident.holders.add(req.req_id)
+                local.touch(resident, now)
                 continue
 
             inflight = local.inflight_incoming(block_hash)

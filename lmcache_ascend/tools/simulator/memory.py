@@ -21,11 +21,16 @@ class KVBlock:
         state: BlockState,
         task: Task | None = None,
         holders: set[str] | None = None,
+        last_touch: float = 0.0,
     ):
         self.hash: str = hash
         self.state: BlockState = state
         self.task: Task | None = task
         self.holders: set[str] = holders if holders is not None else set()
+        self.last_touch: float = last_touch
+
+    def touch(self, t: float) -> None:
+        self.last_touch = t
 
 
 class Memory:
@@ -100,3 +105,7 @@ class Memory:
 
     def can_evict_block(self, block: KVBlock) -> bool:
         return block.state == BlockState.RESIDENT and len(block.holders) == 0
+
+    def touch(self, block: KVBlock, t: float) -> None:
+        """Record last use time (simulation clock) for LRU eviction."""
+        block.touch(t)
