@@ -14,20 +14,23 @@ from policies import (
     CostBasedPullLookupPolicy,
     ConsumeOnPull,
     FirstAvailableEviction,
+    GlobalCopyCap,
     HBMAndDRAM,
     HBMOnly,
     LRUEviction,
     OrderedPullLookupPolicy,
     SingleCopyPerTier,
+    TieredPlacement,
     UnboundedRetention,
     local_satisfied,
 )
+from tasks import BatchLoadTask, StoreTask, Task, TaskPool, TaskStatus
+
 from engine import Engine
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
 from scheduler import Scheduler
 from simulator import Simulator
-from tasks import Task, TaskPool, TaskStatus
 
 
 class _SimpleTask(Task):
@@ -754,6 +757,180 @@ def test_request_metrics_pd_decode() -> None:
     assert dm.engine_id == "npu-1"
 
 
+def test_global_copy_cap_trims_across_tiers() -> None:
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "other": Memory(size=10, name="other"),
+    }
+    req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    memories["hbm"].append(KVBlock("a", BlockState.RESIDENT))
+    memories["other"].append(KVBlock("a", BlockState.RESIDENT))
+    memories["other"].append(KVBlock("a", BlockState.RESIDENT))
+
+    cap = GlobalCopyCap(2, ["hbm", "other"], per_tier_cap=None)
+    cap.on_block_resident(
+        memories,
+        tier_key="other",
+        block=memories["other"].list()[-1],
+        now=1.0,
+        req=req,
+    )
+
+    total = sum(mem.count_resident("a") for mem in memories.values())
+    assert total == 2
+
+
+def test_tiered_placement_async_store_e2e() -> None:
+    pool = TaskPool()
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "ssd": Memory(size=10, name="ssd", chunk_blocks=4),
+    }
+    write_link = BandwidthResource(base_speed=4.0, latency=0.0)
+    eng = Engine(
+        "e0",
+        [],
+        pool,
+        memories,
+        "hbm",
+        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        ComputeResource(base_speed=8.0),
+        work_per_block=1.0,
+        placement_policy=TieredPlacement(["ssd"], paid_write_tiers=frozenset({"ssd"})),
+        write_links={"ssd": write_link},
+        work_per_store=4.0,
+    )
+    eng.schedule_request(
+        Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    Simulator([eng], pool).run()
+
+    chunk_key = "chunk:a|b|c|d"
+    assert memories["ssd"].best_resident(chunk_key) is not None
+    assert write_link.queued_load() == 0
+
+
+def test_inflight_remote_source_waits_not_preempts() -> None:
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "src": Memory(size=10, name="src", chunk_blocks=4),
+    }
+    chunk_key = "chunk:a|b|c|d"
+    loading = KVBlock(chunk_key, BlockState.LOADING)
+    loading.task = object()  # type: ignore[assignment]
+    memories["src"].append(loading)
+
+    req = Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 4
+    policy = OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["src"])
+    actions = policy.resolve_actions(memories, ["c"], req=req)
+    assert actions == {"c": "wait"}
+
+
+def test_batch_load_task_amortizes_work() -> None:
+    pool = TaskPool()
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "dram": Memory(size=10, name="dram", chunk_blocks=4),
+    }
+    chunk_key = "chunk:a|b|c|d"
+    memories["dram"].append(KVBlock(chunk_key, BlockState.RESIDENT))
+
+    link = BandwidthResource(base_speed=1.0, latency=1.0)
+    eng = Engine(
+        "e0",
+        [],
+        pool,
+        memories,
+        "hbm",
+        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        ComputeResource(base_speed=100.0),
+        transfer_links={"dram": link},
+        work_per_block=1.0,
+        work_per_transfer=1.0,
+    )
+    eng.schedule_request(
+        Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    eng.release_arrivals(0.0)
+    batch = eng.schedule(0.0)
+    tasks = eng.execute_batch(batch, 0.0)
+    assert any(isinstance(t, BatchLoadTask) for t in tasks)
+
+    t0 = Simulator([eng], pool).run()
+    assert t0 == 5.0
+
+
+def test_pull_dedupe_across_requests_in_batch() -> None:
+    pool = TaskPool()
+    memories = {
+        "hbm": Memory(size=20, name="hbm"),
+        "dram": Memory(size=10, name="dram", chunk_blocks=4),
+    }
+    chunk_key = "chunk:a|b|c|d"
+    memories["dram"].append(KVBlock(chunk_key, BlockState.RESIDENT))
+
+    link = BandwidthResource(base_speed=1.0, latency=1.0)
+    eng = Engine(
+        "e0",
+        [],
+        pool,
+        memories,
+        "hbm",
+        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        ComputeResource(base_speed=100.0),
+        transfer_links={"dram": link},
+        work_per_block=1.0,
+        work_per_transfer=1.0,
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+    )
+    eng.schedule_request(
+        Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    eng.schedule_request(
+        Request("r2", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    eng.release_arrivals(0.0)
+    batch = eng.schedule(0.0)
+    assert len(batch.entries) == 2
+
+    tasks = eng.execute_batch(batch, 0.0)
+    batch_loads = [t for t in tasks if isinstance(t, BatchLoadTask)]
+    assert len(batch_loads) == 1
+    assert len(batch_loads[0].blocks) == 8
+
+    finish = Simulator([eng], pool).run()
+    assert finish == 5.0
+    assert eng.completed[0].metrics.pulls == 4
+    assert eng.completed[1].metrics.pulls == 4
+
+
+def test_sync_evict_frees_before_pull() -> None:
+    pool = TaskPool()
+    memories = {"hbm": Memory(size=1, name="hbm")}
+    memories["hbm"].append(KVBlock("old", BlockState.RESIDENT))
+    eng = Engine(
+        "e0",
+        [],
+        pool,
+        memories,
+        "hbm",
+        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        ComputeResource(base_speed=8.0),
+        work_per_block=1.0,
+        sync_evict=True,
+    )
+    eng.schedule_request(
+        Request("r1", 0.0, ["new"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    eng.release_arrivals(0.0)
+    batch = eng.schedule(0.0)
+    eng.execute_batch(batch, 0.0)
+    assert memories["hbm"].best_resident("old") is None
+    assert memories["hbm"].find_reserved_for("new", "r1") is not None
+
+
 def test_sweep_smoke() -> None:
     from sweep import SweepConfig, run_sweep
 
@@ -789,6 +966,12 @@ def run_unit_tests() -> None:
         test_consume_on_pull_removes_unheld_source,
         test_consume_on_pull_keeps_held_source,
         test_consume_on_pull_e2e,
+        test_global_copy_cap_trims_across_tiers,
+        test_tiered_placement_async_store_e2e,
+        test_inflight_remote_source_waits_not_preempts,
+        test_batch_load_task_amortizes_work,
+        test_pull_dedupe_across_requests_in_batch,
+        test_sync_evict_frees_before_pull,
         # eviction
         test_lru_eviction_picks_oldest_touch,
         test_lru_eviction_skips_held_and_excluded,

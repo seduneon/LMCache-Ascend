@@ -344,6 +344,7 @@ def test_parallel_pull_tasks_start_together() -> None:
     """Pull tasks in one batch depend on evicts only, not on each other."""
     from engine import Engine
     from policies import LookupResult, OrderedPullLookupPolicy
+    from tasks import BatchLoadTask
 
     pool = TaskPool()
     memories = {
@@ -383,7 +384,7 @@ def test_parallel_pull_tasks_start_together() -> None:
     batch.entries[1].req.prefix_block_count = 1
 
     tasks = eng.execute_batch(batch)
-    pulls = [t for t in tasks if t.__class__.__name__ == "LoadTask"]
+    pulls = [t for t in tasks if isinstance(t, BatchLoadTask)]
     assert len(pulls) == 2
     for pull in pulls:
         assert pull.prereqs == []

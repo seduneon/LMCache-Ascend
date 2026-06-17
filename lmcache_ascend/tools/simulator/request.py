@@ -31,6 +31,7 @@ class RequestMetrics:
     pulls: int = 0
     computes: int = 0
     local_hits: int = 0
+    remote_waits: int = 0
     preemptions: int = 0
     remote_kv_admits: int = 0
     forward_steps: int = 0

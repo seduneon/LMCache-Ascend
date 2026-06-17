@@ -16,6 +16,7 @@ from policies import (
     ComputeOnlyLookupPolicy,
     ConsumeOnPull,
     CostBasedPullLookupPolicy,
+    GlobalCopyCap,
     HBMAndDRAM,
     HBMOnly,
     LookupPolicy,
@@ -23,6 +24,7 @@ from policies import (
     PlacementPolicy,
     RetentionPolicy,
     SingleCopyPerTier,
+    TieredPlacement,
     UnboundedRetention,
 )
 from request import Request, RequestPD, RequestStatus
@@ -40,7 +42,10 @@ class SimConfig:
 
     hbm_size: int = 40
     dram_size: int = 80
+    ssd_size: int = 160
     dram_chunk_blocks: int = 4
+    ssd_chunk_blocks: int = 4
+    ssd_write_speed: float = 8.0
     max_num_seqs: int = 12
     max_num_batched_tokens: int = 24
     compute_speed: float = 64.0
@@ -91,6 +96,16 @@ def _hbm_dram_memories(cfg: SimConfig) -> dict[str, Memory]:
         size=cfg.dram_size,
         name="npu-0:dram",
         chunk_blocks=cfg.dram_chunk_blocks,
+    )
+    return memories
+
+
+def _hbm_dram_ssd_memories(cfg: SimConfig) -> dict[str, Memory]:
+    memories = _hbm_dram_memories(cfg)
+    memories["npu-0:ssd"] = Memory(
+        size=cfg.ssd_size,
+        name="npu-0:ssd",
+        chunk_blocks=cfg.ssd_chunk_blocks,
     )
     return memories
 
@@ -157,6 +172,36 @@ PRESETS: dict[str, PolicyPreset] = {
         build_retention=SingleCopyPerTier,
         decode_pull_sources=lambda m: ["npu-0:hbm"],
     ),
+    "ssd_tier": PolicyPreset(
+        name="ssd_tier",
+        description="P sync DRAM + paid SSD writes; D cost-pull from SSD/DRAM/HBM",
+        build_memories=_hbm_dram_ssd_memories,
+        build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
+        build_decode_policy=lambda m: CostBasedPullLookupPolicy(
+            local_memory="npu-1:hbm",
+            pull_sources=["npu-0:ssd", "npu-0:dram", "npu-0:hbm"],
+        ),
+        build_prefill_placement=lambda m: TieredPlacement(
+            ["npu-0:dram", "npu-0:ssd"],
+            paid_write_tiers=frozenset({"npu-0:ssd"}),
+        ),
+        build_retention=UnboundedRetention,
+        decode_pull_sources=lambda m: ["npu-0:ssd", "npu-0:dram", "npu-0:hbm"],
+    ),
+    "global_cap_2": PolicyPreset(
+        name="global_cap_2",
+        description="baseline + GlobalCopyCap(2) across P HBM and D HBM",
+        build_memories=_hbm_memories,
+        build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
+        build_decode_policy=lambda m: CostBasedPullLookupPolicy(
+            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
+        ),
+        build_prefill_placement=lambda m: HBMOnly(),
+        build_retention=lambda: GlobalCopyCap(
+            2, ["npu-0:hbm", "npu-1:hbm"], per_tier_cap=None
+        ),
+        decode_pull_sources=lambda m: ["npu-0:hbm"],
+    ),
 }
 
 DEFAULT_PRESET_NAMES: tuple[str, ...] = (
@@ -191,6 +236,8 @@ class SweepRow:
     prefill_evictions: int = 0
     pull_ratio: float = 0.0
     dram_slots_used: int = 0
+    ssd_slots_used: int = 0
+    peak_duplicate_count: int = 0
     tier_used_at_end: str = ""
 
 
@@ -203,6 +250,19 @@ def _transfer_links(
     link: BandwidthResource,
 ) -> dict[str, BandwidthResource]:
     return {src: link for src in pull_sources if src in memories}
+
+
+def _write_links(
+    memories: dict[str, Memory],
+    sim_cfg: SimConfig,
+) -> dict[str, BandwidthResource]:
+    links: dict[str, BandwidthResource] = {}
+    if "npu-0:ssd" in memories:
+        links["npu-0:ssd"] = BandwidthResource(
+            base_speed=sim_cfg.ssd_write_speed,
+            latency=sim_cfg.link_latency,
+        )
+    return links
 
 
 def build_engines(
@@ -233,6 +293,8 @@ def build_engines(
         enable_chunked_prefill=True,
         placement_policy=preset.build_prefill_placement(memories),
         retention_policy=retention,
+        write_links=_write_links(memories, sim_cfg),
+        work_per_store=sim_cfg.work_per_transfer,
     )
     npu1 = Engine(
         engine_id="npu-1",
@@ -290,6 +352,9 @@ def _aggregate_metrics(
     )
     dram = memories.get("npu-0:dram")
     dram_slots_used = dram.used_size() if dram is not None else 0
+    ssd = memories.get("npu-0:ssd")
+    ssd_slots_used = ssd.used_size() if ssd is not None else 0
+    peak_dup = max(npu0._peak_duplicate_count, npu1._peak_duplicate_count)
 
     return SweepRow(
         preset=preset,
@@ -310,6 +375,8 @@ def _aggregate_metrics(
         prefill_evictions=prefill_evictions,
         pull_ratio=pull_ratio,
         dram_slots_used=dram_slots_used,
+        ssd_slots_used=ssd_slots_used,
+        peak_duplicate_count=peak_dup,
         tier_used_at_end=tier_used_at_end,
     )
 

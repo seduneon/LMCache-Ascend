@@ -203,6 +203,81 @@ class LoadTask(MemoryTask):
             self._on_resident(self.block, self.now)
 
 
+class BatchLoadTask(Task):
+    """Pull multiple HBM blocks in one transfer (chunk latency amortized once)."""
+
+    def __init__(
+        self,
+        work_left: float,
+        resource: Resource,
+        memory: Memory,
+        blocks: list[KVBlock],
+        on_resident: Callable[[KVBlock, float], None] | None = None,
+    ):
+        super().__init__(work_left, resource)
+        self.memory = memory
+        self.blocks = list(blocks)
+        self._on_resident = on_resident
+        self._block_callbacks: dict[int, Callable[[KVBlock, float], None]] = {}
+        if on_resident is not None:
+            for block in self.blocks:
+                self._block_callbacks[id(block)] = on_resident
+
+    def add_block(
+        self,
+        block: KVBlock,
+        on_resident: Callable[[KVBlock, float], None] | None = None,
+    ) -> None:
+        """Attach another destination block before the task starts (pull dedupe)."""
+        assert self.status == TaskStatus.PENDING, "cannot extend pull after start"
+        self.blocks.append(block)
+        block.task = self
+        if on_resident is not None:
+            self._block_callbacks[id(block)] = on_resident
+
+    def on_start(self) -> None:
+        for block in self.blocks:
+            block.state = BlockState.LOADING
+            block.task = self
+
+    def on_end(self) -> None:
+        for block in self.blocks:
+            block.state = BlockState.RESIDENT
+            block.task = None
+            self.memory.touch(block, self.now)
+            callback = self._block_callbacks.get(id(block), self._on_resident)
+            if callback is not None:
+                callback(block, self.now)
+
+
+class StoreTask(Task):
+    """Write a chunk copy from local HBM to a downstream tier (paid bandwidth)."""
+
+    def __init__(
+        self,
+        work_left: float,
+        resource: Resource,
+        tier: Memory,
+        tier_block: KVBlock,
+        on_resident: Callable[[KVBlock, float], None] | None = None,
+    ):
+        super().__init__(work_left, resource)
+        self.tier = tier
+        self.tier_block = tier_block
+        self._on_resident = on_resident
+
+    def on_start(self) -> None:
+        self.tier_block.state = BlockState.LOADING
+        self.tier_block.task = self
+
+    def on_end(self) -> None:
+        self.tier_block.state = BlockState.RESIDENT
+        self.tier_block.task = None
+        self.tier.touch(self.tier_block, self.now)
+        if self._on_resident is not None:
+            self._on_resident(self.tier_block, self.now)
+
+
 class EvictTask(MemoryTask):
     def __init__(
         self,

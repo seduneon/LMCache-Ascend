@@ -70,11 +70,12 @@ class Memory:
         return [b for b in self.get(block_hash) if b.state == BlockState.RESIDENT]
 
     def inflight_incoming(self, block_hash: str) -> KVBlock | None:
+        """Block not yet resident: reserved slot, load in progress, or pending store."""
         return next(
             (
                 b
                 for b in self.get(block_hash)
-                if b.state in (BlockState.RESERVED, BlockState.LOADING) and b.task is not None
+                if b.state in (BlockState.RESERVED, BlockState.LOADING)
             ),
             None,
         )
@@ -113,3 +114,59 @@ class Memory:
     def touch(self, block: KVBlock, t: float) -> None:
         """Record last use time (simulation clock) for LRU eviction."""
         block.touch(t)
+
+    def count_resident(self, block_hash: str) -> int:
+        return len(self.resident_copies(block_hash))
+
+
+def count_resident_across_tiers(
+    memories: dict[str, Memory],
+    tier_keys: list[str],
+    content_key: str,
+) -> int:
+    total = 0
+    for key in tier_keys:
+        mem = memories.get(key)
+        if mem is not None:
+            total += mem.count_resident(content_key)
+    return total
+
+
+def collect_resident_copies(
+    memories: dict[str, Memory],
+    tier_keys: list[str],
+    content_key: str,
+) -> list[tuple[str, KVBlock]]:
+    copies: list[tuple[str, KVBlock]] = []
+    for key in tier_keys:
+        mem = memories.get(key)
+        if mem is None:
+            continue
+        for block in mem.resident_copies(content_key):
+            copies.append((key, block))
+    return copies
+
+
+def collect_content_copies(
+    memories: dict[str, Memory],
+    tier_keys: list[str],
+    req: Request | None,
+    anchor_hbm: str,
+) -> list[tuple[str, KVBlock]]:
+    """All resident copies of the same logical content across tiers."""
+    from chunk_hash import chunk_key_for_hbm_block
+
+    copies: list[tuple[str, KVBlock]] = []
+    seen: set[tuple[str, int]] = set()
+    for tier_key in tier_keys:
+        mem = memories.get(tier_key)
+        if mem is None:
+            continue
+        key = chunk_key_for_hbm_block(req, anchor_hbm, mem.chunk_blocks)
+        for block in mem.resident_copies(key):
+            token = (tier_key, id(block))
+            if token in seen:
+                continue
+            seen.add(token)
+            copies.append((tier_key, block))
+    return copies

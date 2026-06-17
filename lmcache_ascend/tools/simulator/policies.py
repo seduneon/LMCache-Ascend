@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
 from chunk_hash import (
+    anchor_hbm_hash,
     chunk_key_for_hbm_block,
     lmcache_chunk_hash,
     tier_covers_hbm_block,
@@ -13,17 +14,37 @@ from chunk_hash import (
     transfer_work_units,
 )
 from cost_model import block_recompute_work
-from memory import BlockState, KVBlock, Memory
+from memory import (
+    BlockState,
+    KVBlock,
+    Memory,
+    collect_content_copies,
+    collect_resident_copies,
+    count_resident_across_tiers,
+)
 from request import Request
 
 if TYPE_CHECKING:
     from resource import BandwidthResource, ComputeResource
 
-BlockAction = Literal["compute"] | tuple[Literal["pull"], str]
+BlockAction = (
+    Literal["compute"]
+    | Literal["wait"]
+    | tuple[Literal["pull"], str]
+)
 BlockActions = dict[str, BlockAction]
 
 _LOCAL = Literal["local"]
 BlockResolution = BlockAction | _LOCAL | None
+
+
+@dataclass(frozen=True)
+class StoreOp:
+    """Async write of one chunk slot to a downstream tier."""
+
+    tier_key: str
+    content_key: str
+    hbm_block_hash: str
 
 
 @dataclass
@@ -114,6 +135,28 @@ class PlacementPolicy(ABC):
     def bind_retention(self, retention: RetentionPolicy) -> None:
         """Optional hook for tier mirrors to enforce copy caps (``HBMAndDRAM``)."""
 
+    def plan_async_stores(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block_hash: str,
+        req: Request,
+    ) -> list[StoreOp]:
+        """Return paid async mirror ops after compute/pull (empty for sync-only placement)."""
+        return []
+
+    def plan_spill_stores(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block_hash: str,
+        req: Request,
+    ) -> list[StoreOp]:
+        """Return paid async spill ops before HBM victim is removed."""
+        return []
+
 
 class HBMOnly(PlacementPolicy):
     """Keep computed KV on local HBM only (default)."""
@@ -201,6 +244,170 @@ class HBMAndDRAM(PlacementPolicy):
         )
 
 
+class TieredPlacement(PlacementPolicy):
+    """Mirror/spill HBM to one or more downstream tiers; optional paid writes per tier."""
+
+    def __init__(
+        self,
+        tier_keys: list[str],
+        *,
+        tier_eviction: dict[str, EvictionPolicy] | None = None,
+        paid_write_tiers: frozenset[str] | None = None,
+    ):
+        self.tier_keys = list(tier_keys)
+        self._tier_eviction = tier_eviction or {}
+        self._paid_write_tiers = paid_write_tiers or frozenset()
+        self._retention: RetentionPolicy = UnboundedRetention()
+
+    def bind_retention(self, retention: RetentionPolicy) -> None:
+        self._retention = retention
+
+    def _eviction_for(self, tier_key: str) -> EvictionPolicy:
+        return self._tier_eviction.get(tier_key, LRUEviction())
+
+    def _ensure_tier_resident_sync(
+        self,
+        memories: dict[str, Memory],
+        *,
+        tier_key: str,
+        req: Request,
+        block_hash: str,
+        now: float,
+    ) -> bool:
+        tier = memories[tier_key]
+        chunk_key = chunk_key_for_hbm_block(req, block_hash, tier.chunk_blocks)
+        if tier.best_resident(chunk_key) is not None:
+            return True
+        if tier.inflight_incoming(chunk_key) is not None:
+            return True
+
+        exclude = {chunk_key}
+        while tier.free_size() <= 0:
+            victims = self._eviction_for(tier_key).pick_victims(tier, 1, exclude)
+            if not victims:
+                return False
+            tier.remove_block(victims[0])
+
+        copy = KVBlock(chunk_key, BlockState.RESIDENT)
+        tier.append(copy)
+        tier.touch(copy, now)
+        self._retention.on_block_resident(
+            memories, tier_key=tier_key, block=copy, now=now
+        )
+        return True
+
+    def _reserve_tier_loading(
+        self,
+        memories: dict[str, Memory],
+        *,
+        tier_key: str,
+        req: Request,
+        block_hash: str,
+    ) -> KVBlock | None:
+        tier = memories[tier_key]
+        chunk_key = chunk_key_for_hbm_block(req, block_hash, tier.chunk_blocks)
+        if tier.best_resident(chunk_key) is not None:
+            return None
+        if tier.inflight_incoming(chunk_key) is not None:
+            return None
+
+        exclude = {chunk_key}
+        while tier.free_size() <= 0:
+            victims = self._eviction_for(tier_key).pick_victims(tier, 1, exclude)
+            if not victims:
+                return None
+            tier.remove_block(victims[0])
+
+        copy = KVBlock(chunk_key, BlockState.RESERVED)
+        tier.append(copy)
+        return copy
+
+    def place_copy(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block: KVBlock,
+        req: Request,
+        now: float,
+    ) -> None:
+        for tier_key in self.tier_keys:
+            if tier_key in self._paid_write_tiers:
+                continue
+            self._ensure_tier_resident_sync(
+                memories, tier_key=tier_key, req=req, block_hash=block.hash, now=now
+            )
+
+    def spill_on_evict(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block: KVBlock,
+        now: float,
+        req: Request | None = None,
+    ) -> None:
+        if req is None:
+            return
+        for tier_key in self.tier_keys:
+            if tier_key in self._paid_write_tiers:
+                continue
+            self._ensure_tier_resident_sync(
+                memories, tier_key=tier_key, req=req, block_hash=block.hash, now=now
+            )
+
+    def plan_async_stores(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block_hash: str,
+        req: Request,
+    ) -> list[StoreOp]:
+        return self._paid_stores(
+            memories, req=req, block_hash=block_hash, paid_only=True
+        )
+
+    def plan_spill_stores(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block_hash: str,
+        req: Request,
+    ) -> list[StoreOp]:
+        return self._paid_stores(
+            memories, req=req, block_hash=block_hash, paid_only=True
+        )
+
+    def _paid_stores(
+        self,
+        memories: dict[str, Memory],
+        *,
+        req: Request,
+        block_hash: str,
+        paid_only: bool,
+    ) -> list[StoreOp]:
+        ops: list[StoreOp] = []
+        for tier_key in self.tier_keys:
+            if tier_key not in self._paid_write_tiers:
+                continue
+            tier = memories[tier_key]
+            chunk_key = chunk_key_for_hbm_block(req, block_hash, tier.chunk_blocks)
+            if tier.best_resident(chunk_key) is not None:
+                continue
+            if tier.inflight_incoming(chunk_key) is not None:
+                continue
+            if self._reserve_tier_loading(
+                memories, tier_key=tier_key, req=req, block_hash=block_hash
+            ) is None:
+                continue
+            ops.append(
+                StoreOp(tier_key=tier_key, content_key=chunk_key, hbm_block_hash=block_hash)
+            )
+        return ops
+
+
 # --- Retention ---
 
 
@@ -226,6 +433,7 @@ class RetentionPolicy(ABC):
         tier_key: str,
         block: KVBlock,
         now: float,
+        req: Request | None = None,
     ) -> None:
         memory = memories[tier_key]
         cap = self.max_copies(memory, block.hash)
@@ -282,6 +490,59 @@ class ConsumeOnPull(RetentionPolicy):
         return PullDisposition.CONSUME
 
 
+class GlobalCopyCap(RetentionPolicy):
+    """Cap total resident copies of a content key across selected tiers."""
+
+    def __init__(
+        self,
+        max_total: int,
+        tier_keys: list[str],
+        *,
+        per_tier_cap: int | None = 1,
+    ):
+        self.max_total = max_total
+        self.tier_keys = list(tier_keys)
+        self._per_tier_cap = per_tier_cap
+
+    def max_copies(self, memory: Memory, block_hash: str) -> int | None:
+        if self._per_tier_cap is None:
+            return None
+        return self._per_tier_cap
+
+    def on_block_resident(
+        self,
+        memories: dict[str, Memory],
+        *,
+        tier_key: str,
+        block: KVBlock,
+        now: float,
+        req: Request | None = None,
+    ) -> None:
+        super().on_block_resident(
+            memories, tier_key=tier_key, block=block, now=now, req=req
+        )
+        if req is None:
+            anchor = block.hash
+        else:
+            anchor = anchor_hbm_hash(req, tier_key, block.hash, memories)
+        while len(collect_content_copies(memories, self.tier_keys, req, anchor)) > self.max_total:
+            copies = collect_content_copies(memories, self.tier_keys, req, anchor)
+            evictable = [
+                (tier, blk)
+                for tier, blk in copies
+                if memories[tier].can_evict_block(blk)
+                and memories[tier].inflight_incoming(blk.hash) is None
+            ]
+            if not evictable:
+                break
+            tier_order = {t: i for i, t in enumerate(reversed(self.tier_keys))}
+            victim_tier, victim = min(
+                evictable,
+                key=lambda item: (tier_order.get(item[0], 0), item[1].last_touch),
+            )
+            memories[victim_tier].remove_block(victim)
+
+
 # --- Lookup helpers ---
 
 
@@ -296,8 +557,43 @@ def slots_needed(actions: BlockActions) -> int:
     return sum(
         1
         for action in actions.values()
-        if action == "compute" or (isinstance(action, tuple) and action[0] == "pull")
+        if action == "compute"
+        or (isinstance(action, tuple) and action[0] == "pull")
     )
+
+
+def remote_wait_source(
+    memories: dict[str, Memory],
+    pull_sources: list[str],
+    block_hash: str,
+    *,
+    req: Request | None = None,
+) -> str | None:
+    """Pull source with in-flight chunk (resident copy not ready yet)."""
+    for src_key in pull_sources:
+        src = memories[src_key]
+        if tier_covers_hbm_block(src, req, block_hash):
+            continue
+        if tier_inflight_hbm_block(src, req, block_hash):
+            return src_key
+    return None
+
+
+def remote_pull_satisfied(
+    memories: dict[str, Memory],
+    pull_sources: list[str],
+    block_hash: str,
+    *,
+    req: Request | None = None,
+) -> bool:
+    """True when a pull source has the chunk resident or an in-flight load/store for it."""
+    for src_key in pull_sources:
+        src = memories[src_key]
+        if tier_covers_hbm_block(src, req, block_hash):
+            return True
+        if tier_inflight_hbm_block(src, req, block_hash):
+            return True
+    return False
 
 
 def first_resident_pull_source(
@@ -309,8 +605,6 @@ def first_resident_pull_source(
 ) -> str | None:
     for src_key in pull_sources:
         src = memories[src_key]
-        if tier_inflight_hbm_block(src, req, block_hash):
-            return None
         if tier_covers_hbm_block(src, req, block_hash):
             return src_key
     return None
@@ -468,6 +762,9 @@ class OrderedPullLookupPolicy(LookupPolicy):
         if local_satisfied(local, block_hash):
             return "local"
 
+        if remote_wait_source(memories, self._pull_sources, block_hash, req=req) is not None:
+            return "wait"
+
         src_key = first_resident_pull_source(
             memories, self._pull_sources, block_hash, req=req
         )
@@ -585,7 +882,7 @@ class CostBasedPullLookupPolicy(LookupPolicy):
             compute_res.queued_load() + pending_forward,
         )
 
-    def _note_resolution(self, resolution: BlockResolution) -> None:
+    def _note_resolution(self, resolution: BlockResolution, block_hash: str) -> None:
         if isinstance(resolution, tuple) and resolution[0] == "pull":
             src_key = resolution[1]
             self._pending_pulls[src_key] = self._pending_pulls.get(src_key, 0) + 1
@@ -605,17 +902,20 @@ class CostBasedPullLookupPolicy(LookupPolicy):
         if local_satisfied(local, block_hash):
             return "local"
 
+        if remote_wait_source(memories, self._pull_sources, block_hash, req=req) is not None:
+            return "wait"
+
         if not self._transfer_links or self._compute_res is None:
             src_key = first_resident_pull_source(
                 memories, self._pull_sources, block_hash, req=req
             )
             if src_key is not None:
                 resolution: BlockResolution = ("pull", src_key)
-                self._note_resolution(resolution)
+                self._note_resolution(resolution, block_hash)
                 return resolution
             if allow_compute:
                 resolution = "compute"
-                self._note_resolution(resolution)
+                self._note_resolution(resolution, block_hash)
                 return resolution
             return None
 
@@ -623,9 +923,9 @@ class CostBasedPullLookupPolicy(LookupPolicy):
 
         for order, src_key in enumerate(self._pull_sources):
             src = memories[src_key]
-            if tier_inflight_hbm_block(src, req, block_hash):
-                return None
             if not tier_covers_hbm_block(src, req, block_hash):
+                if tier_inflight_hbm_block(src, req, block_hash):
+                    return "wait"
                 continue
 
             link = self._transfer_links.get(src_key)
@@ -646,15 +946,17 @@ class CostBasedPullLookupPolicy(LookupPolicy):
         )
 
         if best_pull is None:
+            if remote_wait_source(memories, self._pull_sources, block_hash, req=req):
+                return "wait"
             if allow_compute:
                 resolution = "compute"
-                self._note_resolution(resolution)
+                self._note_resolution(resolution, block_hash)
                 return resolution
             return None
 
         if not allow_compute:
             resolution = ("pull", best_pull[2])
-            self._note_resolution(resolution)
+            self._note_resolution(resolution, block_hash)
             return resolution
 
         t_compute = self._compute_time()
@@ -666,5 +968,5 @@ class CostBasedPullLookupPolicy(LookupPolicy):
             resolution = "compute"
         else:
             resolution = ("pull", best_pull[2])
-        self._note_resolution(resolution)
+        self._note_resolution(resolution, block_hash)
         return resolution
