@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from batch_context import BatchContext
 from memory import BlockState, Memory
 from policies import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
 from request import Request, RequestPD, RequestStatus
@@ -151,9 +152,10 @@ def test_in_flight_blocks_reschedule() -> None:
 
     original = eng.execute_batch
 
-    def guarded_execute(batch: Batch, now: float = 0.0):
+    def guarded_execute(batch: Batch, now: float = 0.0, batch_ctx: BatchContext | None = None):
+        assert batch_ctx is not None
         assert "e0" not in sim._in_flight, "execute_batch while batch still in flight"
-        return original(batch, now)
+        return original(batch, now, batch_ctx)
 
     eng.execute_batch = guarded_execute  # type: ignore[method-assign]
 
@@ -383,7 +385,7 @@ def test_parallel_pull_tasks_start_together() -> None:
     batch.entries[0].req.prefix_block_count = 1
     batch.entries[1].req.prefix_block_count = 1
 
-    tasks = eng.execute_batch(batch)
+    tasks = eng.execute_batch(batch, 0.0, BatchContext(batch_id=0, engine_id="e0"))
     pulls = [t for t in tasks if isinstance(t, BatchLoadTask)]
     assert len(pulls) == 2
     for pull in pulls:

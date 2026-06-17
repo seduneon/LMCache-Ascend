@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from batch_context import BatchContext
 from chunk_hash import (
     chunk_key_for_hbm_block,
     lmcache_chunk_hash,
     tier_covers_hbm_block,
     transfer_work_units,
 )
-from memory import BlockState, KVBlock, Memory
+from content_key import ContentKey, tier_storage_key
+from memory import BlockState, KVBlock, Memory, collect_content_copies
 from policies import (
     ComputeOnlyLookupPolicy,
     CostBasedPullLookupPolicy,
@@ -24,11 +26,12 @@ from policies import (
     UnboundedRetention,
     local_satisfied,
 )
-from tasks import BatchLoadTask, StoreTask, Task, TaskPool, TaskStatus
+from tasks import BatchLoadTask, ForwardTask, StoreTask, Task, TaskPool, TaskStatus
 
 from engine import Engine
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
+from simulator import Simulator
 from scheduler import Scheduler
 from simulator import Simulator
 
@@ -854,7 +857,7 @@ def test_batch_load_task_amortizes_work() -> None:
     )
     eng.release_arrivals(0.0)
     batch = eng.schedule(0.0)
-    tasks = eng.execute_batch(batch, 0.0)
+    tasks = eng.execute_batch(batch, 0.0, BatchContext(batch_id=0, engine_id="e0"))
     assert any(isinstance(t, BatchLoadTask) for t in tasks)
 
     t0 = Simulator([eng], pool).run()
@@ -895,7 +898,7 @@ def test_pull_dedupe_across_requests_in_batch() -> None:
     batch = eng.schedule(0.0)
     assert len(batch.entries) == 2
 
-    tasks = eng.execute_batch(batch, 0.0)
+    tasks = eng.execute_batch(batch, 0.0, BatchContext(batch_id=0, engine_id="e0"))
     batch_loads = [t for t in tasks if isinstance(t, BatchLoadTask)]
     assert len(batch_loads) == 1
     assert len(batch_loads[0].blocks) == 8
@@ -926,9 +929,119 @@ def test_sync_evict_frees_before_pull() -> None:
     )
     eng.release_arrivals(0.0)
     batch = eng.schedule(0.0)
-    eng.execute_batch(batch, 0.0)
+    eng.execute_batch(batch, 0.0, BatchContext(batch_id=0, engine_id="e0"))
     assert memories["hbm"].best_resident("old") is None
     assert memories["hbm"].find_reserved_for("new", "r1") is not None
+
+
+def test_content_key_same_across_tiers() -> None:
+    req = Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 4
+    hbm = Memory(size=10, name="hbm", chunk_blocks=1)
+    dram = Memory(size=10, name="dram", chunk_blocks=4)
+
+    content = ContentKey.for_hbm_block(req, "c")
+    assert str(content) == "c"
+    assert tier_storage_key(content, hbm, req, "c") == "c"
+    assert tier_storage_key(content, dram, req, "c") == "chunk:a|b|c|d"
+
+    dram.append(KVBlock("chunk:a|b|c|d", BlockState.RESIDENT))
+    copies = collect_content_copies({"hbm": hbm, "dram": dram}, ["hbm", "dram"], content, req=req)
+    assert len(copies) == 1
+    assert copies[0][0] == "dram"
+
+
+def test_global_copy_cap_ssd_chunk_tier() -> None:
+    memories = {
+        "hbm": Memory(size=10, name="hbm", chunk_blocks=1),
+        "dram": Memory(size=10, name="dram", chunk_blocks=4),
+        "other": Memory(size=10, name="other", chunk_blocks=1),
+    }
+    req = Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 4
+    memories["hbm"].append(KVBlock("a", BlockState.RESIDENT))
+    memories["dram"].append(KVBlock("chunk:a|b|c|d", BlockState.RESIDENT))
+    memories["other"].append(KVBlock("a", BlockState.RESIDENT))
+    memories["other"].append(KVBlock("a", BlockState.RESIDENT))
+
+    cap = GlobalCopyCap(2, ["hbm", "dram", "other"], per_tier_cap=None)
+    cap.on_block_resident(
+        memories,
+        tier_key="other",
+        block=memories["other"].list()[-1],
+        now=1.0,
+        req=req,
+    )
+
+    content = ContentKey.for_hbm_block(req, "a")
+    copies = collect_content_copies(memories, ["hbm", "dram", "other"], content, req=req)
+    assert len(copies) == 2
+
+
+def test_execute_batch_tags_pool_tasks() -> None:
+    pool = TaskPool()
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "ssd": Memory(size=10, name="ssd", chunk_blocks=4),
+    }
+    write_link = BandwidthResource(base_speed=4.0, latency=0.0)
+    eng = Engine(
+        "e0",
+        [],
+        pool,
+        memories,
+        "hbm",
+        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        ComputeResource(base_speed=8.0),
+        work_per_block=1.0,
+        placement_policy=TieredPlacement(["ssd"], paid_write_tiers=frozenset({"ssd"})),
+        write_links={"ssd": write_link},
+        work_per_store=4.0,
+    )
+    eng.schedule_request(
+        Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    eng.release_arrivals(0.0)
+    batch = eng.schedule(0.0)
+    batch_ctx = BatchContext(batch_id=3, engine_id="e0")
+    eng.execute_batch(batch, 0.0, batch_ctx)
+
+    tagged = [t for t in pool.tasks if t.batch_id == 3]
+    assert tagged
+    assert all(t.batch_id == 3 for t in tagged)
+
+
+def test_batch_complete_waits_for_tagged_tasks() -> None:
+    pool = TaskPool()
+    sim = Simulator([], pool)
+    compute = ComputeResource(base_speed=10.0, latency=0.0)
+    write = BandwidthResource(base_speed=4.0, latency=0.0)
+    hbm = Memory(size=10, name="hbm")
+    ssd = Memory(size=10, name="ssd")
+    reserved = KVBlock("a", BlockState.RESERVED)
+    hbm.append(reserved)
+    tier_block = KVBlock("a", BlockState.RESERVED)
+    ssd.append(tier_block)
+
+    forward = ForwardTask(2.0, compute, [reserved])
+    store = StoreTask(4.0, write, ssd, tier_block)
+    pool.add(forward, [], batch_id=5)
+    pool.add(store, [forward], batch_id=5)
+
+    assert not sim._batch_complete(5)
+    pool.start_ready(0.0)
+    for _ in range(10):
+        if sim._batch_complete(5):
+            break
+        running = pool.running()
+        if not running:
+            pool.start_ready(10.0)
+            continue
+        pool.advance_running_to(min(t.estimated_end() for t in running))
+        pool.finish_done()
+        pool.start_ready(10.0)
+
+    assert sim._batch_complete(5)
 
 
 def test_sweep_smoke() -> None:
@@ -967,6 +1080,10 @@ def run_unit_tests() -> None:
         test_consume_on_pull_keeps_held_source,
         test_consume_on_pull_e2e,
         test_global_copy_cap_trims_across_tiers,
+        test_content_key_same_across_tiers,
+        test_global_copy_cap_ssd_chunk_tier,
+        test_execute_batch_tags_pool_tasks,
+        test_batch_complete_waits_for_tagged_tasks,
         test_tiered_placement_async_store_e2e,
         test_inflight_remote_source_waits_not_preempts,
         test_batch_load_task_amortizes_work,

@@ -26,6 +26,7 @@ class Task(ABC):
         self.work_left = work_left
         self.resource = resource
         self.status = TaskStatus.PENDING
+        self.batch_id: int | None = None
         self._resource_reserved = False
 
     def reserve_resource(self) -> None:
@@ -110,8 +111,16 @@ class TaskPool:
     def filter(input: list[Task]) -> list[Task]:
         return [t for t in input if t.status not in _TERMINAL]
 
-    def add(self, task: Task, prereqs: list[Task]) -> None:
+    def add(
+        self,
+        task: Task,
+        prereqs: list[Task],
+        *,
+        batch_id: int | None = None,
+    ) -> None:
         task.prereqs = self.filter(prereqs)
+        if batch_id is not None:
+            task.batch_id = batch_id
         task.reserve_resource()
         self.tasks.append(task)
 

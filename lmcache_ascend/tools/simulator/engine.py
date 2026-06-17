@@ -1,5 +1,5 @@
+from batch_context import BatchContext
 from chunk_hash import (
-    anchor_hbm_hash,
     chunk_key_for_hbm_block,
     chunk_transfer_work,
     group_pull_blocks,
@@ -7,6 +7,7 @@ from chunk_hash import (
     tier_covers_hbm_block,
     tier_inflight_hbm_block,
 )
+from content_key import ContentKey, content_from_resident
 from cost_model import batch_forward_work, entry_has_compute
 from memory import BlockState, KVBlock, Memory, collect_content_copies
 from policies import (
@@ -144,6 +145,16 @@ class Engine:
     def schedule(self, now: float) -> Batch:
         return self.scheduler.schedule(now, engine_id=self.engine_id)
 
+    def _pool_add(
+        self,
+        task: Task,
+        prereqs: list[Task],
+        batch_ctx: BatchContext,
+        all_tasks: list[Task],
+    ) -> None:
+        self.pool.add(task, prereqs, batch_id=batch_ctx.batch_id)
+        all_tasks.append(task)
+
     def _record_entry_actions(self, entry: BatchEntry) -> None:
         metrics = entry.req.metrics
         metrics.evictions += len(entry.result.evicts)
@@ -160,18 +171,16 @@ class Engine:
         if entry_has_compute(entry):
             metrics.forward_steps += 1
 
-    def _track_duplicates(self, req: Request | None, tier_key: str, block_hash: str) -> None:
-        anchor = (
-            anchor_hbm_hash(req, tier_key, block_hash, self.memories)
-            if req is not None
-            else block_hash
-        )
+    def _track_duplicates(
+        self, req: Request | None, tier_key: str, block_hash: str
+    ) -> None:
+        content = content_from_resident(req, tier_key, block_hash, self.memories)
         count = len(
             collect_content_copies(
                 self.memories,
                 list(self.memories.keys()),
-                req,
-                anchor,
+                content,
+                req=req,
             )
         )
         self._peak_duplicate_count = max(self._peak_duplicate_count, count)
@@ -249,6 +258,7 @@ class Engine:
         now: float,
         *,
         spill_req: Request | None,
+        batch_ctx: BatchContext,
         all_tasks: list[Task],
     ) -> None:
         self._on_hbm_evict(victim, spill_req, now)
@@ -290,14 +300,13 @@ class Engine:
                         tier_block=tier_block,
                         on_resident=on_spill_done,
                     )
-                    self.pool.add(store, [])
-                    all_tasks.append(store)
+                    self._pool_add(store, [], batch_ctx, all_tasks)
                 return
         self._local().remove_block(victim)
 
     def _tier_block_for_store(self, op) -> KVBlock | None:
         tier = self.memories[op.tier_key]
-        for block in tier.get(op.content_key):
+        for block in tier.get(op.storage_key):
             if block.state in (BlockState.RESERVED, BlockState.LOADING):
                 return block
         return None
@@ -308,10 +317,11 @@ class Engine:
         src_key: str,
         group_hashes: list[str],
         prereqs: list[Task],
+        batch_ctx: BatchContext,
         all_tasks: list[Task],
         pull_tasks: list[Task],
         store_tasks: list[Task],
-        shared_pulls: dict[tuple[str, str], BatchLoadTask],
+        shared_pulls: dict[tuple[str, ContentKey], BatchLoadTask],
     ) -> None:
         local = self._local()
         link = self.transfer_links.get(src_key)
@@ -355,14 +365,13 @@ class Engine:
             task.add_block(dst, make_callback(entry.req, src_key))
 
         pull_task = task
-        self.pool.add(task, prereqs)
+        self._pool_add(task, prereqs, batch_ctx, all_tasks)
         for block in dst_blocks:
             block.task = task
         shared_pulls[dedupe_key] = task
         pull_tasks.append(task)
-        all_tasks.append(task)
 
-        seen_store: set[tuple[str, str]] = set()
+        seen_store: set[tuple[str, ContentKey]] = set()
         for block_hash in group_hashes:
             ops = self.placement_policy.plan_async_stores(
                 self.memories,
@@ -371,7 +380,7 @@ class Engine:
                 req=entry.req,
             )
             for op in ops:
-                dedupe = (op.tier_key, op.content_key)
+                dedupe = (op.tier_key, op.content)
                 if dedupe in seen_store:
                     continue
                 seen_store.add(dedupe)
@@ -394,11 +403,12 @@ class Engine:
                         tk, b, r, t
                     ),
                 )
-                self.pool.add(store, [pull_task])
+                self._pool_add(store, [pull_task], batch_ctx, all_tasks)
                 store_tasks.append(store)
-                all_tasks.append(store)
 
-    def execute_batch(self, batch: Batch, now: float = 0.0) -> list[Task]:
+    def execute_batch(
+        self, batch: Batch, now: float, batch_ctx: BatchContext
+    ) -> list[Task]:
         """Reserve memory, sync evict, pulls/stores, then one batched forward."""
         local = self._local()
         all_tasks: list[Task] = []
@@ -407,7 +417,7 @@ class Engine:
         store_tasks: list[Task] = []
         forward_blocks: list[KVBlock] = []
         forward_block_req: dict[int, Request] = {}
-        shared_pulls: dict[tuple[str, str], BatchLoadTask] = {}
+        shared_pulls: dict[tuple[str, ContentKey], BatchLoadTask] = {}
 
         for entry in batch.entries:
             self._record_entry_actions(entry)
@@ -419,6 +429,7 @@ class Engine:
                         victim,
                         now,
                         spill_req=self._req_for_block_hash(victim.hash),
+                        batch_ctx=batch_ctx,
                         all_tasks=all_tasks,
                     )
                 else:
@@ -431,9 +442,8 @@ class Engine:
                             v, self._req_for_block_hash(v.hash), t
                         ),
                     )
-                    self.pool.add(task, [])
+                    self._pool_add(task, [], batch_ctx, all_tasks)
                     evict_tasks.append(task)
-                    all_tasks.append(task)
 
             prereqs_tail: list[Task] = list(evict_tasks)
 
@@ -449,6 +459,7 @@ class Engine:
                     src_key,
                     group_hashes,
                     prereqs_tail,
+                    batch_ctx,
                     all_tasks,
                     pull_tasks,
                     store_tasks,
@@ -484,10 +495,9 @@ class Engine:
                 forward_blocks,
                 on_resident=on_resident,
             )
-            self.pool.add(forward, evict_tasks + pull_tasks)
-            all_tasks.append(forward)
+            self._pool_add(forward, evict_tasks + pull_tasks, batch_ctx, all_tasks)
 
-            seen_store: set[tuple[str, str]] = set()
+            seen_store: set[tuple[str, ContentKey]] = set()
             for block in forward_blocks:
                 req = forward_block_req[id(block)]
                 ops = self.placement_policy.plan_async_stores(
@@ -497,7 +507,7 @@ class Engine:
                     req=req,
                 )
                 for op in ops:
-                    dedupe = (op.tier_key, op.content_key)
+                    dedupe = (op.tier_key, op.content)
                     if dedupe in seen_store:
                         continue
                     seen_store.add(dedupe)
@@ -520,9 +530,8 @@ class Engine:
                             tk, b, r, t
                         ),
                     )
-                    self.pool.add(store, [forward])
+                    self._pool_add(store, [forward], batch_ctx, all_tasks)
                     store_tasks.append(store)
-                    all_tasks.append(store)
 
         return all_tasks
 
@@ -574,8 +583,8 @@ class Engine:
             if tier_covers_hbm_block(src, req, block_hash):
                 continue
             if tier_inflight_hbm_block(src, req, block_hash):
-                chunk_key = chunk_key_for_hbm_block(req, block_hash, src.chunk_blocks)
-                inflight = src.inflight_incoming(chunk_key)
+                storage_key = chunk_key_for_hbm_block(req, block_hash, src.chunk_blocks)
+                inflight = src.inflight_incoming(storage_key)
                 if inflight is not None:
                     inflight.holders.add(req.req_id)
 

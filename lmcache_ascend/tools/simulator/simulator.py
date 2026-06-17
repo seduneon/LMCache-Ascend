@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from batch_context import BatchContext
 from engine import Engine
 from pd import PDConfig
 from request import Request, RequestPD, RequestStatus
@@ -15,7 +16,7 @@ from tasks import Task, TaskPool, TaskStatus
 @dataclass
 class InFlightBatch:
     batch: Batch
-    tasks: list[Task]
+    batch_id: int
 
 
 class Simulator:
@@ -39,7 +40,19 @@ class Simulator:
         self.log = log
         self.progress = progress
         self._in_flight: dict[str, InFlightBatch] = {}
+        self._next_batch_id = 0
         self.event_steps = 0
+
+    def _alloc_batch_id(self) -> int:
+        batch_id = self._next_batch_id
+        self._next_batch_id += 1
+        return batch_id
+
+    def _batch_complete(self, batch_id: int) -> bool:
+        tagged = [t for t in self.pool.tasks if t.batch_id == batch_id]
+        if not tagged:
+            return True
+        return all(task.status == TaskStatus.COMPLETED for task in tagged)
 
     def _idle(self) -> bool:
         for eng in self.engines.values():
@@ -62,10 +75,12 @@ class Simulator:
                 self.log.on_schedule(eng.engine_id, self, batch)
             if not batch.entries:
                 continue
-            tasks = eng.execute_batch(batch, self.now)
+            batch_id = self._alloc_batch_id()
+            batch_ctx = BatchContext(batch_id=batch_id, engine_id=eng.engine_id)
+            tasks = eng.execute_batch(batch, self.now, batch_ctx)
             if self.log:
                 self.log.on_execute(eng.engine_id, self, tasks)
-            self._in_flight[eng.engine_id] = InFlightBatch(batch=batch, tasks=tasks)
+            self._in_flight[eng.engine_id] = InFlightBatch(batch=batch, batch_id=batch_id)
 
     def _next_event_time(self) -> float | None:
         running = self.pool.running()
@@ -109,7 +124,7 @@ class Simulator:
         remote_kv_by_engine: dict[str, list[Request]] = {}
 
         for eng_id, inflight in list(self._in_flight.items()):
-            if not all(task.status == TaskStatus.COMPLETED for task in inflight.tasks):
+            if not self._batch_complete(inflight.batch_id):
                 continue
 
             eng = self.engines[eng_id]

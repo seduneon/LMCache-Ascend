@@ -3,7 +3,10 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from content_key import ContentKey
+
 if TYPE_CHECKING:
+    from request import Request
     from tasks import Task
 
 
@@ -150,19 +153,21 @@ def collect_resident_copies(
 def collect_content_copies(
     memories: dict[str, Memory],
     tier_keys: list[str],
-    req: Request | None,
-    anchor_hbm: str,
+    content: ContentKey,
+    *,
+    req: Request | None = None,
 ) -> list[tuple[str, KVBlock]]:
     """All resident copies of the same logical content across tiers."""
-    from chunk_hash import chunk_key_for_hbm_block
+    from content_key import tier_storage_key
 
     copies: list[tuple[str, KVBlock]] = []
     seen: set[tuple[str, int]] = set()
+    anchor = content.anchor_hbm()
     for tier_key in tier_keys:
         mem = memories.get(tier_key)
         if mem is None:
             continue
-        key = chunk_key_for_hbm_block(req, anchor_hbm, mem.chunk_blocks)
+        key = tier_storage_key(content, mem, req, anchor)
         for block in mem.resident_copies(key):
             token = (tier_key, id(block))
             if token in seen:

@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
+from content_key import ContentKey
 from chunk_hash import (
-    anchor_hbm_hash,
     chunk_key_for_hbm_block,
     lmcache_chunk_hash,
     tier_covers_hbm_block,
@@ -43,7 +43,8 @@ class StoreOp:
     """Async write of one chunk slot to a downstream tier."""
 
     tier_key: str
-    content_key: str
+    content: ContentKey
+    storage_key: str
     hbm_block_hash: str
 
 
@@ -403,7 +404,12 @@ class TieredPlacement(PlacementPolicy):
             ) is None:
                 continue
             ops.append(
-                StoreOp(tier_key=tier_key, content_key=chunk_key, hbm_block_hash=block_hash)
+                StoreOp(
+                    tier_key=tier_key,
+                    content=ContentKey.for_hbm_block(req, block_hash),
+                    storage_key=chunk_key,
+                    hbm_block_hash=block_hash,
+                )
             )
         return ops
 
@@ -521,12 +527,9 @@ class GlobalCopyCap(RetentionPolicy):
         super().on_block_resident(
             memories, tier_key=tier_key, block=block, now=now, req=req
         )
-        if req is None:
-            anchor = block.hash
-        else:
-            anchor = anchor_hbm_hash(req, tier_key, block.hash, memories)
-        while len(collect_content_copies(memories, self.tier_keys, req, anchor)) > self.max_total:
-            copies = collect_content_copies(memories, self.tier_keys, req, anchor)
+        content = ContentKey.for_storage_key(block.hash)
+        while len(collect_content_copies(memories, self.tier_keys, content, req=req)) > self.max_total:
+            copies = collect_content_copies(memories, self.tier_keys, content, req=req)
             evictable = [
                 (tier, blk)
                 for tier, blk in copies

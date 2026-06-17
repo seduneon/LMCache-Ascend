@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
+from content_key import ContentKey, hbm_blocks_in_token, lmcache_chunk_hash
 from memory import Memory
 from request import Request
 
 
-def lmcache_chunk_hash(hbm_hashes: list[str]) -> str:
-    """Deterministic chunk content id (LMCache ``chunk_hashes`` shape, block-grain)."""
-    if len(hbm_hashes) == 1:
-        return hbm_hashes[0]
-    return "chunk:" + "|".join(hbm_hashes)
+def hbm_blocks_in_chunk_key(chunk_key: str) -> list[str]:
+    return hbm_blocks_in_token(chunk_key)
 
 
 def chunk_hbm_group(ordered_hbm: list[str], block_hash: str, chunk_blocks: int) -> list[str]:
@@ -23,30 +21,6 @@ def chunk_hbm_group(ordered_hbm: list[str], block_hash: str, chunk_blocks: int) 
         return [block_hash]
     start = (idx // chunk_blocks) * chunk_blocks
     return ordered_hbm[start : start + chunk_blocks]
-
-
-def hbm_blocks_in_chunk_key(chunk_key: str) -> list[str]:
-    if not chunk_key.startswith("chunk:"):
-        return [chunk_key]
-    return chunk_key.split(":", 1)[1].split("|")
-
-
-def anchor_hbm_hash(
-    req: Request | None,
-    tier_key: str,
-    block_hash: str,
-    memories: dict[str, Memory],
-) -> str:
-    """Representative HBM block hash for a resident key on ``tier_key``."""
-    mem = memories[tier_key]
-    if mem.chunk_blocks <= 1:
-        return block_hash
-    blocks = hbm_blocks_in_chunk_key(block_hash)
-    if blocks:
-        return blocks[0]
-    if req is not None and block_hash in req.block_hashes:
-        return block_hash
-    return block_hash
 
 
 def chunk_key_for_hbm_block(
@@ -97,11 +71,11 @@ def pull_dedupe_key(
     req: Request | None,
     block_hash: str,
     memories: dict[str, Memory],
-) -> tuple[str, str]:
-    """Shared pull identity: one transfer per (source tier, chunk slot)."""
+) -> tuple[str, ContentKey]:
+    """Shared pull identity: one transfer per (source tier, logical content)."""
     src = memories[src_key]
-    chunk_key = chunk_key_for_hbm_block(req, block_hash, src.chunk_blocks)
-    return (src_key, chunk_key)
+    storage = chunk_key_for_hbm_block(req, block_hash, src.chunk_blocks)
+    return (src_key, ContentKey.for_storage_key(storage))
 
 
 def group_pull_blocks(
