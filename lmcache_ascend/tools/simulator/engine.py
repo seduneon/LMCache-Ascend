@@ -1,3 +1,4 @@
+from chunk_hash import transfer_work_units
 from cost_model import batch_forward_work, entry_has_compute
 from memory import KVBlock, Memory
 from policies import (
@@ -169,14 +170,27 @@ class Engine:
             dst_key=self.local_memory,
             block_hash=block.hash,
             now=now,
+            req=req,
         )
 
-    def _on_hbm_evict(self, block: KVBlock, now: float) -> None:
+    def _req_for_block_hash(self, block_hash: str) -> Request | None:
+        for req in (
+            *self.scheduler.waiting,
+            *self.scheduler.running,
+            *self.scheduler.completed,
+        ):
+            prefix = req.block_hashes[: req.prefix_block_count]
+            if block_hash in prefix:
+                return req
+        return None
+
+    def _on_hbm_evict(self, block: KVBlock, spill_req: Request | None, now: float) -> None:
         self.placement_policy.spill_on_evict(
             self.memories,
             local_memory=self.local_memory,
             block=block,
             now=now,
+            req=spill_req,
         )
 
     def execute_batch(self, batch: Batch, now: float = 0.0) -> list[Task]:
@@ -198,7 +212,9 @@ class Engine:
                     resource=self.compute_res,
                     memory=local,
                     block=victim,
-                    on_before_evict=lambda b, t, v=victim: self._on_hbm_evict(v, t),
+                    on_before_evict=lambda b, t, v=victim: self._on_hbm_evict(
+                        v, self._req_for_block_hash(v.hash), t
+                    ),
                 )
                 self.pool.add(task, [])
                 evict_tasks.append(task)
@@ -229,8 +245,12 @@ class Engine:
                         raise RuntimeError(
                             f"transfer link required for pull source {src_key!r}"
                         )
+                    src_mem = self.memories[src_key]
+                    pull_work = self.work_per_transfer * transfer_work_units(
+                        src_mem, entry.req, block_hash
+                    )
                     task = LoadTask(
-                        work_left=self.work_per_transfer,
+                        work_left=pull_work,
                         resource=link,
                         memory=local,
                         block=dst_block,

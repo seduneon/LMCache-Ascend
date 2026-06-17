@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from engine import Engine
+from chunk_hash import (
+    chunk_key_for_hbm_block,
+    lmcache_chunk_hash,
+    tier_covers_hbm_block,
+    transfer_work_units,
+)
 from memory import BlockState, KVBlock, Memory
 from policies import (
     ComputeOnlyLookupPolicy,
@@ -17,6 +22,7 @@ from policies import (
     UnboundedRetention,
     local_satisfied,
 )
+from engine import Engine
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
 from scheduler import Scheduler
@@ -142,16 +148,85 @@ def test_spill_on_evict_without_prior_mirror() -> None:
         "hbm": Memory(size=2, name="hbm"),
         "dram": Memory(size=10, name="dram"),
     }
+    req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 1
     block = KVBlock("a", BlockState.RESIDENT)
     memories["hbm"].append(block)
 
     HBMAndDRAM("dram").spill_on_evict(
-        memories, local_memory="hbm", block=block, now=5.0
+        memories, local_memory="hbm", block=block, now=5.0, req=req
     )
     memories["hbm"].remove_block(block)
 
     assert memories["hbm"].best_resident("a") is None
     assert memories["dram"].best_resident("a") is not None
+
+
+def test_lmcache_chunk_hash_groups_aligned_blocks() -> None:
+    assert lmcache_chunk_hash(["a"]) == "a"
+    assert lmcache_chunk_hash(["a", "b", "c", "d"]) == "chunk:a|b|c|d"
+
+
+def test_chunk_key_for_hbm_block_aligned_group() -> None:
+    req = Request("r1", 0.0, ["a", "b", "c", "d", "e"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 5
+    dram = Memory(size=10, name="dram", chunk_blocks=4)
+    assert chunk_key_for_hbm_block(req, "c", dram.chunk_blocks) == "chunk:a|b|c|d"
+    assert chunk_key_for_hbm_block(req, "e", dram.chunk_blocks) == "e"
+
+
+def test_chunked_dram_mirror_and_pull() -> None:
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "dram": Memory(size=10, name="dram", chunk_blocks=4),
+    }
+    req = Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 4
+    block = KVBlock("b", BlockState.RESIDENT)
+    memories["hbm"].append(block)
+
+    HBMAndDRAM("dram").place_copy(
+        memories, local_memory="hbm", block=block, req=req, now=1.0
+    )
+    chunk_key = "chunk:a|b|c|d"
+    assert memories["dram"].best_resident(chunk_key) is not None
+    assert memories["dram"].best_resident("b") is None
+
+    policy = OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"])
+    assert policy.resolve_actions(memories, ["c"], req=req)["c"] == ("pull", "dram")
+    assert tier_covers_hbm_block(memories["dram"], req, "c")
+    assert transfer_work_units(memories["dram"], req, "c") == 4
+
+
+def test_chunked_dram_pull_transfer_cost_e2e() -> None:
+    pool = TaskPool()
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "dram": Memory(size=10, name="dram", chunk_blocks=4),
+    }
+    chunk_key = "chunk:a|b|c|d"
+    memories["dram"].append(KVBlock(chunk_key, BlockState.RESIDENT))
+
+    eng = Engine(
+        "e0",
+        [],
+        pool,
+        memories,
+        "hbm",
+        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        ComputeResource(base_speed=8.0),
+        BandwidthResource(base_speed=4.0),
+        work_per_block=1.0,
+        work_per_transfer=1.0,
+    )
+    eng.schedule_request(
+        Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
+    )
+    Simulator([eng], pool).run()
+
+    req = eng.completed[0]
+    assert req.metrics.pulls == 4
+    assert req.metrics.computes == 0
 
 
 def test_spill_e2e_after_hbm_pressure() -> None:
@@ -703,6 +778,10 @@ def run_unit_tests() -> None:
         test_placement_e2e_pull_from_dram,
         test_dram_lru_eviction_when_tier_full,
         test_spill_on_evict_without_prior_mirror,
+        test_lmcache_chunk_hash_groups_aligned_blocks,
+        test_chunk_key_for_hbm_block_aligned_group,
+        test_chunked_dram_mirror_and_pull,
+        test_chunked_dram_pull_transfer_cost_e2e,
         test_spill_e2e_after_hbm_pressure,
         # retention
         test_unbounded_retention_allows_duplicate_residents,

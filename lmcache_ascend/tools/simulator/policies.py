@@ -5,6 +5,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
+from chunk_hash import (
+    chunk_key_for_hbm_block,
+    lmcache_chunk_hash,
+    tier_covers_hbm_block,
+    tier_inflight_hbm_block,
+    transfer_work_units,
+)
 from cost_model import block_recompute_work
 from memory import BlockState, KVBlock, Memory
 from request import Request
@@ -100,6 +107,7 @@ class PlacementPolicy(ABC):
         local_memory: str,
         block: KVBlock,
         now: float,
+        req: Request | None = None,
     ) -> None:
         """Called before an HBM victim is removed. Default: drop (no spill)."""
 
@@ -141,21 +149,24 @@ class HBMAndDRAM(PlacementPolicy):
     def _ensure_dram_resident(
         self,
         memories: dict[str, Memory],
+        *,
+        req: Request,
         block_hash: str,
         now: float,
     ) -> bool:
         dram = memories[self.dram_memory]
-        if dram.best_resident(block_hash) is not None:
+        chunk_key = chunk_key_for_hbm_block(req, block_hash, dram.chunk_blocks)
+        if dram.best_resident(chunk_key) is not None:
             return True
 
-        exclude = {block_hash}
+        exclude = {chunk_key}
         while dram.free_size() <= 0:
             victims = self._dram_eviction.pick_victims(dram, 1, exclude)
             if not victims:
                 return False
             dram.remove_block(victims[0])
 
-        copy = KVBlock(block_hash, BlockState.RESIDENT)
+        copy = KVBlock(chunk_key, BlockState.RESIDENT)
         dram.append(copy)
         dram.touch(copy, now)
         self._retention.on_block_resident(
@@ -172,7 +183,9 @@ class HBMAndDRAM(PlacementPolicy):
         req: Request,
         now: float,
     ) -> None:
-        self._ensure_dram_resident(memories, block.hash, now)
+        self._ensure_dram_resident(
+            memories, req=req, block_hash=block.hash, now=now
+        )
 
     def spill_on_evict(
         self,
@@ -181,8 +194,11 @@ class HBMAndDRAM(PlacementPolicy):
         local_memory: str,
         block: KVBlock,
         now: float,
+        req: Request | None = None,
     ) -> None:
-        self._ensure_dram_resident(memories, block.hash, now)
+        self._ensure_dram_resident(
+            memories, req=req, block_hash=block.hash, now=now
+        )
 
 
 # --- Retention ---
@@ -225,11 +241,13 @@ class RetentionPolicy(ABC):
         dst_key: str,
         block_hash: str,
         now: float,
+        req: Request | None = None,
     ) -> None:
         if self.pull_disposition() != PullDisposition.CONSUME:
             return
         src = memories[src_key]
-        src_block = src.best_resident(block_hash)
+        storage_key = chunk_key_for_hbm_block(req, block_hash, src.chunk_blocks)
+        src_block = src.best_resident(storage_key)
         if src_block is None or not src.can_evict_block(src_block):
             return
         src.remove_block(src_block)
@@ -286,12 +304,14 @@ def first_resident_pull_source(
     memories: dict[str, Memory],
     pull_sources: list[str],
     block_hash: str,
+    *,
+    req: Request | None = None,
 ) -> str | None:
     for src_key in pull_sources:
         src = memories[src_key]
-        if src.inflight_incoming(block_hash) is not None:
+        if tier_inflight_hbm_block(src, req, block_hash):
             return None
-        if src.best_resident(block_hash) is not None:
+        if tier_covers_hbm_block(src, req, block_hash):
             return src_key
     return None
 
@@ -448,7 +468,9 @@ class OrderedPullLookupPolicy(LookupPolicy):
         if local_satisfied(local, block_hash):
             return "local"
 
-        src_key = first_resident_pull_source(memories, self._pull_sources, block_hash)
+        src_key = first_resident_pull_source(
+            memories, self._pull_sources, block_hash, req=req
+        )
         if src_key is not None:
             return ("pull", src_key)
 
@@ -479,6 +501,7 @@ class CostBasedPullLookupPolicy(LookupPolicy):
         self._forward_reserved_in_alloc = False
         self._alloc_req: Request | None = None
         self._alloc_block_size = 1
+        self._alloc_memories: dict[str, Memory] | None = None
 
     @property
     def pull_sources(self) -> list[str]:
@@ -524,6 +547,7 @@ class CostBasedPullLookupPolicy(LookupPolicy):
     ) -> BlockActions | None:
         self._alloc_req = req
         self._alloc_block_size = block_size
+        self._alloc_memories = memories
         return super().resolve_actions(
             memories,
             block_hashes,
@@ -532,10 +556,14 @@ class CostBasedPullLookupPolicy(LookupPolicy):
             block_size=block_size,
         )
 
-    def _pull_time(self, link: BandwidthResource, src_key: str) -> float:
+    def _pull_time(self, link: BandwidthResource, src_key: str, block_hash: str) -> float:
         pending = self._pending_pulls.get(src_key, 0)
+        work = self._work_per_transfer
+        if self._alloc_memories is not None:
+            src = self._alloc_memories[src_key]
+            work *= transfer_work_units(src, self._alloc_req, block_hash)
         return link.time_for(
-            self._work_per_transfer,
+            work,
             link.queued_load() + pending + 1,
         )
 
@@ -579,7 +607,7 @@ class CostBasedPullLookupPolicy(LookupPolicy):
 
         if not self._transfer_links or self._compute_res is None:
             src_key = first_resident_pull_source(
-                memories, self._pull_sources, block_hash
+                memories, self._pull_sources, block_hash, req=req
             )
             if src_key is not None:
                 resolution: BlockResolution = ("pull", src_key)
@@ -595,9 +623,9 @@ class CostBasedPullLookupPolicy(LookupPolicy):
 
         for order, src_key in enumerate(self._pull_sources):
             src = memories[src_key]
-            if src.inflight_incoming(block_hash) is not None:
+            if tier_inflight_hbm_block(src, req, block_hash):
                 return None
-            if src.best_resident(block_hash) is None:
+            if not tier_covers_hbm_block(src, req, block_hash):
                 continue
 
             link = self._transfer_links.get(src_key)
@@ -605,7 +633,7 @@ class CostBasedPullLookupPolicy(LookupPolicy):
                 continue
             pull_candidates.append(
                 (
-                    self._pull_time(link, src_key),
+                    self._pull_time(link, src_key, block_hash),
                     order,
                     src_key,
                 )

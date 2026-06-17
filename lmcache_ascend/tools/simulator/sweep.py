@@ -40,6 +40,7 @@ class SimConfig:
 
     hbm_size: int = 40
     dram_size: int = 80
+    dram_chunk_blocks: int = 4
     max_num_seqs: int = 12
     max_num_batched_tokens: int = 24
     compute_speed: float = 64.0
@@ -86,7 +87,11 @@ def _hbm_memories(cfg: SimConfig) -> dict[str, Memory]:
 
 def _hbm_dram_memories(cfg: SimConfig) -> dict[str, Memory]:
     memories = _hbm_memories(cfg)
-    memories["npu-0:dram"] = Memory(size=cfg.dram_size, name="npu-0:dram")
+    memories["npu-0:dram"] = Memory(
+        size=cfg.dram_size,
+        name="npu-0:dram",
+        chunk_blocks=cfg.dram_chunk_blocks,
+    )
     return memories
 
 

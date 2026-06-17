@@ -34,9 +34,10 @@ class KVBlock:
 
 
 class Memory:
-    def __init__(self, size: int, name: str):
+    def __init__(self, size: int, name: str, *, chunk_blocks: int = 1):
         self.name = name
         self.size = size
+        self.chunk_blocks = max(1, chunk_blocks)
         self.blocks: dict[str, list[KVBlock]] = {}
 
     def get(self, block_hash: str) -> list[KVBlock]:
