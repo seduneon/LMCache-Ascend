@@ -3,10 +3,9 @@ from __future__ import annotations
 import heapq
 from collections import deque
 
-from .kv_controller import KVController
-from .memory import Memory
-from .plan import EntryPlan, ScheduleResult, SimContext, WorkEntry
 from .lookup import LookupPolicy, local_satisfied
+from .memory import Memory
+from .plan import EntryPlan, ScheduleResult, WorkEntry
 from .request import Request, RequestPD, RequestStatus
 
 
@@ -15,7 +14,7 @@ class Scheduler:
 
     def __init__(
         self,
-        controller_or_policy: KVController | LookupPolicy,
+        policy: LookupPolicy,
         memories: dict[str, Memory],
         local_memory: str,
         *,
@@ -25,11 +24,7 @@ class Scheduler:
         enable_chunked_prefill: bool = False,
         remote_kv_wait: bool = False,
     ):
-        if isinstance(controller_or_policy, KVController):
-            self.controller = controller_or_policy
-        else:
-            self.controller = KVController(controller_or_policy)
-        self.policy = self.controller.policy
+        self.policy = policy
         self.memories = memories
         self.local_memory = local_memory
         self.max_num_seqs = max_num_seqs
@@ -137,7 +132,6 @@ class Scheduler:
         *,
         now: float | None = None,
         engine_id: str | None = None,
-        ctx: SimContext | None = None,
     ) -> bool:
         block_hashes = self._prefix_block_hashes(req)
         if not block_hashes:
@@ -149,8 +143,6 @@ class Scheduler:
             scheduled_ids,
             scheduled.preempted,
             pull_only=True,
-            now=now,
-            ctx=ctx,
         )
         if plan is None:
             return False
@@ -197,9 +189,7 @@ class Scheduler:
         now: float | None = None,
         *,
         engine_id: str | None = None,
-        ctx: SimContext | None = None,
     ) -> ScheduleResult:
-        self.controller.begin_batch()
         scheduled = ScheduleResult()
         scheduled_ids: set[str] = set()
         token_budget = self.max_num_batched_tokens
@@ -218,7 +208,7 @@ class Scheduler:
                 continue
 
             plan = self._allocate_blocks(
-                req, block_hashes, scheduled_ids, scheduled.preempted, now=now, ctx=ctx
+                req, block_hashes, scheduled_ids, scheduled.preempted
             )
             if plan is None:
                 idx += 1
@@ -256,7 +246,6 @@ class Scheduler:
                         scheduled_ids,
                         now=now,
                         engine_id=engine_id,
-                        ctx=ctx,
                     ):
                         break
                     break
@@ -281,7 +270,7 @@ class Scheduler:
                     break
 
                 plan = self._allocate_blocks(
-                    req, block_hashes, scheduled_ids, scheduled.preempted, now=now, ctx=ctx
+                    req, block_hashes, scheduled_ids, scheduled.preempted
                 )
                 if plan is None:
                     break
@@ -325,22 +314,14 @@ class Scheduler:
         preempted: list[Request],
         *,
         pull_only: bool = False,
-        now: float | None = None,
-        ctx: SimContext | None = None,
     ) -> EntryPlan | None:
         while True:
-            plan = self.controller.plan_blocks(
+            plan = self.policy.lookup(
                 self.memories,
                 block_hashes,
                 allow_compute=not pull_only,
                 req=req,
                 block_size=self.block_size,
-                ctx=ctx,
-                known_requests=[
-                    *self.waiting,
-                    *self.running,
-                    *self.completed,
-                ],
             )
             if plan is not None:
                 return plan
@@ -349,7 +330,7 @@ class Scheduler:
             if victim is None:
                 return None
 
-            self._preempt_request(victim, now=now)
+            self._preempt_request(victim, now=None)
             preempted.append(victim)
             if victim.req_id == req.req_id:
                 return None

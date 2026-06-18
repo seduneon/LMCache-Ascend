@@ -14,22 +14,6 @@ def decode_work(work_per_decode_req: float) -> float:
     return work_per_decode_req
 
 
-def block_recompute_work(
-    req: Request | None,
-    *,
-    block_size: int,
-    work_per_prefill_token: float,
-    work_per_decode_req: float,
-    work_per_block: float,
-) -> float:
-    """Work for one block-level recompute decision during lookup."""
-    if req is None:
-        return work_per_block
-    if req.is_prefill_chunk():
-        return prefill_work(block_size, work_per_prefill_token)
-    return decode_work(work_per_decode_req)
-
-
 def entry_has_compute(entry: WorkEntry) -> bool:
     return any(action == "compute" for action in entry.plan.blocks.values())
 

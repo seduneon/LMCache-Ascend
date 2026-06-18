@@ -42,6 +42,7 @@ class ExecuteContext:
     retention: RetentionProfile
     pull_sources: list[str]
     scheduled_at: float
+    resolve_spill_req: object  # Callable[[str], Request | None]
     on_hbm_evict: object
     on_hbm_resident: object
     on_tier_resident: object
@@ -126,7 +127,7 @@ class BatchExecutor:
             self._reserve(entry, now=work.scheduled_at)
 
             for victim in entry.plan.evicts:
-                spill_req = entry.plan.spill_reqs.get(id(victim))
+                spill_req = self._ctx.resolve_spill_req(victim.hash)
                 if self._ctx.sync_evict:
                     self._sync_evict(
                         victim,
@@ -180,13 +181,10 @@ class BatchExecutor:
                             f"request {entry.req.req_id!r}"
                         )
                     forward_blocks.append(dst)
-                    forward_outcomes[id(dst)] = entry.plan.resident_outcomes.get(
-                        block_hash,
-                        TaskOutcome(
-                            kind="hbm_resident",
-                            req_id=entry.req.req_id,
-                            block_hash=block_hash,
-                        ),
+                    forward_outcomes[id(dst)] = TaskOutcome(
+                        kind="hbm_resident",
+                        req_id=entry.req.req_id,
+                        block_hash=block_hash,
                     )
 
         if forward_blocks:
@@ -421,14 +419,11 @@ class BatchExecutor:
                     f"no reserved block for {block_hash!r} request {entry.req.req_id!r}"
                 )
             dst_blocks.append(dst)
-            pull_outcomes[id(dst)] = entry.plan.pull_outcomes.get(
-                block_hash,
-                TaskOutcome(
-                    kind="pull_complete",
-                    req_id=entry.req.req_id,
-                    block_hash=block_hash,
-                    src_key=src_key,
-                ),
+            pull_outcomes[id(dst)] = TaskOutcome(
+                kind="pull_complete",
+                req_id=entry.req.req_id,
+                block_hash=block_hash,
+                src_key=src_key,
             )
 
         existing = shared_pulls.get(dedupe_key)

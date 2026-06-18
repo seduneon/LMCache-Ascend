@@ -14,7 +14,6 @@ from .memory import Memory
 from .pd import PDConfig
 from .lookup import (
     ComputeOnlyLookupPolicy,
-    CostBasedPullLookupPolicy,
     LookupPolicy,
     OrderedPullLookupPolicy,
 )
@@ -112,10 +111,10 @@ def _hbm_dram_ssd_memories(cfg: SimConfig) -> dict[str, Memory]:
 PRESETS: dict[str, PolicyPreset] = {
     "baseline": PolicyPreset(
         name="baseline",
-        description="P compute-only; D cost-based pull from P HBM (stress default)",
+        description="P compute-only; D ordered pull from P HBM (stress default)",
         build_memories=_hbm_memories,
         build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: CostBasedPullLookupPolicy(
+        build_decode_policy=lambda m: OrderedPullLookupPolicy(
             local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
         ),
         build_prefill_placement=lambda m: HBMOnly(),
@@ -136,10 +135,10 @@ PRESETS: dict[str, PolicyPreset] = {
     ),
     "dram_tier": PolicyPreset(
         name="dram_tier",
-        description="P mirrors/spills to DRAM; D cost-pull from DRAM then P HBM",
+        description="P mirrors/spills to DRAM; D ordered pull from DRAM then P HBM",
         build_memories=_hbm_dram_memories,
         build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: CostBasedPullLookupPolicy(
+        build_decode_policy=lambda m: OrderedPullLookupPolicy(
             local_memory="npu-1:hbm",
             pull_sources=["npu-0:dram", "npu-0:hbm"],
         ),
@@ -152,7 +151,7 @@ PRESETS: dict[str, PolicyPreset] = {
         description="baseline + ConsumeOnPull (source copy removed when unheld)",
         build_memories=_hbm_memories,
         build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: CostBasedPullLookupPolicy(
+        build_decode_policy=lambda m: OrderedPullLookupPolicy(
             local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
         ),
         build_prefill_placement=lambda m: HBMOnly(),
@@ -164,7 +163,7 @@ PRESETS: dict[str, PolicyPreset] = {
         description="baseline + SingleCopyPerTier retention cap",
         build_memories=_hbm_memories,
         build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: CostBasedPullLookupPolicy(
+        build_decode_policy=lambda m: OrderedPullLookupPolicy(
             local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
         ),
         build_prefill_placement=lambda m: HBMOnly(),
@@ -173,10 +172,10 @@ PRESETS: dict[str, PolicyPreset] = {
     ),
     "ssd_tier": PolicyPreset(
         name="ssd_tier",
-        description="P sync DRAM + paid SSD writes; D cost-pull from SSD/DRAM/HBM",
+        description="P sync DRAM + paid SSD writes; D ordered pull from SSD/DRAM/HBM",
         build_memories=_hbm_dram_ssd_memories,
         build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: CostBasedPullLookupPolicy(
+        build_decode_policy=lambda m: OrderedPullLookupPolicy(
             local_memory="npu-1:hbm",
             pull_sources=["npu-0:ssd", "npu-0:dram", "npu-0:hbm"],
         ),
@@ -192,7 +191,7 @@ PRESETS: dict[str, PolicyPreset] = {
         description="baseline + GlobalCopyCap(2) across P HBM and D HBM",
         build_memories=_hbm_memories,
         build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: CostBasedPullLookupPolicy(
+        build_decode_policy=lambda m: OrderedPullLookupPolicy(
             local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
         ),
         build_prefill_placement=lambda m: HBMOnly(),

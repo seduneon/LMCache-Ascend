@@ -1,11 +1,10 @@
 from .content_key import ContentKey
 from .effect_interpreter import BatchExecutor, ExecuteContext
-from .kv_controller import KVController
 from .lookup import LookupPolicy
 from .memory import KVBlock, Memory, collect_content_copies
 from .placement import HBMOnly, PlacementPolicy
-from .plan import BatchPlan, RetentionProfile, SimContext, StoreOp, WorkEntry
-from .request import Request, RequestPD, RequestStatus
+from .plan import BatchPlan, RetentionProfile, StoreOp, WorkEntry
+from .request import Request, RequestPD, RequestStatus, request_owning_prefix_block
 from .resource import BandwidthResource, ComputeResource
 from .retention import (
     ConsumeOnPull,
@@ -82,22 +81,8 @@ class Engine:
         self._peak_duplicate_count = 0
         self._next_batch_id = 0
 
-        policy.bind_resources(
-            compute_res=self.compute_res,
-            transfer_links=self.transfer_links,
-            work_per_transfer=self.work_per_transfer,
-            work_per_block=self.work_per_block,
-            work_per_prefill_token=self.work_per_prefill_token,
-            work_per_decode_req=self.work_per_decode_req,
-            block_size=self.block_size,
-        )
-
-        self.controller = KVController(
-            policy,
-            placement=self.placement_policy,
-        )
         self.scheduler = Scheduler(
-            self.controller,
+            policy,
             memories,
             local_memory,
             max_num_seqs=max_num_seqs,
@@ -129,15 +114,6 @@ class Engine:
     def remote_kv_wait(self, enabled: bool) -> None:
         self.scheduler.remote_kv_wait = enabled
 
-    def planning_context(self, now: float) -> SimContext:
-        return SimContext.capture(
-            now=now,
-            local_memory=self.local_memory,
-            block_size=self.block_size,
-            compute_res=self.compute_res,
-            transfer_links=self.transfer_links,
-        )
-
     def schedule_request(self, req: Request) -> None:
         self.scheduler.add_request(req)
 
@@ -146,6 +122,16 @@ class Engine:
 
     def next_arrival(self) -> float | None:
         return self.scheduler.next_arrival()
+
+    def _known_requests(self) -> list[Request]:
+        return [
+            *self.scheduler.waiting,
+            *self.scheduler.running,
+            *self.scheduler.completed,
+        ]
+
+    def _resolve_spill_req(self, block_hash: str) -> Request | None:
+        return request_owning_prefix_block(block_hash, self._known_requests())
 
     def _track_duplicates(
         self, req: Request | None, tier_key: str, block_hash: str
@@ -221,7 +207,7 @@ class Engine:
         )
 
     def _expand_spill_stores(self, entry: WorkEntry, victim: KVBlock) -> list[StoreOp]:
-        spill_req = entry.plan.spill_reqs.get(id(victim))
+        spill_req = self._resolve_spill_req(victim.hash)
         if spill_req is None:
             return []
         ops = self.placement_policy.plan_spill_stores(
@@ -251,6 +237,7 @@ class Engine:
             scheduled_at=scheduled_at,
             retention=self.retention_profile,
             pull_sources=self.policy.pull_sources,
+            resolve_spill_req=self._resolve_spill_req,
             on_hbm_evict=self._on_hbm_evict,
             on_hbm_resident=self._on_hbm_resident,
             on_tier_resident=self._on_tier_resident,
@@ -268,7 +255,6 @@ class Engine:
         scheduled = self.scheduler.schedule(
             now,
             engine_id=self.engine_id,
-            ctx=self.planning_context(now),
         )
         if not scheduled.entries:
             return None

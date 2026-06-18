@@ -6,7 +6,6 @@ from simulator.plan import EntryPlan, WorkEntry
 from simulator.eviction import LRUEviction
 from simulator.lookup import (
     ComputeOnlyLookupPolicy,
-    CostBasedPullLookupPolicy,
     OrderedPullLookupPolicy,
     local_satisfied,
 )
@@ -395,7 +394,7 @@ def test_lru_eviction_under_allocate_pressure() -> None:
     req.prefix_block_count = 1
     sched.running.append(req)
 
-    result = sched._allocate_blocks(req, ["new"], set(), [], now=10.0)
+    result = sched._allocate_blocks(req, ["new"], set(), [])
     assert result is not None
     assert len(result.evicts) == 1
     assert result.evicts[0].hash == "old"
@@ -463,190 +462,6 @@ def test_finish_frees_kv() -> None:
     sched.finish_request(req)
     assert memories["hbm"].used_size() == 0
     assert req in sched.completed
-
-
-def test_cost_model_picks_faster_pull_source() -> None:
-    memories = {
-        "fast": Memory(size=10, name="fast"),
-        "slow": Memory(size=10, name="slow"),
-        "dst": Memory(size=10, name="dst"),
-    }
-    make_resident(memories["fast"], "a")
-    make_resident(memories["slow"], "a")
-
-    fast_link = BandwidthResource(base_speed=10.0)
-    slow_link = BandwidthResource(base_speed=1.0)
-    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["slow", "fast"])
-    policy.bind_resources(
-        compute_res=ComputeResource(base_speed=1.0),
-        transfer_links={"fast": fast_link, "slow": slow_link},
-        work_per_transfer=1.0,
-        work_per_block=1.0,
-    )
-
-    action = policy.resolve_actions(memories, ["a"])["a"]
-    assert action == ("pull", "fast")
-
-
-def test_cost_model_prefers_compute_under_load() -> None:
-    memories = {
-        "src": Memory(size=10, name="src"),
-        "dst": Memory(size=10, name="dst"),
-    }
-    make_resident(memories["src"], "a")
-
-    compute_res = ComputeResource(base_speed=10.0)
-    congested_link = BandwidthResource(base_speed=1.0)
-    for _ in range(9):
-        congested_link.schedule()
-        congested_link.start()
-
-    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
-    policy.bind_resources(
-        compute_res=compute_res,
-        transfer_links={"src": congested_link},
-        work_per_transfer=1.0,
-        work_per_block=1.0,
-    )
-
-    assert policy.resolve_actions(memories, ["a"])["a"] == "compute"
-
-
-def test_cost_model_prefill_recompute_expensive() -> None:
-    memories = {
-        "src": Memory(size=10, name="src"),
-        "dst": Memory(size=10, name="dst"),
-    }
-    make_resident(memories["src"], "a")
-
-    req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
-    req.prefix_block_count = 1
-
-    compute_res = ComputeResource(base_speed=1.0)
-    link = BandwidthResource(base_speed=10.0, latency=0.0)
-    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
-    policy.bind_resources(
-        compute_res=compute_res,
-        transfer_links={"src": link},
-        work_per_transfer=1.0,
-        work_per_block=1.0,
-        work_per_prefill_token=100.0,
-        work_per_decode_req=1.0,
-        block_size=4,
-    )
-
-    assert policy.resolve_actions(memories, ["a"], req=req, block_size=4)["a"] == (
-        "pull",
-        "src",
-    )
-
-
-def test_cost_model_decode_recompute_cheap() -> None:
-    memories = {
-        "src": Memory(size=10, name="src"),
-        "dst": Memory(size=10, name="dst"),
-    }
-    make_resident(memories["src"], "a")
-
-    req = Request(
-        "r1",
-        0.0,
-        ["p"],
-        RequestPD.DECODE,
-        RequestStatus.RUNNING,
-        max_output_blocks=1,
-    )
-    req.prefix_block_count = 1
-    req.num_computed_blocks = 1
-
-    compute_res = ComputeResource(base_speed=100.0)
-    slow_link = BandwidthResource(base_speed=1.0, latency=0.5)
-    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
-    policy.bind_resources(
-        compute_res=compute_res,
-        transfer_links={"src": slow_link},
-        work_per_transfer=1.0,
-        work_per_block=1.0,
-        work_per_prefill_token=100.0,
-        work_per_decode_req=0.01,
-        block_size=1,
-    )
-
-    assert policy.resolve_actions(memories, ["a"], req=req)["a"] == "compute"
-
-
-def test_cost_model_pending_pulls_in_allocation() -> None:
-    memories = {
-        "src": Memory(size=10, name="src"),
-        "dst": Memory(size=10, name="dst"),
-    }
-    make_resident(memories["src"], "a")
-    make_resident(memories["src"], "b")
-
-    req = Request("r1", 0.0, ["a", "b"], RequestPD.PREFILL, RequestStatus.RUNNING)
-    req.prefix_block_count = 2
-
-    compute_res = ComputeResource(base_speed=100.0)
-    link = BandwidthResource(base_speed=1.0, latency=0.0)
-    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
-    policy.bind_resources(
-        compute_res=compute_res,
-        transfer_links={"src": link},
-        work_per_transfer=1.0,
-        work_per_block=1.0,
-        work_per_prefill_token=100.0,
-        block_size=1,
-    )
-
-    actions = policy.resolve_actions(memories, ["a", "b"], req=req, block_size=1)
-    assert actions["a"] == ("pull", "src")
-    assert actions["b"] == "compute"
-
-
-def test_cost_model_link_scheduled_load() -> None:
-    memories = {
-        "src": Memory(size=10, name="src"),
-        "dst": Memory(size=10, name="dst"),
-    }
-    make_resident(memories["src"], "a")
-
-    compute_res = ComputeResource(base_speed=10.0)
-    link = BandwidthResource(base_speed=2.0, latency=0.0)
-    for _ in range(4):
-        link.schedule()
-
-    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
-    policy.bind_resources(
-        compute_res=compute_res,
-        transfer_links={"src": link},
-        work_per_transfer=1.0,
-        work_per_block=1.0,
-    )
-
-    assert policy.resolve_actions(memories, ["a"])["a"] == "compute"
-
-
-def test_cost_model_pull_only_ignores_compute() -> None:
-    memories = {
-        "src": Memory(size=10, name="src"),
-        "dst": Memory(size=10, name="dst"),
-    }
-    make_resident(memories["src"], "a")
-
-    compute_res = ComputeResource(base_speed=100.0)
-    slow_link = BandwidthResource(base_speed=0.1)
-
-    policy = CostBasedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
-    policy.bind_resources(
-        compute_res=compute_res,
-        transfer_links={"src": slow_link},
-        work_per_transfer=1.0,
-        work_per_block=1.0,
-    )
-
-    assert policy.resolve_actions(memories, ["a"], allow_compute=False) == {
-        "a": ("pull", "src")
-    }
 
 
 def test_local_satisfied_inflight() -> None:
@@ -719,7 +534,7 @@ def test_request_metrics_pd_decode() -> None:
         pool,
         memories,
         "npu-1:hbm",
-        CostBasedPullLookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]),
+        OrderedPullLookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]),
         ComputeResource(base_speed=4.0),
         BandwidthResource(base_speed=4.0),
         work_per_transfer=1.0,

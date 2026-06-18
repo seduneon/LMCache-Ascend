@@ -34,7 +34,7 @@ def run_critical_tests() -> None:
 
 def run_pd_demo() -> None:
     from simulator.memory import Memory
-    from simulator.lookup import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
+    from simulator.lookup import ComputeOnlyLookupPolicy, OrderedPullLookupPolicy
     from simulator.resource import BandwidthResource, ComputeResource
 
     pool = TaskPool()
@@ -68,7 +68,7 @@ def run_pd_demo() -> None:
         pool=pool,
         memories=memories,
         local_memory="npu-1:hbm",
-        policy=CostBasedPullLookupPolicy(
+        policy=OrderedPullLookupPolicy(
             local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
         ),
         compute_res=ComputeResource(base_speed=1.0),
@@ -224,7 +224,7 @@ def run_chunked_prefill_test() -> None:
 
 def run_pd_read_test() -> None:
     from simulator.memory import Memory
-    from simulator.lookup import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
+    from simulator.lookup import ComputeOnlyLookupPolicy, OrderedPullLookupPolicy
     from simulator.resource import BandwidthResource, ComputeResource
 
     pool = TaskPool()
@@ -256,7 +256,7 @@ def run_pd_read_test() -> None:
         pool=pool,
         memories=memories,
         local_memory="npu-1:hbm",
-        policy=CostBasedPullLookupPolicy(
+        policy=OrderedPullLookupPolicy(
             local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
         ),
         compute_res=ComputeResource(base_speed=1.0),

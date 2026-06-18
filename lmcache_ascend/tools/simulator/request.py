@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Iterable
 
 
 class RequestPD(StrEnum):
@@ -116,3 +119,13 @@ class Request:
     def is_prefill_chunk(self) -> bool:
         """vLLM: num_computed_tokens < prompt length (here: prefix blocks)."""
         return self.num_computed_blocks < self.prefix_block_count
+
+
+def request_owning_prefix_block(
+    block_hash: str, requests: Iterable[Request]
+) -> Request | None:
+    """Find the request that owns a prefix block (for spill-on-evict)."""
+    for req in requests:
+        if block_hash in req.block_hashes[: req.prefix_block_count]:
+            return req
+    return None

@@ -5,7 +5,7 @@ from __future__ import annotations
 from simulator.engine import Engine
 from simulator.memory import BlockState, Memory
 from simulator.plan import EntryPlan, WorkEntry
-from simulator.lookup import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy, OrderedPullLookupPolicy
+from simulator.lookup import ComputeOnlyLookupPolicy, OrderedPullLookupPolicy
 from simulator.request import Request, RequestPD, RequestStatus
 from simulator.resource import BandwidthResource, ComputeResource
 from simulator.sim_log import SimLogConfig
@@ -49,7 +49,7 @@ def _pd_engines(
         pool=pool,
         memories=memories,
         local_memory="npu-1:hbm",
-        policy=CostBasedPullLookupPolicy(
+        policy=OrderedPullLookupPolicy(
             local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
         ),
         compute_res=compute,
