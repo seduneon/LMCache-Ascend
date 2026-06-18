@@ -7,30 +7,22 @@ import csv
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Callable
 
 from .engine import Engine
-from .memory import Memory
 from .pd import PDConfig
-from .lookup import (
-    ComputeOnlyLookupPolicy,
-    LookupPolicy,
-    OrderedPullLookupPolicy,
+from .presets import (
+    DEFAULT_PRESET_NAMES,
+    PRESETS,
+    EngineBuildConfig,
+    PresetSpec,
+    build_pd_engines,
 )
-from .placement import HBMAndDRAM, HBMOnly, PlacementPolicy, TieredPlacement
-from .retention import (
-    ConsumeOnPull,
-    GlobalCopyCap,
-    RetentionPolicy,
-    SingleCopyPerTier,
-    UnboundedRetention,
-)
-from .request import Request, RequestPD, RequestStatus
-from .resource import BandwidthResource, ComputeResource
+from .request import RequestPD, RequestStatus
 from .sim_log import SimLogConfig, SimLogger
 from .sim_progress import SimProgress, SimProgressConfig
 from .simulator import Simulator
 from .tasks import TaskPool
+from .topology import SimResources
 from .workload import WorkloadConfig, generate_prefill_workload
 
 
@@ -56,158 +48,27 @@ class SimConfig:
     wall_timeout_s: float | None = None
     show_progress: bool = False
 
+    def resources(self) -> SimResources:
+        return SimResources(
+            hbm_size=self.hbm_size,
+            dram_size=self.dram_size,
+            ssd_size=self.ssd_size,
+            dram_chunk_blocks=self.dram_chunk_blocks,
+            ssd_chunk_blocks=self.ssd_chunk_blocks,
+        )
 
-@dataclass(frozen=True)
-class PolicyPreset:
-    name: str
-    description: str
-    build_memories: Callable[[SimConfig], dict[str, Memory]]
-    build_prefill_policy: Callable[[dict[str, Memory]], LookupPolicy]
-    build_decode_policy: Callable[[dict[str, Memory]], LookupPolicy]
-    build_prefill_placement: Callable[[dict[str, Memory]], PlacementPolicy]
-    build_retention: Callable[[], RetentionPolicy]
-    decode_pull_sources: Callable[[dict[str, Memory]], list[str]]
-
-
-def _percentile(values: list[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    rank = (len(ordered) - 1) * pct / 100.0
-    lo = int(rank)
-    hi = min(lo + 1, len(ordered) - 1)
-    if lo == hi:
-        return ordered[lo]
-    return ordered[lo] + (ordered[hi] - ordered[lo]) * (rank - lo)
-
-
-def _hbm_memories(cfg: SimConfig) -> dict[str, Memory]:
-    return {
-        "npu-0:hbm": Memory(size=cfg.hbm_size, name="npu-0:hbm"),
-        "npu-1:hbm": Memory(size=cfg.hbm_size, name="npu-1:hbm"),
-    }
-
-
-def _hbm_dram_memories(cfg: SimConfig) -> dict[str, Memory]:
-    memories = _hbm_memories(cfg)
-    memories["npu-0:dram"] = Memory(
-        size=cfg.dram_size,
-        name="npu-0:dram",
-        chunk_blocks=cfg.dram_chunk_blocks,
-    )
-    return memories
-
-
-def _hbm_dram_ssd_memories(cfg: SimConfig) -> dict[str, Memory]:
-    memories = _hbm_dram_memories(cfg)
-    memories["npu-0:ssd"] = Memory(
-        size=cfg.ssd_size,
-        name="npu-0:ssd",
-        chunk_blocks=cfg.ssd_chunk_blocks,
-    )
-    return memories
-
-
-PRESETS: dict[str, PolicyPreset] = {
-    "baseline": PolicyPreset(
-        name="baseline",
-        description="P compute-only; D ordered pull from P HBM (stress default)",
-        build_memories=_hbm_memories,
-        build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
-        ),
-        build_prefill_placement=lambda m: HBMOnly(),
-        build_retention=UnboundedRetention,
-        decode_pull_sources=lambda m: ["npu-0:hbm"],
-    ),
-    "ordered_pull": PolicyPreset(
-        name="ordered_pull",
-        description="P compute-only; D first-available pull from P HBM (no cost model)",
-        build_memories=_hbm_memories,
-        build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
-        ),
-        build_prefill_placement=lambda m: HBMOnly(),
-        build_retention=UnboundedRetention,
-        decode_pull_sources=lambda m: ["npu-0:hbm"],
-    ),
-    "dram_tier": PolicyPreset(
-        name="dram_tier",
-        description="P mirrors/spills to DRAM; D ordered pull from DRAM then P HBM",
-        build_memories=_hbm_dram_memories,
-        build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm",
-            pull_sources=["npu-0:dram", "npu-0:hbm"],
-        ),
-        build_prefill_placement=lambda m: HBMAndDRAM("npu-0:dram"),
-        build_retention=UnboundedRetention,
-        decode_pull_sources=lambda m: ["npu-0:dram", "npu-0:hbm"],
-    ),
-    "consume_on_pull": PolicyPreset(
-        name="consume_on_pull",
-        description="baseline + ConsumeOnPull (source copy removed when unheld)",
-        build_memories=_hbm_memories,
-        build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
-        ),
-        build_prefill_placement=lambda m: HBMOnly(),
-        build_retention=ConsumeOnPull,
-        decode_pull_sources=lambda m: ["npu-0:hbm"],
-    ),
-    "single_copy": PolicyPreset(
-        name="single_copy",
-        description="baseline + SingleCopyPerTier retention cap",
-        build_memories=_hbm_memories,
-        build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
-        ),
-        build_prefill_placement=lambda m: HBMOnly(),
-        build_retention=SingleCopyPerTier,
-        decode_pull_sources=lambda m: ["npu-0:hbm"],
-    ),
-    "ssd_tier": PolicyPreset(
-        name="ssd_tier",
-        description="P sync DRAM + paid SSD writes; D ordered pull from SSD/DRAM/HBM",
-        build_memories=_hbm_dram_ssd_memories,
-        build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm",
-            pull_sources=["npu-0:ssd", "npu-0:dram", "npu-0:hbm"],
-        ),
-        build_prefill_placement=lambda m: TieredPlacement(
-            ["npu-0:dram", "npu-0:ssd"],
-            paid_write_tiers=frozenset({"npu-0:ssd"}),
-        ),
-        build_retention=UnboundedRetention,
-        decode_pull_sources=lambda m: ["npu-0:ssd", "npu-0:dram", "npu-0:hbm"],
-    ),
-    "global_cap_2": PolicyPreset(
-        name="global_cap_2",
-        description="baseline + GlobalCopyCap(2) across P HBM and D HBM",
-        build_memories=_hbm_memories,
-        build_prefill_policy=lambda m: ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
-        build_decode_policy=lambda m: OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
-        ),
-        build_prefill_placement=lambda m: HBMOnly(),
-        build_retention=lambda: GlobalCopyCap(
-            2, ["npu-0:hbm", "npu-1:hbm"], per_tier_cap=None
-        ),
-        decode_pull_sources=lambda m: ["npu-0:hbm"],
-    ),
-}
-
-DEFAULT_PRESET_NAMES: tuple[str, ...] = (
-    "baseline",
-    "ordered_pull",
-    "dram_tier",
-    "consume_on_pull",
-)
+    def engine_build(self) -> EngineBuildConfig:
+        return EngineBuildConfig(
+            compute_speed=self.compute_speed,
+            link_speed=self.link_speed,
+            link_latency=self.link_latency,
+            ssd_write_speed=self.ssd_write_speed,
+            work_per_block=self.work_per_block,
+            work_per_transfer=self.work_per_transfer,
+            max_num_seqs=self.max_num_seqs,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            resources=self.resources(),
+        )
 
 
 HBM_TIER_KEYS: tuple[str, ...] = ("npu-0:hbm", "npu-1:hbm")
@@ -242,77 +103,32 @@ class SweepRow:
 SWEEP_CSV_FIELDS = [f.name for f in SweepRow.__dataclass_fields__.values()]
 
 
-def _transfer_links(
-    memories: dict[str, Memory],
-    pull_sources: list[str],
-    link: BandwidthResource,
-) -> dict[str, BandwidthResource]:
-    return {src: link for src in pull_sources if src in memories}
-
-
-def _write_links(
-    memories: dict[str, Memory],
-    sim_cfg: SimConfig,
-) -> dict[str, BandwidthResource]:
-    links: dict[str, BandwidthResource] = {}
-    if "npu-0:ssd" in memories:
-        links["npu-0:ssd"] = BandwidthResource(
-            base_speed=sim_cfg.ssd_write_speed,
-            latency=sim_cfg.link_latency,
-        )
-    return links
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = (len(ordered) - 1) * pct / 100.0
+    lo = int(rank)
+    hi = min(lo + 1, len(ordered) - 1)
+    if lo == hi:
+        return ordered[lo]
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (rank - lo)
 
 
 def build_engines(
-    requests: list[Request],
+    requests: list,
     pool: TaskPool,
-    preset: PolicyPreset,
+    preset: PresetSpec,
     sim_cfg: SimConfig,
-) -> tuple[Engine, Engine, dict[str, Memory]]:
-    memories = preset.build_memories(sim_cfg)
-    compute = ComputeResource(base_speed=sim_cfg.compute_speed)
-    link = BandwidthResource(
-        base_speed=sim_cfg.link_speed, latency=sim_cfg.link_latency
+) -> tuple[Engine, Engine, dict]:
+    npu0, npu1, topo = build_pd_engines(
+        requests,
+        pool,
+        preset,
+        cfg=sim_cfg.engine_build(),
+        resources=sim_cfg.resources(),
     )
-    pull_sources = preset.decode_pull_sources(memories)
-    retention = preset.build_retention()
-
-    npu0 = Engine(
-        engine_id="npu-0",
-        requests=requests,
-        pool=pool,
-        memories=memories,
-        local_memory="npu-0:hbm",
-        policy=preset.build_prefill_policy(memories),
-        compute_res=compute,
-        work_per_block=sim_cfg.work_per_block,
-        max_num_seqs=sim_cfg.max_num_seqs,
-        max_num_batched_tokens=sim_cfg.max_num_batched_tokens,
-        enable_chunked_prefill=True,
-        placement_policy=preset.build_prefill_placement(memories),
-        retention_policy=retention,
-        write_links=_write_links(memories, sim_cfg),
-        work_per_store=sim_cfg.work_per_transfer,
-    )
-    npu1 = Engine(
-        engine_id="npu-1",
-        requests=[],
-        pool=pool,
-        memories=memories,
-        local_memory="npu-1:hbm",
-        policy=preset.build_decode_policy(memories),
-        compute_res=compute,
-        bandwidth_res=link,
-        transfer_links=_transfer_links(memories, pull_sources, link),
-        work_per_block=sim_cfg.work_per_block,
-        work_per_transfer=sim_cfg.work_per_transfer,
-        max_num_seqs=sim_cfg.max_num_seqs,
-        max_num_batched_tokens=sim_cfg.max_num_batched_tokens,
-        enable_chunked_prefill=True,
-        remote_kv_wait=True,
-        retention_policy=retention,
-    )
-    return npu0, npu1, memories
+    return npu0, npu1, topo.memories
 
 
 def _aggregate_metrics(
@@ -325,7 +141,7 @@ def _aggregate_metrics(
     steps: int,
     finish_time: float,
     wall_seconds: float,
-    memories: dict[str, Memory],
+    memories: dict,
 ) -> SweepRow:
     decode_latencies = [
         r.metrics.latency
@@ -380,7 +196,7 @@ def _aggregate_metrics(
 
 
 def run_sweep_case(
-    preset: PolicyPreset,
+    preset: PresetSpec,
     workload: WorkloadConfig,
     sim_cfg: SimConfig,
 ) -> SweepRow:

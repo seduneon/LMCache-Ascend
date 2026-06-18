@@ -29,16 +29,6 @@ class StoreOp:
     hbm_block_hash: str
 
 
-@dataclass(frozen=True)
-class RetentionProfile:
-    """Frozen retention knobs planned into outcomes (no live policy in Execute)."""
-
-    kind: Literal["unbounded", "single_copy", "consume_on_pull", "global_cap"] = "unbounded"
-    max_total: int = 0
-    tier_keys: tuple[str, ...] = ()
-    per_tier_cap: int | None = None
-
-
 @dataclass
 class EntryPlan:
     """Per-request KV intent: all executor-visible memory actions."""
@@ -79,4 +69,3 @@ class BatchPlan:
     entries: list[WorkEntry] = field(default_factory=list)
     preempted: list[Request] = field(default_factory=list)
     total_num_scheduled_tokens: int = 0
-    retention: RetentionProfile = field(default_factory=RetentionProfile)

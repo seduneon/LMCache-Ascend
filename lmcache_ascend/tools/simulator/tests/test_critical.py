@@ -11,7 +11,7 @@ from simulator.resource import BandwidthResource, ComputeResource
 from simulator.sim_log import SimLogConfig
 from simulator.simulator import Simulator
 from simulator.tasks import BatchLoadTask, TaskPool, TaskStatus
-from simulator.tests.test_helpers import SimpleTask, execute_plan, make_plan, make_resident
+from simulator.tests.test_helpers import SimpleTask, execute_plan, make_plan, make_resident, policies_compute, policies_pull
 
 
 def _pd_engines(
@@ -36,8 +36,7 @@ def _pd_engines(
         requests=prefill_requests,
         pool=pool,
         memories=memories,
-        local_memory="npu-0:hbm",
-        policy=ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
+        policies=policies_compute("npu-0:hbm"),
         compute_res=compute,
         work_per_block=1.0,
         max_num_seqs=max_num_seqs,
@@ -48,10 +47,7 @@ def _pd_engines(
         requests=[],
         pool=pool,
         memories=memories,
-        local_memory="npu-1:hbm",
-        policy=OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
-        ),
+        policies=policies_pull("npu-1:hbm", ["npu-0:hbm"]),
         compute_res=compute,
         bandwidth_res=link,
         work_per_transfer=1.0,
@@ -79,8 +75,7 @@ def test_micro_step_waits_for_arrival() -> None:
         [Request("r1", 2.5, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)],
         pool,
         memories,
-        "hbm",
-        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        policies_compute("hbm"),
         ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
@@ -103,8 +98,7 @@ def test_event_steps_matches_completed_steps() -> None:
         [Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)],
         pool,
         memories,
-        "hbm",
-        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        policies_compute("hbm"),
         ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
@@ -128,8 +122,7 @@ def test_in_flight_blocks_reschedule() -> None:
         ],
         pool,
         memories,
-        "hbm",
-        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        policies_compute("hbm"),
         ComputeResource(base_speed=1.0),
         work_per_block=1.0,
         max_num_batched_tokens=2,
@@ -333,8 +326,7 @@ def test_parallel_pull_tasks_start_together() -> None:
         [],
         pool,
         memories,
-        "dst",
-        OrderedPullLookupPolicy(local_memory="dst", pull_sources=["src"]),
+        policies_pull("dst", ["src"]),
         ComputeResource(base_speed=1.0),
         BandwidthResource(base_speed=1.0),
         work_per_transfer=1.0,

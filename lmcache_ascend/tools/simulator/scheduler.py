@@ -3,7 +3,7 @@ from __future__ import annotations
 import heapq
 from collections import deque
 
-from .lookup import LookupPolicy, local_satisfied
+from .schedule import SchedulePolicy, local_satisfied
 from .memory import Memory
 from .plan import EntryPlan, ScheduleResult, WorkEntry
 from .request import Request, RequestPD, RequestStatus
@@ -14,7 +14,7 @@ class Scheduler:
 
     def __init__(
         self,
-        policy: LookupPolicy,
+        policy: SchedulePolicy,
         memories: dict[str, Memory],
         local_memory: str,
         *,

@@ -25,7 +25,7 @@ from simulator.kv_content import (
 )
 from simulator.memory import BlockState, KVBlock, Memory, collect_content_copies
 from simulator.tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
-from simulator.tests.test_helpers import SimpleTask, make_resident
+from simulator.tests.test_helpers import SimpleTask, make_resident, policies_compute, policies_pull
 
 from simulator.engine import Engine
 from simulator.request import Request, RequestPD, RequestStatus
@@ -88,12 +88,10 @@ def test_placement_e2e_pull_from_dram() -> None:
         [],
         pool,
         memories,
-        "hbm",
-        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        policies_pull("hbm", ["dram"], mirror_tiers=("dram",)),
         ComputeResource(base_speed=8.0),
         BandwidthResource(base_speed=8.0),
         work_per_block=1.0,
-        placement_policy=HBMAndDRAM("dram"),
     )
     eng.schedule_request(
         Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)
@@ -201,8 +199,7 @@ def test_chunked_dram_pull_transfer_cost_e2e() -> None:
         [],
         pool,
         memories,
-        "hbm",
-        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        policies_pull("hbm", ["dram"]),
         ComputeResource(base_speed=8.0),
         BandwidthResource(base_speed=4.0),
         work_per_block=1.0,
@@ -229,12 +226,10 @@ def test_spill_e2e_after_hbm_pressure() -> None:
         [],
         pool,
         memories,
-        "hbm",
-        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        policies_pull("hbm", ["dram"], mirror_tiers=("dram",)),
         ComputeResource(base_speed=8.0),
         BandwidthResource(base_speed=8.0),
         work_per_block=1.0,
-        placement_policy=HBMAndDRAM("dram"),
     )
     eng.schedule_request(
         Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)
@@ -333,13 +328,11 @@ def test_consume_on_pull_e2e() -> None:
         [Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)],
         pool,
         memories,
-        "hbm",
-        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        policies_pull("hbm", ["dram"], retention="consume_on_pull"),
         ComputeResource(base_speed=8.0),
         BandwidthResource(base_speed=8.0),
         work_per_block=1.0,
         hold_kv_on_complete=True,
-        retention_policy=ConsumeOnPull(),
     )
 
     Simulator([eng], pool).run()
@@ -482,8 +475,7 @@ def test_request_metrics_phases() -> None:
         [req],
         pool,
         memories,
-        "hbm",
-        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        policies_compute("hbm"),
         ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
@@ -522,8 +514,7 @@ def test_request_metrics_pd_decode() -> None:
         [prefill],
         pool,
         memories,
-        "npu-0:hbm",
-        ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
+        policies_compute("npu-0:hbm"),
         ComputeResource(base_speed=4.0),
         work_per_block=1.0,
     )
@@ -532,8 +523,7 @@ def test_request_metrics_pd_decode() -> None:
         [],
         pool,
         memories,
-        "npu-1:hbm",
-        OrderedPullLookupPolicy(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]),
+        policies_pull("npu-1:hbm", ["npu-0:hbm"]),
         ComputeResource(base_speed=4.0),
         BandwidthResource(base_speed=4.0),
         work_per_transfer=1.0,
@@ -594,11 +584,9 @@ def test_tiered_placement_async_store_e2e() -> None:
         [],
         pool,
         memories,
-        "hbm",
-        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        policies_compute("hbm", async_write_tiers=frozenset({"ssd"})),
         ComputeResource(base_speed=8.0),
         work_per_block=1.0,
-        placement_policy=TieredPlacement(["ssd"], paid_write_tiers=frozenset({"ssd"})),
         write_links={"ssd": write_link},
         work_per_store=4.0,
     )
@@ -644,8 +632,7 @@ def test_batch_load_task_amortizes_work() -> None:
         [],
         pool,
         memories,
-        "hbm",
-        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        policies_pull("hbm", ["dram"]),
         ComputeResource(base_speed=100.0),
         transfer_links={"dram": link},
         work_per_block=1.0,
@@ -679,8 +666,7 @@ def test_pull_dedupe_across_requests_in_batch() -> None:
         [],
         pool,
         memories,
-        "hbm",
-        OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"]),
+        policies_pull("hbm", ["dram"]),
         ComputeResource(base_speed=100.0),
         transfer_links={"dram": link},
         work_per_block=1.0,
@@ -719,8 +705,7 @@ def test_sync_evict_frees_before_pull() -> None:
         [],
         pool,
         memories,
-        "hbm",
-        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        policies_compute("hbm"),
         ComputeResource(base_speed=8.0),
         work_per_block=1.0,
         sync_evict=True,
@@ -791,11 +776,9 @@ def test_execute_plan_tags_pool_tasks() -> None:
         [],
         pool,
         memories,
-        "hbm",
-        ComputeOnlyLookupPolicy(local_memory="hbm"),
+        policies_compute("hbm", async_write_tiers=frozenset({"ssd"})),
         ComputeResource(base_speed=8.0),
         work_per_block=1.0,
-        placement_policy=TieredPlacement(["ssd"], paid_write_tiers=frozenset({"ssd"})),
         write_links={"ssd": write_link},
         work_per_store=4.0,
     )

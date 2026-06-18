@@ -1,18 +1,10 @@
 from .kv_content import ContentKey
 from .execute import BatchRunner
-from .lookup import LookupPolicy
 from .memory import KVBlock, Memory, collect_content_copies
-from .placement import HBMOnly, PlacementPolicy
-from .plan import BatchPlan, RetentionProfile, StoreOp, WorkEntry
+from .plan import BatchPlan, StoreOp, WorkEntry
+from .policies import EnginePolicies, enrich_entry_plan
 from .request import Request, RequestPD, RequestStatus, request_owning_prefix_block
 from .resource import BandwidthResource, ComputeResource
-from .retention import (
-    ConsumeOnPull,
-    GlobalCopyCap,
-    RetentionPolicy,
-    SingleCopyPerTier,
-    UnboundedRetention,
-)
 from .scheduler import Scheduler
 from .tasks import TaskPool
 
@@ -24,8 +16,7 @@ class Engine:
         requests: list[Request],
         pool: TaskPool,
         memories: dict[str, Memory],
-        local_memory: str,
-        policy: LookupPolicy,
+        policies: EnginePolicies,
         compute_res: ComputeResource,
         bandwidth_res: BandwidthResource | None = None,
         transfer_links: dict[str, BandwidthResource] | None = None,
@@ -42,19 +33,18 @@ class Engine:
         hold_kv_on_complete: bool = False,
         work_per_prefill_token: float | None = None,
         work_per_decode_req: float | None = None,
-        placement_policy: PlacementPolicy | None = None,
-        retention_policy: RetentionPolicy | None = None,
         sync_evict: bool = True,
     ):
         self.engine_id = engine_id
         self.pool = pool
         self.memories = memories
-        self.local_memory = local_memory
-        self.policy = policy
+        self.policies = policies
+        self.local_memory = policies.schedule.local_memory
         self.compute_res = compute_res
         self.bandwidth_res = bandwidth_res
-        if transfer_links is None and bandwidth_res is not None and policy.pull_sources:
-            transfer_links = {src: bandwidth_res for src in policy.pull_sources}
+        schedule = policies.schedule
+        if transfer_links is None and bandwidth_res is not None and schedule.pull_sources:
+            transfer_links = {src: bandwidth_res for src in schedule.pull_sources}
         self.transfer_links = transfer_links or {}
         self.write_links = write_links or {}
         self.work_per_block = work_per_block
@@ -74,17 +64,13 @@ class Engine:
             work_per_decode_req if work_per_decode_req is not None else work_per_block
         )
         self.hold_kv_on_complete = hold_kv_on_complete
-        self.placement_policy = placement_policy or HBMOnly()
-        self.retention_policy = retention_policy or UnboundedRetention()
-        self.placement_policy.bind_retention(self.retention_policy)
-        self.retention_profile = _retention_profile(self.retention_policy)
         self._peak_duplicate_count = 0
         self._next_batch_id = 0
 
         self.scheduler = Scheduler(
-            policy,
+            schedule,
             memories,
-            local_memory,
+            self.local_memory,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
             block_size=block_size,
@@ -149,88 +135,51 @@ class Engine:
         self._peak_duplicate_count = max(self._peak_duplicate_count, count)
 
     def _on_hbm_resident(self, block: KVBlock, req: Request, now: float) -> None:
-        self.placement_policy.place_copy(
-            self.memories,
-            local_memory=self.local_memory,
-            block=block,
-            req=req,
-            now=now,
-        )
-        self.retention_policy.on_block_resident(
-            self.memories,
-            tier_key=self.local_memory,
-            block=block,
-            now=now,
-            req=req,
-        )
+        self.policies.effects.on_hbm_resident(self.memories, block, req, now)
         self._track_duplicates(req, self.local_memory, block.hash)
 
     def _on_tier_resident(
         self, tier_key: str, block: KVBlock, req: Request, now: float
     ) -> None:
-        self.retention_policy.on_block_resident(
-            self.memories,
-            tier_key=tier_key,
-            block=block,
-            now=now,
-            req=req,
+        self.policies.effects.on_tier_resident(
+            self.memories, tier_key, block, req, now
         )
         self._track_duplicates(req, tier_key, block.hash)
 
     def _after_pull(
         self, src_key: str, block_hash: str, req: Request, now: float
     ) -> None:
-        self.retention_policy.after_pull(
-            self.memories,
-            src_key=src_key,
-            dst_key=self.local_memory,
-            block_hash=block_hash,
-            now=now,
-            req=req,
+        del now
+        self.policies.effects.after_pull(
+            self.memories, src_key, block_hash, req
         )
 
     def _on_hbm_evict(self, victim: KVBlock, spill_req: Request, now: float) -> None:
-        self.placement_policy.spill_on_evict(
-            self.memories,
-            local_memory=self.local_memory,
-            block=victim,
-            now=now,
-            req=spill_req,
-        )
+        self.policies.effects.on_hbm_evict(self.memories, victim, spill_req, now)
 
-    def _expand_async_stores(self, entry: WorkEntry, block_hash: str) -> list[StoreOp]:
-        return self.placement_policy.plan_async_stores(
-            self.memories,
-            local_memory=self.local_memory,
-            block_hash=block_hash,
-            req=entry.req,
-        )
-
-    def _expand_spill_stores(self, entry: WorkEntry, victim: KVBlock) -> list[StoreOp]:
-        spill_req = self._resolve_spill_req(victim.hash)
-        if spill_req is None:
-            return []
-        ops = self.placement_policy.plan_spill_stores(
-            self.memories,
-            local_memory=self.local_memory,
-            block_hash=victim.hash,
-            req=spill_req,
-        )
-        if ops:
-            entry.plan.spill_store_ops[id(victim)] = ops
-        return ops
+    def _enrich_scheduled(self, scheduled) -> None:
+        known = self._known_requests()
+        for entry in scheduled.entries:
+            enrich_entry_plan(
+                entry.plan,
+                entry=entry,
+                effects=self.policies.effects,
+                memories=self.memories,
+                known_requests=known,
+            )
 
     def _execute_plan(self, plan: BatchPlan) -> None:
         BatchRunner(self, plan.scheduled_at).run(plan)
 
     def try_schedule_and_execute(self, now: float) -> BatchPlan | None:
-        """Admit → plan → execute in one call; returns ``None`` when idle."""
+        """Admit → plan → enrich → execute; returns ``None`` when idle."""
         scheduled = self.scheduler.schedule(
             now,
             engine_id=self.engine_id,
         )
         if not scheduled.entries:
             return None
+        self._enrich_scheduled(scheduled)
         batch_id = self._next_batch_id
         self._next_batch_id += 1
         plan = BatchPlan(
@@ -240,7 +189,6 @@ class Engine:
             entries=list(scheduled.entries),
             preempted=list(scheduled.preempted),
             total_num_scheduled_tokens=scheduled.total_num_scheduled_tokens,
-            retention=self.retention_profile,
         )
         self._execute_plan(plan)
         return plan
@@ -282,18 +230,3 @@ class Engine:
 
     def release_held_kv(self, req_id: str) -> None:
         self.memories[self.local_memory].free_request(req_id)
-
-
-def _retention_profile(policy: RetentionPolicy) -> RetentionProfile:
-    if isinstance(policy, ConsumeOnPull):
-        return RetentionProfile(kind="consume_on_pull")
-    if isinstance(policy, SingleCopyPerTier):
-        return RetentionProfile(kind="single_copy")
-    if isinstance(policy, GlobalCopyCap):
-        return RetentionProfile(
-            kind="global_cap",
-            max_total=policy.max_total,
-            tier_keys=tuple(policy.tier_keys),
-            per_tier_cap=policy._per_tier_cap,
-        )
-    return RetentionProfile(kind="unbounded")

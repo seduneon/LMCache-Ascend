@@ -10,6 +10,7 @@ _TOOLS_DIR = Path(__file__).resolve().parents[2]
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
+from simulator.tests.test_helpers import policies_compute, policies_pull
 from simulator.engine import Engine
 from simulator.pd import PDConfig
 from simulator.request import Request, RequestPD, RequestStatus
@@ -57,8 +58,7 @@ def run_pd_demo() -> None:
         requests=prefill_requests,
         pool=pool,
         memories=memories,
-        local_memory="npu-0:hbm",
-        policy=ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
+        policies=policies_compute("npu-0:hbm"),
         compute_res=ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
@@ -67,10 +67,7 @@ def run_pd_demo() -> None:
         requests=[],
         pool=pool,
         memories=memories,
-        local_memory="npu-1:hbm",
-        policy=OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
-        ),
+        policies=policies_pull("npu-1:hbm", ["npu-0:hbm"]),
         compute_res=ComputeResource(base_speed=1.0),
         bandwidth_res=BandwidthResource(base_speed=1.0),
         work_per_block=1.0,
@@ -128,8 +125,7 @@ def run_deadlock_test() -> None:
         requests=requests,
         pool=pool,
         memories=memories,
-        local_memory="npu-0:hbm",
-        policy=ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
+        policies=policies_compute("npu-0:hbm"),
         compute_res=ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
@@ -198,8 +194,7 @@ def run_chunked_prefill_test() -> None:
         requests=[],
         pool=pool,
         memories=memories,
-        local_memory="hbm",
-        policy=policy,
+        policies=policies_compute("hbm"),
         compute_res=ComputeResource(base_speed=1.0),
         block_size=1,
         max_num_batched_tokens=2,
@@ -245,8 +240,7 @@ def run_pd_read_test() -> None:
         requests=[prefill],
         pool=pool,
         memories=memories,
-        local_memory="npu-0:hbm",
-        policy=ComputeOnlyLookupPolicy(local_memory="npu-0:hbm"),
+        policies=policies_compute("npu-0:hbm"),
         compute_res=ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
@@ -255,10 +249,7 @@ def run_pd_read_test() -> None:
         requests=[],
         pool=pool,
         memories=memories,
-        local_memory="npu-1:hbm",
-        policy=OrderedPullLookupPolicy(
-            local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"]
-        ),
+        policies=policies_pull("npu-1:hbm", ["npu-0:hbm"]),
         compute_res=ComputeResource(base_speed=1.0),
         bandwidth_res=BandwidthResource(base_speed=1.0),
         work_per_block=1.0,
@@ -457,8 +448,7 @@ def run_pd_config_validation_test() -> None:
         [],
         pool,
         memories,
-        "p",
-        ComputeOnlyLookupPolicy(local_memory="p"),
+        policies_compute("p"),
         ComputeResource(base_speed=1.0),
     )
     npu1 = Engine(
@@ -466,8 +456,7 @@ def run_pd_config_validation_test() -> None:
         [],
         pool,
         memories,
-        "d",
-        ComputeOnlyLookupPolicy(local_memory="d"),
+        policies_compute("d"),
         ComputeResource(base_speed=1.0),
     )
     try:

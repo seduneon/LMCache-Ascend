@@ -26,7 +26,7 @@ class PDConfig:
 
             prefill = engines[prefill_id]
             decode = engines[decode_id]
-            if not decode.policy.pull_sources:
+            if not decode.policies.schedule.pull_sources:
                 raise ValueError(
                     f"decode engine {decode_id!r} needs pull_sources for PD read mode"
                 )

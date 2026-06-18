@@ -5,6 +5,7 @@ from __future__ import annotations
 from simulator.engine import Engine
 from simulator.memory import BlockState, Memory
 from simulator.plan import BatchPlan, WorkEntry
+from simulator.policies import EnginePolicies
 from simulator.tasks import Task
 
 
@@ -41,3 +42,11 @@ def make_resident(memory: Memory, block_hash: str, req_id: str = "producer") -> 
     block = memory.find_reserved_for(block_hash, req_id)
     assert block is not None
     block.state = BlockState.RESIDENT
+
+
+def policies_compute(local_memory: str, **kwargs) -> EnginePolicies:
+    return EnginePolicies.compute_only(local_memory, **kwargs)
+
+
+def policies_pull(local_memory: str, sources: list[str] | tuple[str, ...], **kwargs) -> EnginePolicies:
+    return EnginePolicies.ordered_pull(local_memory, sources, **kwargs)

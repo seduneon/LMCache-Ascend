@@ -14,7 +14,7 @@ from .kv_content import (
     transfer_work,
 )
 from .cost_model import batch_forward_work, record_entry_metrics
-from .lookup import first_resident_pull_source
+from .schedule import first_resident_pull_source
 from .memory import BlockState, KVBlock, Memory
 from .plan import BatchPlan, StoreOp, WorkEntry
 from .request import Request
@@ -122,7 +122,7 @@ class BatchRunner:
                 if local.find_reserved_for(block_hash, entry.req.req_id) is None:
                     continue
                 self._schedule_stores(
-                    self._store_ops(entry, block_hash),
+                    entry.plan.store_ops.get(block_hash, []),
                     req=entry.req,
                     prereqs=[forward],
                     batch_id=plan.batch_id,
@@ -190,14 +190,14 @@ class BatchRunner:
                 continue
             if first_resident_pull_source(
                 self._engine.memories,
-                self._engine.policy.pull_sources,
+                self._engine.policies.schedule.pull_sources,
                 block_hash,
                 req=entry.req,
             ) is None:
                 self._attach_remote_wait(entry.req, block_hash)
 
     def _attach_remote_wait(self, req: Request, block_hash: str) -> None:
-        for src_key in self._engine.policy.pull_sources:
+        for src_key in self._engine.policies.schedule.pull_sources:
             src = self._engine.memories[src_key]
             if tier_has_block(src, req, block_hash):
                 continue
@@ -218,8 +218,6 @@ class BatchRunner:
         if spill_req is not None:
             self._engine._on_hbm_evict(victim, spill_req, self._at)
         spill_ops = entry.plan.spill_store_ops.get(id(victim), [])
-        if spill_req is not None and not spill_ops:
-            spill_ops = self._engine._expand_spill_stores(entry, victim)
         if spill_req is not None and spill_ops:
             for op in spill_ops:
                 tier_block = self._tier_block_for_store(op)
@@ -270,13 +268,6 @@ class BatchRunner:
         )
         self._add_task(store, prereqs, batch_id)
         return True
-
-    def _store_ops(self, entry: WorkEntry, block_hash: str) -> list[StoreOp]:
-        ops = entry.plan.store_ops.get(block_hash)
-        if ops is None:
-            ops = self._engine._expand_async_stores(entry, block_hash)
-            entry.plan.store_ops[block_hash] = ops
-        return ops
 
     def _schedule_stores(
         self,
@@ -358,7 +349,7 @@ class BatchRunner:
         seen_store: set[tuple[str, ContentKey]] = set()
         for block_hash in group_hashes:
             self._schedule_stores(
-                self._store_ops(entry, block_hash),
+                entry.plan.store_ops.get(block_hash, []),
                 req=entry.req,
                 prereqs=[task],
                 batch_id=batch_id,
