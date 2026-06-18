@@ -20,7 +20,6 @@ class RequestMetrics:
     """Per-request counters and phase timings (simulation clock)."""
 
     released_at: float | None = None
-    first_active_at: float | None = None
     finished_at: float | None = None
 
     queue_time: float = 0.0
@@ -61,8 +60,6 @@ class RequestMetrics:
 
     def enter_remote_kv(self, now: float, *, engine_id: str | None = None) -> None:
         self._close_phase(now)
-        if self.first_active_at is None:
-            self.first_active_at = now
         if engine_id is not None:
             self.engine_id = engine_id
         self.remote_kv_admits += 1
@@ -71,8 +68,6 @@ class RequestMetrics:
 
     def enter_running(self, now: float, *, engine_id: str | None = None) -> None:
         self._close_phase(now)
-        if self.first_active_at is None:
-            self.first_active_at = now
         if engine_id is not None:
             self.engine_id = engine_id
         self._phase = "running"
@@ -89,10 +84,6 @@ class RequestMetrics:
         if self.released_at is None or self.finished_at is None:
             return None
         return self.finished_at - self.released_at
-
-    @property
-    def active_time(self) -> float:
-        return self.run_time + self.remote_kv_time
 
 
 @dataclass
@@ -113,10 +104,6 @@ class Request:
     @property
     def num_preemptions(self) -> int:
         return self.metrics.preemptions
-
-    @num_preemptions.setter
-    def num_preemptions(self, value: int) -> None:
-        self.metrics.preemptions = value
 
     def total_blocks(self) -> int:
         return self.prefix_block_count + self.max_output_blocks

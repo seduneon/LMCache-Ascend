@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from content_key import ContentKey, lmcache_chunk_hash
-from memory import Memory
-from request import Request
+from .content_key import ContentKey, lmcache_chunk_hash
+from .memory import Memory
+from .request import Request
 
 
 def chunk_hbm_group(ordered_hbm: list[str], block_hash: str, chunk_blocks: int) -> list[str]:

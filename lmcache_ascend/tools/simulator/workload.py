@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 
-from request import Request, RequestPD, RequestStatus
+from .request import Request, RequestPD, RequestStatus
 
 
 @dataclass(frozen=True)

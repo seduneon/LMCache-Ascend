@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from plan import BatchWork, WorkEntry
-from request import Request
+from .plan import BatchPlan, WorkEntry
+from .request import Request
 
 
 def prefill_work(num_tokens: int, work_per_prefill_token: float) -> float:
@@ -68,7 +68,7 @@ def entry_forward_work(
 
 
 def batch_forward_work(
-    work: BatchWork,
+    work: BatchPlan,
     *,
     work_per_prefill_token: float,
     work_per_decode_req: float,

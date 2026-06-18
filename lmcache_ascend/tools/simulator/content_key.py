@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from memory import Memory
-    from request import Request
+    from .memory import Memory
+    from .request import Request
 
 
 def lmcache_chunk_hash(hbm_hashes: list[str]) -> str:
@@ -30,7 +30,7 @@ class ContentKey:
     token: str
 
     @classmethod
-    def for_hbm_block(cls, req: Request | None, hbm_hash: str) -> ContentKey:
+    def for_hbm_block(cls, hbm_hash: str) -> ContentKey:
         """Finest-grain content id for one HBM block."""
         return cls(lmcache_chunk_hash([hbm_hash]))
 
@@ -57,7 +57,7 @@ def tier_storage_key(
     hbm_hash: str,
 ) -> str:
     """Key in ``Memory.blocks`` for ``mem`` (coarser slots on downstream tiers)."""
-    from chunk_hash import chunk_key_for_hbm_block
+    from .chunk_hash import chunk_key_for_hbm_block
 
     if mem.chunk_blocks <= 1:
         return hbm_hash

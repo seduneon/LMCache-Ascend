@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from memory import BlockState, Memory
-from plan import EntryPlan, WorkEntry
-from policies import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
-from request import Request, RequestPD, RequestStatus
-from resource import BandwidthResource, ComputeResource
-from sim_log import SimLogConfig
-from simulator import Simulator
-from tasks import BatchLoadTask, TaskPool, TaskStatus
-from tests.test_helpers import SimpleTask, make_resident, make_work
+from simulator.memory import BlockState, Memory
+from simulator.plan import EntryPlan, WorkEntry
+from simulator.policies import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
+from simulator.request import Request, RequestPD, RequestStatus
+from simulator.resource import BandwidthResource, ComputeResource
+from simulator.sim_log import SimLogConfig
+from simulator.simulator import Simulator
+from simulator.tasks import BatchLoadTask, TaskPool, TaskStatus
+from simulator.tests.test_helpers import SimpleTask, make_resident, make_work
 
 
 def _pd_engines(
@@ -20,8 +20,8 @@ def _pd_engines(
     prefill_hbm: int = 100,
     max_num_seqs: int = 10,
 ):
-    from engine import Engine
-    from pd import PDConfig
+    from simulator.engine import Engine
+    from simulator.pd import PDConfig
 
     pool = TaskPool()
     memories = {
@@ -69,7 +69,7 @@ def _pd_engines(
 
 def test_micro_step_waits_for_arrival() -> None:
     """With no runnable work, one step() advances now to the next arrival."""
-    from engine import Engine
+    from simulator.engine import Engine
 
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
@@ -93,7 +93,7 @@ def test_micro_step_waits_for_arrival() -> None:
 
 
 def test_event_steps_matches_completed_steps() -> None:
-    from engine import Engine
+    from simulator.engine import Engine
 
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
@@ -115,7 +115,7 @@ def test_event_steps_matches_completed_steps() -> None:
 
 def test_in_flight_blocks_reschedule() -> None:
     """An engine with an in-flight batch must not execute another batch."""
-    from engine import Engine
+    from simulator.engine import Engine
 
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
@@ -293,7 +293,7 @@ def test_pd_organic_decode_preemption_e2e() -> None:
 
 def test_stress_n16_seed42_regression() -> None:
     """Regression for the n=16 PD deadlock (early P KV release + decode preempt)."""
-    from tests.test_stress import StressConfig, run_stress_test
+    from simulator.tests.test_stress import StressConfig, run_stress_test
 
     run_stress_test(
         StressConfig(
@@ -328,9 +328,9 @@ def test_pd_kv_released_only_on_decode_complete() -> None:
 
 def test_parallel_pull_tasks_start_together() -> None:
     """Pull tasks in one batch depend on evicts only, not on each other."""
-    from engine import Engine
-    from policies import OrderedPullLookupPolicy
-    from tests.test_helpers import make_work
+    from simulator.engine import Engine
+    from simulator.policies import OrderedPullLookupPolicy
+    from simulator.tests.test_helpers import make_work
 
     pool = TaskPool()
     memories = {
@@ -406,23 +406,3 @@ def test_shared_block_survives_partial_free() -> None:
     mem.free_request("r2")
     assert mem.used_size() == 0
 
-
-def run_critical_tests() -> None:
-    tests = [
-        test_micro_step_waits_for_arrival,
-        test_event_steps_matches_completed_steps,
-        test_in_flight_blocks_reschedule,
-        test_time_monotonic_across_steps,
-        test_pd_kv_held_after_remote_kv_promote,
-        test_pd_kv_survives_manual_preemption,
-        test_pd_organic_decode_preemption_e2e,
-        test_stress_n16_seed42_regression,
-        test_pd_kv_released_only_on_decode_complete,
-        test_parallel_pull_tasks_start_together,
-        test_task_latency_before_work,
-        test_held_blocks_not_evictable,
-        test_shared_block_survives_partial_free,
-    ]
-    for test in tests:
-        test()
-        print(f"{test.__name__} ok")

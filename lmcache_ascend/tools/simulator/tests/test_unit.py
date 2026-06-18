@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from plan import BatchWork, EntryPlan, WorkEntry
-from chunk_hash import (
+from simulator.plan import BatchWork, EntryPlan, WorkEntry
+from simulator.chunk_hash import (
     chunk_key_for_hbm_block,
     lmcache_chunk_hash,
     tier_covers_hbm_block,
     transfer_work_units,
 )
-from content_key import ContentKey, tier_storage_key
-from memory import BlockState, KVBlock, Memory, collect_content_copies
-from policies import (
+from simulator.content_key import ContentKey, tier_storage_key
+from simulator.memory import BlockState, KVBlock, Memory, collect_content_copies
+from simulator.policies import (
     ComputeOnlyLookupPolicy,
     CostBasedPullLookupPolicy,
     ConsumeOnPull,
@@ -25,14 +25,15 @@ from policies import (
     UnboundedRetention,
     local_satisfied,
 )
-from tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
-from tests.test_helpers import SimpleTask, make_resident, make_work
+from simulator.tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
+from simulator.task_outcomes import TaskOutcome
+from simulator.tests.test_helpers import SimpleTask, make_resident, make_work
 
-from engine import Engine
-from request import Request, RequestPD, RequestStatus
-from resource import BandwidthResource, ComputeResource
-from scheduler import Scheduler
-from simulator import Simulator
+from simulator.engine import Engine
+from simulator.request import Request, RequestPD, RequestStatus
+from simulator.resource import BandwidthResource, ComputeResource
+from simulator.scheduler import Scheduler
+from simulator.simulator import Simulator
 
 
 def test_hbm_and_dram_placement_creates_copy() -> None:
@@ -687,7 +688,7 @@ def test_request_metrics_phases() -> None:
 
 
 def test_request_metrics_pd_decode() -> None:
-    from pd import PDConfig
+    from simulator.pd import PDConfig
 
     pool = TaskPool()
     memories = {
@@ -923,7 +924,7 @@ def test_content_key_same_across_tiers() -> None:
     hbm = Memory(size=10, name="hbm", chunk_blocks=1)
     dram = Memory(size=10, name="dram", chunk_blocks=4)
 
-    content = ContentKey.for_hbm_block(req, "c")
+    content = ContentKey.for_hbm_block("c")
     assert str(content) == "c"
     assert tier_storage_key(content, hbm, req, "c") == "c"
     assert tier_storage_key(content, dram, req, "c") == "chunk:a|b|c|d"
@@ -956,7 +957,7 @@ def test_global_copy_cap_ssd_chunk_tier() -> None:
         req=req,
     )
 
-    content = ContentKey.for_hbm_block(req, "a")
+    content = ContentKey.for_hbm_block("a")
     copies = collect_content_copies(memories, ["hbm", "dram", "other"], content, req=req)
     assert len(copies) == 2
 
@@ -1005,8 +1006,14 @@ def test_batch_complete_waits_for_tagged_tasks() -> None:
     tier_block = KVBlock("a", BlockState.RESERVED)
     ssd.append(tier_block)
 
-    forward = ForwardTask(2.0, compute, [reserved])
-    store = StoreTask(4.0, write, ssd, tier_block)
+    forward = ForwardTask(2.0, compute, [reserved], {})
+    store = StoreTask(
+        4.0,
+        write,
+        ssd,
+        tier_block,
+        TaskOutcome(kind="tier_resident", req_id="r", block_hash="a", tier_key="ssd"),
+    )
     pool.add(forward, [], batch_id=5)
     pool.add(store, [forward], batch_id=5)
 
@@ -1027,7 +1034,7 @@ def test_batch_complete_waits_for_tagged_tasks() -> None:
 
 
 def test_sweep_smoke() -> None:
-    from sweep import SweepConfig, run_sweep
+    from simulator.sweep import SweepConfig, run_sweep
 
     rows = run_sweep(
         SweepConfig(
@@ -1041,60 +1048,3 @@ def test_sweep_smoke() -> None:
     assert all(r.status == "ok" for r in rows)
     assert rows[0].decode_p99_latency >= 0
 
-
-def run_unit_tests() -> None:
-    tests = [
-        # placement + spill
-        test_hbm_and_dram_placement_creates_copy,
-        test_dram_retains_block_after_hbm_eviction,
-        test_placement_e2e_pull_from_dram,
-        test_dram_lru_eviction_when_tier_full,
-        test_spill_on_evict_without_prior_mirror,
-        test_lmcache_chunk_hash_groups_aligned_blocks,
-        test_chunk_key_for_hbm_block_aligned_group,
-        test_chunked_dram_mirror_and_pull,
-        test_chunked_dram_pull_transfer_cost_e2e,
-        test_spill_e2e_after_hbm_pressure,
-        # retention
-        test_unbounded_retention_allows_duplicate_residents,
-        test_single_copy_per_tier_trims_oldest_duplicate,
-        test_consume_on_pull_removes_unheld_source,
-        test_consume_on_pull_keeps_held_source,
-        test_consume_on_pull_e2e,
-        test_global_copy_cap_trims_across_tiers,
-        test_content_key_same_across_tiers,
-        test_global_copy_cap_ssd_chunk_tier,
-        test_execute_work_tags_pool_tasks,
-        test_batch_complete_waits_for_tagged_tasks,
-        test_tiered_placement_async_store_e2e,
-        test_inflight_remote_source_waits_not_preempts,
-        test_batch_load_task_amortizes_work,
-        test_pull_dedupe_across_requests_in_batch,
-        test_sync_evict_frees_before_pull,
-        # eviction
-        test_lru_eviction_picks_oldest_touch,
-        test_lru_eviction_skips_held_and_excluded,
-        test_lru_eviction_under_allocate_pressure,
-        # lookup / cost model
-        test_lookup_compute,
-        test_pull_only_rejects_compute_fallback,
-        test_cost_model_picks_faster_pull_source,
-        test_cost_model_prefers_compute_under_load,
-        test_cost_model_prefill_recompute_expensive,
-        test_cost_model_decode_recompute_cheap,
-        test_cost_model_pending_pulls_in_allocation,
-        test_cost_model_link_scheduled_load,
-        test_cost_model_pull_only_ignores_compute,
-        # scheduler / tasks / memory
-        test_task_prereq_ordering,
-        test_prefix_block_count_on_arrival,
-        test_finish_frees_kv,
-        test_local_satisfied_inflight,
-        # metrics
-        test_request_metrics_phases,
-        test_request_metrics_pd_decode,
-        test_sweep_smoke,
-    ]
-    for test in tests:
-        test()
-        print(f"{test.__name__} ok")

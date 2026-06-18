@@ -3,11 +3,11 @@ from __future__ import annotations
 import heapq
 from collections import deque
 
-from kv_controller import KVController
-from memory import Memory
-from plan import EntryPlan, ScheduleResult, SimContext, WorkEntry
-from policies import LookupPolicy, local_satisfied
-from request import Request, RequestPD, RequestStatus
+from .kv_controller import KVController
+from .memory import Memory
+from .plan import EntryPlan, ScheduleResult, SimContext, WorkEntry
+from .policies import LookupPolicy, local_satisfied
+from .request import Request, RequestPD, RequestStatus
 
 
 class Scheduler:
@@ -28,7 +28,9 @@ class Scheduler:
         if isinstance(controller_or_policy, KVController):
             self.controller = controller_or_policy
         else:
-            self.controller = KVController(controller_or_policy)
+            self.controller = KVController(
+                controller_or_policy, local_memory=local_memory
+            )
         self.policy = self.controller.policy
         self.memories = memories
         self.local_memory = local_memory
@@ -336,6 +338,11 @@ class Scheduler:
                 req=req,
                 block_size=self.block_size,
                 ctx=ctx,
+                known_requests=[
+                    *self.waiting,
+                    *self.running,
+                    *self.completed,
+                ],
             )
             if plan is not None:
                 return plan

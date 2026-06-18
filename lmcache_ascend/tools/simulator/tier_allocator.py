@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from memory import BlockState, KVBlock, Memory
-from eviction import EvictionPolicy, LRUEviction
+from .memory import BlockState, KVBlock, Memory
+from .eviction import EvictionPolicy, LRUEviction
 
 
 class TierAllocator:

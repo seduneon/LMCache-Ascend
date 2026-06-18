@@ -15,11 +15,6 @@ class Resource(ABC):
     def scheduled(self) -> int:
         return self._scheduled
 
-    @property
-    def works(self) -> int:
-        """Running tasks (alias kept for ``speed()`` and existing tests)."""
-        return self._running
-
     def queued_load(self) -> int:
         """Running plus reserved (pool-pending) consumers."""
         return self._running + self._scheduled
@@ -54,7 +49,9 @@ class Resource(ABC):
         return self.latency + work / rate
 
 
-class ComputeResource(Resource):
+class LinearShareResource(Resource):
+    """Fair-shared linear throughput (compute and bandwidth share the same model)."""
+
     def __init__(self, base_speed: float, latency: float = 0.0):
         super().__init__(latency=latency)
         self._base_speed = base_speed
@@ -70,17 +67,5 @@ class ComputeResource(Resource):
         return self._base_speed / n
 
 
-class BandwidthResource(Resource):
-    def __init__(self, base_speed: float, latency: float = 0.0):
-        super().__init__(latency=latency)
-        self._base_speed = base_speed
-
-    @property
-    def base_speed(self) -> float:
-        return self._base_speed
-
-    def speed(self, works: int | None = None) -> float:
-        n = self._running if works is None else works
-        if n <= 0:
-            return 0.0
-        return self._base_speed / n
+ComputeResource = LinearShareResource
+BandwidthResource = LinearShareResource

@@ -7,13 +7,13 @@ import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from request import RequestStatus
-from tasks import BatchLoadTask, EvictTask, ForwardTask, StoreTask, Task
+from .request import RequestStatus
+from .tasks import BatchLoadTask, EvictTask, ForwardTask, StoreTask, Task
 
 if TYPE_CHECKING:
-    from engine import Engine
-    from plan import ScheduleResult
-    from simulator import Simulator
+    from .engine import Engine
+    from .plan import BatchPlan
+    from .simulator import Simulator
 
 
 def log_config_from_env() -> SimLogConfig:
@@ -85,7 +85,7 @@ class SimLogger:
             return "evict"
         return type(task).__name__
 
-    def _format_schedule(self, scheduled: ScheduleResult) -> str:
+    def _format_schedule(self, scheduled: BatchPlan) -> str:
         if not scheduled.entries and not scheduled.preempted:
             return "empty"
         remote = sum(1 for e in scheduled.entries if e.remote_kv)
@@ -136,7 +136,7 @@ class SimLogger:
             return
         self._write(f"[sim] t={sim.now:.4f} released {count} arrival(s)")
 
-    def on_schedule(self, engine_id: str, sim: Simulator, scheduled: ScheduleResult) -> None:
+    def on_schedule(self, engine_id: str, sim: Simulator, scheduled: BatchPlan) -> None:
         if not self.config.enabled:
             return
         if not self.config.detail and not scheduled.entries and not scheduled.preempted:

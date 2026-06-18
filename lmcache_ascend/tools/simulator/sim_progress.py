@@ -6,10 +6,10 @@ import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from request import RequestPD, RequestStatus
+from .request import RequestPD, RequestStatus
 
 if TYPE_CHECKING:
-    from simulator import Simulator
+    from .simulator import Simulator
 
 
 @dataclass

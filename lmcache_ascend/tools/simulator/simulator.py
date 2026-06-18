@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import time
 
-from engine import Engine
-from events import DecodeSpawn, KvRelease, SimEvent
-from pd import PDConfig
-from plan import BatchWork, ScheduleResult
-from request import RequestPD
-from sim_log import SimLogger
-from sim_progress import SimProgress
-from tasks import TaskPool, TaskStatus
+from .engine import Engine
+from .events import DecodeSpawn, KvRelease, SimEvent
+from .pd import PDConfig
+from .plan import BatchPlan
+from .request import Request, RequestPD, RequestStatus
+from .sim_log import SimLogger
+from .sim_progress import SimProgress
+from .tasks import TaskPool, TaskStatus
 
 
 class Simulator:
@@ -32,14 +32,8 @@ class Simulator:
         self.now = 0.0
         self.log = log
         self.progress = progress
-        self._in_flight: dict[str, BatchWork] = {}
-        self._next_batch_id = 0
+        self._in_flight: dict[str, BatchPlan] = {}
         self.event_steps = 0
-
-    def _alloc_batch_id(self) -> int:
-        batch_id = self._next_batch_id
-        self._next_batch_id += 1
-        return batch_id
 
     def _batch_complete(self, batch_id: int) -> bool:
         tagged = [t for t in self.pool.tasks if t.batch_id == batch_id]
@@ -63,17 +57,14 @@ class Simulator:
         for eng in self.engines.values():
             if eng.engine_id in self._in_flight:
                 continue
-            scheduled = eng.schedule_batch(self.now)
-            if self.log:
-                self.log.on_schedule(eng.engine_id, self, scheduled)
-            if not scheduled.entries:
+            plan = eng.try_schedule_and_execute(self.now)
+            if plan is None:
                 continue
-            batch_id = self._alloc_batch_id()
-            work = eng.make_work(scheduled, batch_id=batch_id, now=self.now)
-            tasks = eng.execute_work(work)
             if self.log:
-                self.log.on_execute(eng.engine_id, self, tasks)
-            self._in_flight[eng.engine_id] = work
+                self.log.on_schedule(eng.engine_id, self, plan)
+                tagged = [t for t in self.pool.tasks if t.batch_id == plan.batch_id]
+                self.log.on_execute(eng.engine_id, self, tagged)
+            self._in_flight[eng.engine_id] = plan
 
     def _next_event_time(self) -> float | None:
         running = self.pool.running()
@@ -129,8 +120,6 @@ class Simulator:
         decode_eng = self.engines.get(event.decode_engine_id)
         if decode_eng is None:
             return
-        from request import Request, RequestStatus
-
         decode_eng.schedule_request(
             Request(
                 event.req_id,
@@ -176,11 +165,11 @@ class Simulator:
 
     def _apply_completed_batches(self) -> bool:
         applied = False
-        for eng_id, work in list(self._in_flight.items()):
-            if not self._batch_complete(work.batch_id):
+        for eng_id, plan in list(self._in_flight.items()):
+            if not self._batch_complete(plan.batch_id):
                 continue
             eng = self.engines[eng_id]
-            finished, remote_kv_done = eng.apply_work(work, self.now)
+            finished, remote_kv_done = eng.apply_plan(plan, self.now)
             del self._in_flight[eng_id]
             applied = True
             if self.log and (finished or remote_kv_done):
@@ -274,6 +263,6 @@ class Simulator:
 
 
 if __name__ == "__main__":
-    from tests.run_tests import main
+    from simulator.tests.run_tests import main
 
     main()

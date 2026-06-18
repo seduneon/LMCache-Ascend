@@ -9,10 +9,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from engine import Engine
-from memory import Memory
-from pd import PDConfig
-from policies import (
+from .engine import Engine
+from .memory import Memory
+from .pd import PDConfig
+from .policies import (
     ComputeOnlyLookupPolicy,
     ConsumeOnPull,
     CostBasedPullLookupPolicy,
@@ -27,13 +27,13 @@ from policies import (
     TieredPlacement,
     UnboundedRetention,
 )
-from request import Request, RequestPD, RequestStatus
-from resource import BandwidthResource, ComputeResource
-from sim_log import SimLogConfig, SimLogger
-from sim_progress import SimProgress, SimProgressConfig
-from simulator import Simulator
-from tasks import TaskPool
-from workload import WorkloadConfig, generate_prefill_workload
+from .request import Request, RequestPD, RequestStatus
+from .resource import BandwidthResource, ComputeResource
+from .sim_log import SimLogConfig, SimLogger
+from .sim_progress import SimProgress, SimProgressConfig
+from .simulator import Simulator
+from .tasks import TaskPool
+from .workload import WorkloadConfig, generate_prefill_workload
 
 
 @dataclass(frozen=True)

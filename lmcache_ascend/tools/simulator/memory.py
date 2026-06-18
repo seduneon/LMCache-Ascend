@@ -3,11 +3,11 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from content_key import ContentKey
+from .content_key import ContentKey
 
 if TYPE_CHECKING:
-    from request import Request
-    from tasks import Task
+    from .request import Request
+    from .tasks import Task
 
 
 class BlockState(StrEnum):
@@ -130,7 +130,7 @@ def collect_content_copies(
     req: Request | None = None,
 ) -> list[tuple[str, KVBlock]]:
     """All resident copies of the same logical content across tiers."""
-    from content_key import tier_storage_key
+    from .content_key import tier_storage_key
 
     copies: list[tuple[str, KVBlock]] = []
     seen: set[tuple[str, int]] = set()

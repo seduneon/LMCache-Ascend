@@ -1,16 +1,17 @@
-"""Pipeline types: schedule intent (``ScheduleResult``) → execute (``BatchWork``)."""
+"""Plan layer: authoritative ``BatchPlan`` consumed mechanically by Execute."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Mapping
 
-from content_key import ContentKey
+from .content_key import ContentKey
+from .task_outcomes import TaskOutcome
 
 if TYPE_CHECKING:
-    from memory import KVBlock
-    from request import Request
-    from resource import BandwidthResource, ComputeResource
+    from .memory import KVBlock
+    from .request import Request
+    from .resource import BandwidthResource, ComputeResource
 
 BlockAction = (
     Literal["compute"]
@@ -21,23 +22,37 @@ BlockActions = dict[str, BlockAction]
 
 
 @dataclass(frozen=True)
-class BlockRef:
-    """Logical block identity for a single HBM slot in a request prefix."""
+class StoreOp:
+    """Async write of one chunk slot to a downstream tier."""
 
-    hbm_hash: str
+    tier_key: str
     content: ContentKey
+    storage_key: str
+    hbm_block_hash: str
 
-    @classmethod
-    def for_hbm(cls, req: Request | None, hbm_hash: str) -> BlockRef:
-        return cls(hbm_hash=hbm_hash, content=ContentKey.for_hbm_block(req, hbm_hash))
+
+@dataclass(frozen=True)
+class RetentionProfile:
+    """Frozen retention knobs planned into outcomes (no live policy in Execute)."""
+
+    kind: Literal["unbounded", "single_copy", "consume_on_pull", "global_cap"] = "unbounded"
+    max_total: int = 0
+    tier_keys: tuple[str, ...] = ()
+    per_tier_cap: int | None = None
 
 
 @dataclass
 class EntryPlan:
-    """Per-request KV intent: HBM evictions + per-block actions."""
+    """Per-request KV intent: all executor-visible memory actions."""
 
     evicts: list[KVBlock] = field(default_factory=list)
     blocks: BlockActions = field(default_factory=dict)
+    store_ops: dict[str, list[StoreOp]] = field(default_factory=dict)
+    spill_store_ops: dict[int, list[StoreOp]] = field(default_factory=dict)
+    spill_reqs: dict[int, Request | None] = field(default_factory=dict)
+    hbm_mirror_tiers: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    resident_outcomes: dict[str, TaskOutcome] = field(default_factory=dict)
+    pull_outcomes: dict[str, TaskOutcome] = field(default_factory=dict)
 
 
 @dataclass
@@ -61,8 +76,8 @@ class ScheduleResult:
 
 
 @dataclass
-class BatchWork:
-    """Fully identified batch flowing through execute → commit."""
+class BatchPlan:
+    """Single batch artifact: schedule output + execute input."""
 
     batch_id: int
     engine_id: str
@@ -70,24 +85,11 @@ class BatchWork:
     entries: list[WorkEntry] = field(default_factory=list)
     preempted: list[Request] = field(default_factory=list)
     total_num_scheduled_tokens: int = 0
+    retention: RetentionProfile = field(default_factory=RetentionProfile)
 
-    @classmethod
-    def from_schedule(
-        cls,
-        scheduled: ScheduleResult,
-        *,
-        batch_id: int,
-        engine_id: str,
-        scheduled_at: float,
-    ) -> BatchWork:
-        return cls(
-            batch_id=batch_id,
-            engine_id=engine_id,
-            scheduled_at=scheduled_at,
-            entries=list(scheduled.entries),
-            preempted=list(scheduled.preempted),
-            total_num_scheduled_tokens=scheduled.total_num_scheduled_tokens,
-        )
+
+# Backward-compatible alias (Phase 3 merged artifact)
+BatchWork = BatchPlan
 
 
 @dataclass(frozen=True)
