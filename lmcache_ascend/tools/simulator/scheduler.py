@@ -2,27 +2,12 @@ from __future__ import annotations
 
 import heapq
 from collections import deque
-from dataclasses import dataclass, field
 
+from kv_controller import KVController
 from memory import Memory
-from policies import LookupPolicy, LookupResult, local_satisfied
+from plan import EntryPlan, ScheduleResult, SimContext, WorkEntry
+from policies import LookupPolicy, local_satisfied
 from request import Request, RequestPD, RequestStatus
-
-
-@dataclass
-class BatchEntry:
-    req: Request
-    block_hashes: list[str]
-    result: LookupResult
-    num_scheduled_tokens: int = 0
-    remote_kv: bool = False
-
-
-@dataclass
-class Batch:
-    entries: list[BatchEntry] = field(default_factory=list)
-    preempted: list[Request] = field(default_factory=list)
-    total_num_scheduled_tokens: int = 0
 
 
 class Scheduler:
@@ -30,7 +15,7 @@ class Scheduler:
 
     def __init__(
         self,
-        policy: LookupPolicy,
+        controller_or_policy: KVController | LookupPolicy,
         memories: dict[str, Memory],
         local_memory: str,
         *,
@@ -40,7 +25,11 @@ class Scheduler:
         enable_chunked_prefill: bool = False,
         remote_kv_wait: bool = False,
     ):
-        self.policy = policy
+        if isinstance(controller_or_policy, KVController):
+            self.controller = controller_or_policy
+        else:
+            self.controller = KVController(controller_or_policy)
+        self.policy = self.controller.policy
         self.memories = memories
         self.local_memory = local_memory
         self.max_num_seqs = max_num_seqs
@@ -54,7 +43,7 @@ class Scheduler:
         self.running: list[Request] = []
         self.completed: list[Request] = []
 
-    def _local(self):
+    def _local(self) -> Memory:
         return self.memories[self.local_memory]
 
     def add_request(self, req: Request) -> None:
@@ -105,10 +94,11 @@ class Scheduler:
     def _waiting_prefix_tokens(self, req: Request) -> int:
         return self._remaining_prefill_tokens(req)
 
-    def _entry_scheduled_tokens(self, entry: BatchEntry) -> int:
+    @staticmethod
+    def _entry_scheduled_tokens(entry: WorkEntry) -> int:
         if entry.remote_kv:
             return 0
-        if not any(action == "compute" for action in entry.result.blocks.values()):
+        if not any(action == "compute" for action in entry.plan.blocks.values()):
             return 0
         return entry.num_scheduled_tokens
 
@@ -142,38 +132,40 @@ class Scheduler:
     def _try_admit_remote_kv(
         self,
         req: Request,
-        batch: Batch,
+        scheduled: ScheduleResult,
         scheduled_ids: set[str],
         *,
         now: float | None = None,
         engine_id: str | None = None,
+        ctx: SimContext | None = None,
     ) -> bool:
         block_hashes = self._prefix_block_hashes(req)
         if not block_hashes:
             return False
 
-        result = self._allocate_blocks(
+        plan = self._allocate_blocks(
             req,
             block_hashes,
             scheduled_ids,
-            batch.preempted,
+            scheduled.preempted,
             pull_only=True,
             now=now,
+            ctx=ctx,
         )
-        if result is None:
+        if plan is None:
             return False
 
-        entry = BatchEntry(
+        entry = WorkEntry(
             req,
             block_hashes,
-            result,
+            plan,
             num_scheduled_tokens=0,
             remote_kv=True,
         )
         req.status = RequestStatus.WAITING_REMOTE_KV
         if now is not None:
             req.metrics.enter_remote_kv(now, engine_id=engine_id)
-        batch.entries.append(entry)
+        scheduled.entries.append(entry)
         scheduled_ids.add(req.req_id)
         return True
 
@@ -200,9 +192,15 @@ class Scheduler:
         self.running.remove(req)
         self.completed.append(req)
 
-    def schedule(self, now: float | None = None, *, engine_id: str | None = None) -> Batch:
-        self.policy.begin_allocate_batch()
-        batch = Batch()
+    def schedule(
+        self,
+        now: float | None = None,
+        *,
+        engine_id: str | None = None,
+        ctx: SimContext | None = None,
+    ) -> ScheduleResult:
+        self.controller.begin_batch()
+        scheduled = ScheduleResult()
         scheduled_ids: set[str] = set()
         token_budget = self.max_num_batched_tokens
 
@@ -219,22 +217,22 @@ class Scheduler:
                 idx += 1
                 continue
 
-            result = self._allocate_blocks(
-                req, block_hashes, scheduled_ids, batch.preempted, now=now
+            plan = self._allocate_blocks(
+                req, block_hashes, scheduled_ids, scheduled.preempted, now=now, ctx=ctx
             )
-            if result is None:
+            if plan is None:
                 idx += 1
                 continue
 
-            entry = BatchEntry(req, block_hashes, result, num_new_tokens)
-            batch.entries.append(entry)
+            entry = WorkEntry(req, block_hashes, plan, num_new_tokens)
+            scheduled.entries.append(entry)
             scheduled_ids.add(req.req_id)
-            scheduled = self._entry_scheduled_tokens(entry)
-            token_budget -= scheduled
-            batch.total_num_scheduled_tokens += scheduled
+            tokens = self._entry_scheduled_tokens(entry)
+            token_budget -= tokens
+            scheduled.total_num_scheduled_tokens += tokens
             idx += 1
 
-        if not batch.preempted:
+        if not scheduled.preempted:
             remote_kv_rotations = 0
             max_rotations = len(self.waiting)
 
@@ -253,7 +251,12 @@ class Scheduler:
 
                 if self._needs_remote_kv(req):
                     if self._try_admit_remote_kv(
-                        req, batch, scheduled_ids, now=now, engine_id=engine_id
+                        req,
+                        scheduled,
+                        scheduled_ids,
+                        now=now,
+                        engine_id=engine_id,
+                        ctx=ctx,
                     ):
                         break
                     break
@@ -267,25 +270,26 @@ class Scheduler:
                 if not self.enable_chunked_prefill and prefix_tokens > token_budget:
                     break
 
-                if self.enable_chunked_prefill:
-                    num_new_tokens = min(prefix_tokens, token_budget)
-                else:
-                    num_new_tokens = prefix_tokens
+                num_new_tokens = (
+                    min(prefix_tokens, token_budget)
+                    if self.enable_chunked_prefill
+                    else prefix_tokens
+                )
 
                 block_hashes = self._blocks_for_prefill_chunk(req, num_new_tokens)
                 if not block_hashes:
                     break
 
-                result = self._allocate_blocks(
-                    req, block_hashes, scheduled_ids, batch.preempted, now=now
+                plan = self._allocate_blocks(
+                    req, block_hashes, scheduled_ids, scheduled.preempted, now=now, ctx=ctx
                 )
-                if result is None:
+                if plan is None:
                     break
 
-                scheduled = self._entry_scheduled_tokens(
-                    BatchEntry(req, block_hashes, result, num_new_tokens)
+                tokens = self._entry_scheduled_tokens(
+                    WorkEntry(req, block_hashes, plan, num_new_tokens)
                 )
-                if scheduled > token_budget:
+                if tokens > token_budget:
                     break
 
                 self.waiting.popleft()
@@ -293,13 +297,13 @@ class Scheduler:
                 if now is not None:
                     req.metrics.enter_running(now, engine_id=engine_id)
                 self.running.append(req)
-                entry = BatchEntry(req, block_hashes, result, num_new_tokens)
-                batch.entries.append(entry)
+                entry = WorkEntry(req, block_hashes, plan, num_new_tokens)
+                scheduled.entries.append(entry)
                 scheduled_ids.add(req.req_id)
-                token_budget -= scheduled
-                batch.total_num_scheduled_tokens += scheduled
+                token_budget -= tokens
+                scheduled.total_num_scheduled_tokens += tokens
 
-        return batch
+        return scheduled
 
     def _blocks_for_running(self, req: Request, num_new_tokens: int) -> list[str]:
         if req.is_prefill_chunk():
@@ -322,17 +326,19 @@ class Scheduler:
         *,
         pull_only: bool = False,
         now: float | None = None,
-    ) -> LookupResult | None:
+        ctx: SimContext | None = None,
+    ) -> EntryPlan | None:
         while True:
-            result = self.policy.lookup(
+            plan = self.controller.plan_blocks(
                 self.memories,
                 block_hashes,
                 allow_compute=not pull_only,
                 req=req,
                 block_size=self.block_size,
+                ctx=ctx,
             )
-            if result is not None:
-                return result
+            if plan is not None:
+                return plan
 
             victim = self._pick_preemption_victim(req, scheduled_ids)
             if victim is None:

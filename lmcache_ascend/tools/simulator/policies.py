@@ -13,18 +13,14 @@ from chunk_hash import (
     transfer_work_units,
 )
 from cost_model import block_recompute_work
+from eviction import EvictionPolicy, LRUEviction
 from memory import BlockState, KVBlock, Memory, collect_content_copies
+from plan import BlockAction, BlockActions
 from request import Request
+from tier_allocator import TierAllocator
 
 if TYPE_CHECKING:
     from resource import BandwidthResource, ComputeResource
-
-BlockAction = (
-    Literal["compute"]
-    | Literal["wait"]
-    | tuple[Literal["pull"], str]
-)
-BlockActions = dict[str, BlockAction]
 
 _LOCAL = Literal["local"]
 BlockResolution = BlockAction | _LOCAL | None
@@ -44,41 +40,6 @@ class StoreOp:
 class LookupResult:
     evicts: list[KVBlock] = field(default_factory=list)
     blocks: BlockActions = field(default_factory=dict)
-
-
-# --- Eviction ---
-
-
-class EvictionPolicy(ABC):
-    @abstractmethod
-    def pick_victims(self, hbm: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
-        pass
-
-    def plan(
-        self, local: Memory, slots_needed: int, exclude: set[str]
-    ) -> list[KVBlock] | None:
-        deficit = slots_needed - local.free_size()
-        if deficit <= 0:
-            return []
-        evicts = self.pick_victims(local, deficit, exclude)
-        if len(evicts) < deficit:
-            return None
-        return evicts
-
-
-class LRUEviction(EvictionPolicy):
-    """Evict resident, unheld blocks with the oldest ``last_touch`` first."""
-
-    def pick_victims(self, hbm: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
-        candidates: list[KVBlock] = []
-        for block_hash, copies in hbm.blocks.items():
-            if block_hash in exclude:
-                continue
-            for block in copies:
-                if hbm.can_evict_block(block):
-                    candidates.append(block)
-        candidates.sort(key=lambda block: block.last_touch)
-        return candidates[:count]
 
 
 # --- Placement ---
@@ -162,6 +123,7 @@ class HBMAndDRAM(PlacementPolicy):
     ):
         self.dram_memory = dram_memory
         self._dram_eviction = dram_eviction_policy or LRUEviction()
+        self._allocator = TierAllocator(self._dram_eviction)
         self._retention: RetentionPolicy = UnboundedRetention()
 
     def bind_retention(self, retention: RetentionPolicy) -> None:
@@ -177,18 +139,18 @@ class HBMAndDRAM(PlacementPolicy):
     ) -> bool:
         dram = memories[self.dram_memory]
         chunk_key = chunk_key_for_hbm_block(req, block_hash, dram.chunk_blocks)
-        if dram.best_resident(chunk_key) is not None:
-            return True
+        if self._allocator.tier_covers(dram, chunk_key):
+            return dram.best_resident(chunk_key) is not None
 
-        exclude = {chunk_key}
-        while dram.free_size() <= 0:
-            victims = self._dram_eviction.pick_victims(dram, 1, exclude)
-            if not victims:
-                return False
-            dram.remove_block(victims[0])
-
-        copy = KVBlock(chunk_key, BlockState.RESIDENT)
-        dram.append(copy)
+        copy = self._allocator.ensure_slot(
+            dram,
+            chunk_key,
+            state=BlockState.RESIDENT,
+            exclude={chunk_key},
+            eviction=self._dram_eviction,
+        )
+        if copy is None:
+            return False
         dram.touch(copy, now)
         self._retention.on_block_resident(
             memories, tier_key=self.dram_memory, block=copy, now=now
@@ -235,13 +197,14 @@ class TieredPlacement(PlacementPolicy):
         self.tier_keys = list(tier_keys)
         self._tier_eviction = tier_eviction or {}
         self._paid_write_tiers = paid_write_tiers or frozenset()
+        self._allocator = TierAllocator()
         self._retention: RetentionPolicy = UnboundedRetention()
 
     def bind_retention(self, retention: RetentionPolicy) -> None:
         self._retention = retention
 
     def _eviction_for(self, tier_key: str) -> EvictionPolicy:
-        return self._tier_eviction.get(tier_key, LRUEviction())
+        return self._allocator.eviction_for(tier_key, self._tier_eviction)
 
     def _ensure_tier_resident_sync(
         self,
@@ -254,20 +217,18 @@ class TieredPlacement(PlacementPolicy):
     ) -> bool:
         tier = memories[tier_key]
         chunk_key = chunk_key_for_hbm_block(req, block_hash, tier.chunk_blocks)
-        if tier.best_resident(chunk_key) is not None:
-            return True
-        if tier.inflight_incoming(chunk_key) is not None:
+        if self._allocator.tier_covers(tier, chunk_key):
             return True
 
-        exclude = {chunk_key}
-        while tier.free_size() <= 0:
-            victims = self._eviction_for(tier_key).pick_victims(tier, 1, exclude)
-            if not victims:
-                return False
-            tier.remove_block(victims[0])
-
-        copy = KVBlock(chunk_key, BlockState.RESIDENT)
-        tier.append(copy)
+        copy = self._allocator.ensure_slot(
+            tier,
+            chunk_key,
+            state=BlockState.RESIDENT,
+            exclude={chunk_key},
+            eviction=self._eviction_for(tier_key),
+        )
+        if copy is None:
+            return False
         tier.touch(copy, now)
         self._retention.on_block_resident(
             memories, tier_key=tier_key, block=copy, now=now
@@ -284,21 +245,13 @@ class TieredPlacement(PlacementPolicy):
     ) -> KVBlock | None:
         tier = memories[tier_key]
         chunk_key = chunk_key_for_hbm_block(req, block_hash, tier.chunk_blocks)
-        if tier.best_resident(chunk_key) is not None:
-            return None
-        if tier.inflight_incoming(chunk_key) is not None:
-            return None
-
-        exclude = {chunk_key}
-        while tier.free_size() <= 0:
-            victims = self._eviction_for(tier_key).pick_victims(tier, 1, exclude)
-            if not victims:
-                return None
-            tier.remove_block(victims[0])
-
-        copy = KVBlock(chunk_key, BlockState.RESERVED)
-        tier.append(copy)
-        return copy
+        return self._allocator.ensure_slot(
+            tier,
+            chunk_key,
+            state=BlockState.RESERVED,
+            exclude={chunk_key},
+            eviction=self._eviction_for(tier_key),
+        )
 
     def place_copy(
         self,

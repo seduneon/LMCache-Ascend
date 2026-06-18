@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from plan import BatchWork, WorkEntry
 from request import Request
 
 
@@ -29,8 +30,26 @@ def block_recompute_work(
     return decode_work(work_per_decode_req)
 
 
-def entry_has_compute(entry) -> bool:
-    return any(action == "compute" for action in entry.result.blocks.values())
+def entry_has_compute(entry: WorkEntry) -> bool:
+    return any(action == "compute" for action in entry.plan.blocks.values())
+
+
+def record_entry_metrics(entry: WorkEntry) -> None:
+    """Update per-request counters from a scheduled work entry."""
+    metrics = entry.req.metrics
+    metrics.evictions += len(entry.plan.evicts)
+    for block_hash in entry.block_hashes:
+        action = entry.plan.blocks.get(block_hash)
+        if action == "compute":
+            metrics.computes += 1
+        elif action == "wait":
+            metrics.remote_waits += 1
+        elif isinstance(action, tuple) and action[0] == "pull":
+            metrics.pulls += 1
+        elif action is None:
+            metrics.local_hits += 1
+    if entry_has_compute(entry):
+        metrics.forward_steps += 1
 
 
 def entry_forward_work(
@@ -49,14 +68,14 @@ def entry_forward_work(
 
 
 def batch_forward_work(
-    batch,
+    work: BatchWork,
     *,
     work_per_prefill_token: float,
     work_per_decode_req: float,
 ) -> float:
     """Total forward work for all compute in a scheduled batch."""
     total = 0.0
-    for entry in batch.entries:
+    for entry in work.entries:
         total += entry_forward_work(
             entry.req,
             num_scheduled_tokens=entry.num_scheduled_tokens,

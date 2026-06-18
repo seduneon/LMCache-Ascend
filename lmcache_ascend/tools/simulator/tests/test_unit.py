@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from batch_context import BatchContext
+from plan import BatchWork, EntryPlan, WorkEntry
 from chunk_hash import (
     chunk_key_for_hbm_block,
     lmcache_chunk_hash,
@@ -26,7 +26,7 @@ from policies import (
     local_satisfied,
 )
 from tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
-from tests.test_helpers import SimpleTask, make_resident
+from tests.test_helpers import SimpleTask, make_resident, make_work
 
 from engine import Engine
 from request import Request, RequestPD, RequestStatus
@@ -840,8 +840,8 @@ def test_batch_load_task_amortizes_work() -> None:
         Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
     )
     eng.release_arrivals(0.0)
-    batch = eng.schedule(0.0)
-    tasks = eng.execute_batch(batch, 0.0, BatchContext(batch_id=0, engine_id="e0"))
+    scheduled = eng.schedule_batch(0.0)
+    tasks = eng.execute_work(eng.make_work(scheduled, batch_id=0, now=0.0))
     assert any(isinstance(t, BatchLoadTask) for t in tasks)
 
     t0 = Simulator([eng], pool).run()
@@ -879,10 +879,10 @@ def test_pull_dedupe_across_requests_in_batch() -> None:
         Request("r2", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
     )
     eng.release_arrivals(0.0)
-    batch = eng.schedule(0.0)
-    assert len(batch.entries) == 2
+    scheduled = eng.schedule_batch(0.0)
+    assert len(scheduled.entries) == 2
 
-    tasks = eng.execute_batch(batch, 0.0, BatchContext(batch_id=0, engine_id="e0"))
+    tasks = eng.execute_work(eng.make_work(scheduled, batch_id=0, now=0.0))
     batch_loads = [t for t in tasks if isinstance(t, BatchLoadTask)]
     assert len(batch_loads) == 1
     assert len(batch_loads[0].blocks) == 8
@@ -912,8 +912,7 @@ def test_sync_evict_frees_before_pull() -> None:
         Request("r1", 0.0, ["new"], RequestPD.PREFILL, RequestStatus.PENDING)
     )
     eng.release_arrivals(0.0)
-    batch = eng.schedule(0.0)
-    eng.execute_batch(batch, 0.0, BatchContext(batch_id=0, engine_id="e0"))
+    eng.execute_work(eng.make_work(eng.schedule_batch(0.0), batch_id=0, now=0.0))
     assert memories["hbm"].best_resident("old") is None
     assert memories["hbm"].find_reserved_for("new", "r1") is not None
 
@@ -962,7 +961,7 @@ def test_global_copy_cap_ssd_chunk_tier() -> None:
     assert len(copies) == 2
 
 
-def test_execute_batch_tags_pool_tasks() -> None:
+def test_execute_work_tags_pool_tasks() -> None:
     pool = TaskPool()
     memories = {
         "hbm": Memory(size=10, name="hbm"),
@@ -986,9 +985,8 @@ def test_execute_batch_tags_pool_tasks() -> None:
         Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
     )
     eng.release_arrivals(0.0)
-    batch = eng.schedule(0.0)
-    batch_ctx = BatchContext(batch_id=3, engine_id="e0")
-    eng.execute_batch(batch, 0.0, batch_ctx)
+    scheduled = eng.schedule_batch(0.0)
+    eng.execute_work(eng.make_work(scheduled, batch_id=3, now=0.0))
 
     tagged = [t for t in pool.tasks if t.batch_id == 3]
     assert tagged
@@ -1066,7 +1064,7 @@ def run_unit_tests() -> None:
         test_global_copy_cap_trims_across_tiers,
         test_content_key_same_across_tiers,
         test_global_copy_cap_ssd_chunk_tier,
-        test_execute_batch_tags_pool_tasks,
+        test_execute_work_tags_pool_tasks,
         test_batch_complete_waits_for_tagged_tasks,
         test_tiered_placement_async_store_e2e,
         test_inflight_remote_source_waits_not_preempts,

@@ -1,22 +1,15 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 
-from batch_context import BatchContext
 from engine import Engine
+from events import DecodeSpawn, KvRelease, SimEvent
 from pd import PDConfig
-from request import Request, RequestPD, RequestStatus
-from scheduler import Batch
+from plan import BatchWork, ScheduleResult
+from request import RequestPD
 from sim_log import SimLogger
 from sim_progress import SimProgress
-from tasks import Task, TaskPool, TaskStatus
-
-
-@dataclass
-class InFlightBatch:
-    batch: Batch
-    batch_id: int
+from tasks import TaskPool, TaskStatus
 
 
 class Simulator:
@@ -39,7 +32,7 @@ class Simulator:
         self.now = 0.0
         self.log = log
         self.progress = progress
-        self._in_flight: dict[str, InFlightBatch] = {}
+        self._in_flight: dict[str, BatchWork] = {}
         self._next_batch_id = 0
         self.event_steps = 0
 
@@ -70,17 +63,17 @@ class Simulator:
         for eng in self.engines.values():
             if eng.engine_id in self._in_flight:
                 continue
-            batch = eng.schedule(self.now)
+            scheduled = eng.schedule_batch(self.now)
             if self.log:
-                self.log.on_schedule(eng.engine_id, self, batch)
-            if not batch.entries:
+                self.log.on_schedule(eng.engine_id, self, scheduled)
+            if not scheduled.entries:
                 continue
             batch_id = self._alloc_batch_id()
-            batch_ctx = BatchContext(batch_id=batch_id, engine_id=eng.engine_id)
-            tasks = eng.execute_batch(batch, self.now, batch_ctx)
+            work = eng.make_work(scheduled, batch_id=batch_id, now=self.now)
+            tasks = eng.execute_work(work)
             if self.log:
                 self.log.on_execute(eng.engine_id, self, tasks)
-            self._in_flight[eng.engine_id] = InFlightBatch(batch=batch, batch_id=batch_id)
+            self._in_flight[eng.engine_id] = work
 
     def _next_event_time(self) -> float | None:
         running = self.pool.running()
@@ -117,23 +110,79 @@ class Simulator:
         self.pool.start_ready(self.now)
         self.pool.compact()
 
-    def _apply_completed_batches(self) -> bool:
-        """Apply batches whose tasks finished; spawn PD decodes. Returns True if any applied."""
-        applied = False
-        completed_by_engine: dict[str, list[Request]] = {}
-        remote_kv_by_engine: dict[str, list[Request]] = {}
+    def dispatch(self, event: SimEvent) -> None:
+        if isinstance(event, KvRelease):
+            prefill_eng = self.engines.get(event.prefill_engine_id)
+            if prefill_eng is None:
+                return
+            prefill = next(
+                (r for r in prefill_eng.completed if r.req_id == event.req_id),
+                None,
+            )
+            if prefill is not None and prefill.kv_held_for_transfer:
+                prefill_eng.release_held_kv(event.req_id)
+                prefill.kv_held_for_transfer = False
+                if self.log:
+                    self.log.on_kv_released(self, event.prefill_engine_id, event.req_id)
+            return
 
-        for eng_id, inflight in list(self._in_flight.items()):
-            if not self._batch_complete(inflight.batch_id):
+        decode_eng = self.engines.get(event.decode_engine_id)
+        if decode_eng is None:
+            return
+        from request import Request, RequestStatus
+
+        decode_eng.schedule_request(
+            Request(
+                event.req_id,
+                event.arrival_time,
+                list(event.prefix_blocks),
+                RequestPD.DECODE,
+                RequestStatus.PENDING,
+                max_output_blocks=event.max_output_blocks,
+                prefix_block_count=event.prefix_block_count,
+                prefill_engine_id=event.prefill_engine_id,
+            )
+        )
+        if self.log:
+            self.log.on_pd_spawn(
+                self,
+                event.prefill_engine_id,
+                event.decode_engine_id,
+                event.req_id,
+            )
+
+    def _events_from_commit(self, eng_id: str, finished) -> list[SimEvent]:
+        events: list[SimEvent] = []
+        for req in finished:
+            if req.pd == RequestPD.DECODE and req.prefill_engine_id is not None:
+                events.append(
+                    KvRelease(req_id=req.req_id, prefill_engine_id=req.prefill_engine_id)
+                )
+            decode_id = self.spawn_map.get(eng_id)
+            if decode_id is None or req.pd != RequestPD.PREFILL:
                 continue
+            events.append(
+                DecodeSpawn(
+                    req_id=req.req_id,
+                    arrival_time=self.now,
+                    prefix_blocks=tuple(req.block_hashes[: req.prefix_block_count]),
+                    max_output_blocks=req.max_output_blocks,
+                    prefix_block_count=req.prefix_block_count,
+                    prefill_engine_id=eng_id,
+                    decode_engine_id=decode_id,
+                )
+            )
+        return events
 
+    def _apply_completed_batches(self) -> bool:
+        applied = False
+        for eng_id, work in list(self._in_flight.items()):
+            if not self._batch_complete(work.batch_id):
+                continue
             eng = self.engines[eng_id]
-            finished, remote_kv_done = eng.apply_batch(inflight.batch, self.now)
-            completed_by_engine[eng_id] = finished
-            remote_kv_by_engine[eng_id] = remote_kv_done
+            finished, remote_kv_done = eng.apply_work(work, self.now)
             del self._in_flight[eng_id]
             applied = True
-
             if self.log and (finished or remote_kv_done):
                 self.log.on_apply(
                     eng_id,
@@ -141,43 +190,8 @@ class Simulator:
                     finished=finished,
                     remote_kv_done=remote_kv_done,
                 )
-
-        for eng_id, finished in completed_by_engine.items():
-            for req in finished:
-                if req.pd == RequestPD.DECODE and req.prefill_engine_id is not None:
-                    prefill_eng = self.engines.get(req.prefill_engine_id)
-                    if prefill_eng is not None:
-                        prefill = next(
-                            (r for r in prefill_eng.completed if r.req_id == req.req_id),
-                            None,
-                        )
-                        if prefill is not None and prefill.kv_held_for_transfer:
-                            prefill_eng.release_held_kv(req.req_id)
-                            prefill.kv_held_for_transfer = False
-                            if self.log:
-                                self.log.on_kv_released(
-                                    self, prefill_eng.engine_id, req.req_id
-                                )
-
-                decode_id = self.spawn_map.get(eng_id)
-                if decode_id is None or req.pd != RequestPD.PREFILL:
-                    continue
-                decode_eng = self.engines[decode_id]
-                decode_eng.schedule_request(
-                    Request(
-                        req.req_id,
-                        self.now,
-                        list(req.block_hashes[: req.prefix_block_count]),
-                        RequestPD.DECODE,
-                        RequestStatus.PENDING,
-                        max_output_blocks=req.max_output_blocks,
-                        prefix_block_count=req.prefix_block_count,
-                        prefill_engine_id=eng_id,
-                    )
-                )
-                if self.log:
-                    self.log.on_pd_spawn(self, eng_id, decode_id, req.req_id)
-
+            for event in self._events_from_commit(eng_id, finished):
+                self.dispatch(event)
         return applied
 
     def step(self) -> bool:
@@ -192,8 +206,7 @@ class Simulator:
             eng.release_arrivals(self.now)
 
         if self.log:
-            released = self._count_new_arrivals(pending_before)
-            self.log.on_arrivals_released(self, released)
+            self.log.on_arrivals_released(self, self._count_new_arrivals(pending_before))
 
         self._schedule_engines()
         self.pool.start_ready(self.now)

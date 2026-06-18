@@ -12,7 +12,7 @@ from tasks import BatchLoadTask, EvictTask, ForwardTask, StoreTask, Task
 
 if TYPE_CHECKING:
     from engine import Engine
-    from scheduler import Batch
+    from plan import ScheduleResult
     from simulator import Simulator
 
 
@@ -85,24 +85,24 @@ class SimLogger:
             return "evict"
         return type(task).__name__
 
-    def _format_batch(self, batch: Batch) -> str:
-        if not batch.entries and not batch.preempted:
+    def _format_schedule(self, scheduled: ScheduleResult) -> str:
+        if not scheduled.entries and not scheduled.preempted:
             return "empty"
-        remote = sum(1 for e in batch.entries if e.remote_kv)
+        remote = sum(1 for e in scheduled.entries if e.remote_kv)
         compute = sum(
             1
-            for e in batch.entries
-            if any(a == "compute" for a in e.result.blocks.values())
+            for e in scheduled.entries
+            if any(a == "compute" for a in e.plan.blocks.values())
         )
         pull = sum(
             1
-            for e in batch.entries
-            if any(isinstance(a, tuple) and a[0] == "pull" for a in e.result.blocks.values())
+            for e in scheduled.entries
+            if any(isinstance(a, tuple) and a[0] == "pull" for a in e.plan.blocks.values())
         )
         return (
-            f"entries={len(batch.entries)} tokens={batch.total_num_scheduled_tokens} "
+            f"entries={len(scheduled.entries)} tokens={scheduled.total_num_scheduled_tokens} "
             f"remote_kv={remote} compute={compute} pull={pull} "
-            f"preempted={len(batch.preempted)}"
+            f"preempted={len(scheduled.preempted)}"
         )
 
     def on_run_start(self, sim: Simulator) -> None:
@@ -136,17 +136,19 @@ class SimLogger:
             return
         self._write(f"[sim] t={sim.now:.4f} released {count} arrival(s)")
 
-    def on_schedule(self, engine_id: str, sim: Simulator, batch: Batch) -> None:
+    def on_schedule(self, engine_id: str, sim: Simulator, scheduled: ScheduleResult) -> None:
         if not self.config.enabled:
             return
-        if not self.config.detail and not batch.entries and not batch.preempted:
+        if not self.config.detail and not scheduled.entries and not scheduled.preempted:
             return
         self._write(
-            f"[sim] t={sim.now:.4f} schedule {engine_id} {self._format_batch(batch)}"
+            f"[sim] t={sim.now:.4f} schedule {engine_id} {self._format_schedule(scheduled)}"
         )
-        if batch.preempted and (self.config.detail or self.step % self.config.step_interval == 0):
-            ids = ",".join(r.req_id for r in batch.preempted[:8])
-            suffix = "..." if len(batch.preempted) > 8 else ""
+        if scheduled.preempted and (
+            self.config.detail or self.step % self.config.step_interval == 0
+        ):
+            ids = ",".join(r.req_id for r in scheduled.preempted[:8])
+            suffix = "..." if len(scheduled.preempted) > 8 else ""
             self._write(f"[sim] t={sim.now:.4f} preempted on {engine_id}: {ids}{suffix}")
 
     def on_execute(self, engine_id: str, sim: Simulator, tasks: list[Task]) -> None:

@@ -24,15 +24,42 @@ Run policy comparisons: `python3.12 simulator.py sweep` (see `sweep.py` for pres
 ### Sound for this tool’s purpose
 
 - Micro-step loop + shared `TaskPool` (cross-engine bandwidth contention)
-- `Scheduler` / `Engine` / `Simulator` split; `LookupResult` as allocate-time SSOT
+- `Scheduler` / `Engine` / `Simulator` split; `EntryPlan` / `BatchWork` as pipeline SSOT
+- `KVController` + `EffectInterpreter` separate plan from execute
 - Pluggable policies; task DAG for evict → pull → forward → store
+- `TierAllocator` for shared downstream tier eviction (placement says *where*)
 - `content_key.py` for tier-independent `ContentKey`; `chunk_hash.py` for tier slot mapping
+
+---
+
+## Pipeline architecture
+
+Data flows in one direction through these modules:
+
+```
+Simulator.step()
+  → Engine.schedule_batch()       # Scheduler + SimContext.capture()
+  → Engine.make_work()            # ScheduleResult → BatchWork
+  → BatchExecutor.execute()       # memory + TaskPool (effect_interpreter.py)
+  → Engine.apply_work()           # advance request cursors
+  → Simulator.dispatch()          # DecodeSpawn / KvRelease PD events
+```
+
+| Module | Role |
+|--------|------|
+| `plan.py` | `ScheduleResult`, `BatchWork`, `EntryPlan`, `SimContext`, `ExecuteResult` |
+| `eviction.py` | `EvictionPolicy`, `LRUEviction` (shared by lookup + tier allocator) |
+| `kv_controller.py` | Planning facade; future joint policy coordinator |
+| `effect_interpreter.py` | `BatchExecutor` + `ResidentEffects` |
+| `tier_allocator.py` | Shared downstream tier slot acquire + eviction |
+| `events.py` | Explicit cross-engine messages (`DecodeSpawn`, `KvRelease`) |
+| `policies.py` | Placement, retention, lookup implementations |
 
 ### Structural limits (read before interpreting sweeps)
 
 | Limit | Effect on experiments |
 |-------|------------------------|
-| **Decoupled policies** | Lookup, eviction, placement, retention do not joint-optimize. Comparing “placement presets” may be dominated by eviction/pull behavior. Prefer isolated knobs or wait for P2 coordinator. |
+| **Decoupled policies** | Lookup, eviction, placement, retention still plan separately inside `KVController`. Joint optimization is the next step. |
 | **Synthetic string hashes** | Prefix sharing is workload-shaped, not content-hash-shaped. Invalid for trace replay or collision/dedup-at-scale claims. |
 | **Schedule vs execute split** | Cost model decides at `schedule()`; `BatchLoadTask` runs once per chunk. Relative pull-vs-recompute ordering is OK; absolute times are approximate. |
 | **Batch-local pull dedupe** | Same chunk pulled once per batch, not across steps/engines. |
@@ -43,7 +70,7 @@ Run policy comparisons: `python3.12 simulator.py sweep` (see `sweep.py` for pres
 
 - Sync eviction at allocate (`sync_evict=True` default)
 - Read/write bandwidth as separate resources per tier
-- Store tasks planned in `execute_batch` (ordered by task DAG, not a background write queue)
+- Store tasks planned in `BatchExecutor.execute()` (ordered by task DAG, not a background write queue)
 - `GlobalCopyCap` uses `ContentKey` + `req` for cross-chunk-tier trimming
 
 ### What sweeps are good for
@@ -102,13 +129,14 @@ CSV adds `ssd_slots_used`, `peak_duplicate_count`.
 
 | Area | Still missing |
 |------|----------------|
-| Architecture | Optional joint policy coordinator |
-| Pull vs recompute | Prefetch queue; multi-hop interconnect; schedule/execute cost alignment |
+| Architecture | Joint planning inside `KVController` (placement + eviction + lookup together) |
+| Pull vs recompute | Prefetch queue; multi-hop interconnect; schedule/execute cost alignment via `QueueSnapshot` |
+| Execution | Task callbacks → `TaskDone` events (interpreter still uses callbacks today) |
 | Placement | Background write queue; spill-vs-drop knob |
 | Retention | Canonical copy semantics; `ConsumeOnPull` + chunk-tier interaction |
 | Eviction | Prefix-aware scoring; decode/prefill watermarks |
 | Infrastructure | Trace replay; isolated single-knob sweeps; tier occupancy time series |
-| Scheduler | PD write mode; cursor at schedule time; pipeline overlap |
+| Scheduler | PD write mode; pipeline overlap |
 
 ---
 
@@ -116,7 +144,7 @@ CSV adds `ssd_slots_used`, `peak_duplicate_count`.
 
 | Priority | Work | Unlocks |
 |----------|------|---------|
-| **P2** | Unified placement + eviction + lookup hook | Joint policies |
+| **P2** | Joint planning in `KVController` | Unified placement + eviction + lookup |
 | **P2** | Trace/workload config + tier occupancy time series in sweep | Production-shaped experiments |
 | **P3** | Prefetch queue, multi-hop links, PD write mode | Production parity |
 
@@ -130,6 +158,7 @@ CSV adds `ssd_slots_used`, `peak_duplicate_count`.
 - ~~P1: in-flight source sharing (`"wait"`)~~
 - ~~P1: sync eviction at allocate~~
 - ~~P1: batch-local pull dedupe~~
+- ~~P2: pipeline refactor (`ScheduleResult` → `BatchWork`, `BatchExecutor`, `TierAllocator`, PD events)~~
 - ~~P2: `ContentKey` + batch-scoped task ownership~~
 - ~~`PlacementPolicy` / `RetentionPolicy` / cost-based pull~~ (prior milestones)
 - ~~PD read mode + KV hold until decode completes~~

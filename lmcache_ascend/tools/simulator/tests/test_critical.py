@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from batch_context import BatchContext
 from memory import BlockState, Memory
+from plan import EntryPlan, WorkEntry
 from policies import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
-from scheduler import Batch, BatchEntry
 from sim_log import SimLogConfig
 from simulator import Simulator
-from tasks import TaskPool, TaskStatus
-from tests.test_helpers import SimpleTask, make_resident
+from tasks import BatchLoadTask, TaskPool, TaskStatus
+from tests.test_helpers import SimpleTask, make_resident, make_work
 
 
 def _pd_engines(
@@ -136,14 +135,13 @@ def test_in_flight_blocks_reschedule() -> None:
     )
     sim = Simulator([eng], pool)
 
-    original = eng.execute_batch
+    original = eng.execute_work
 
-    def guarded_execute(batch: Batch, now: float = 0.0, batch_ctx: BatchContext | None = None):
-        assert batch_ctx is not None
-        assert "e0" not in sim._in_flight, "execute_batch while batch still in flight"
-        return original(batch, now, batch_ctx)
+    def guarded_execute(work: BatchWork):
+        assert "e0" not in sim._in_flight, "execute_work while batch still in flight"
+        return original(work)
 
-    eng.execute_batch = guarded_execute  # type: ignore[method-assign]
+    eng.execute_work = guarded_execute  # type: ignore[method-assign]
 
     sim.run()
     assert len(eng.completed) == 2
@@ -331,8 +329,8 @@ def test_pd_kv_released_only_on_decode_complete() -> None:
 def test_parallel_pull_tasks_start_together() -> None:
     """Pull tasks in one batch depend on evicts only, not on each other."""
     from engine import Engine
-    from policies import LookupResult, OrderedPullLookupPolicy
-    from tasks import BatchLoadTask
+    from policies import OrderedPullLookupPolicy
+    from tests.test_helpers import make_work
 
     pool = TaskPool()
     memories = {
@@ -354,24 +352,19 @@ def test_parallel_pull_tasks_start_together() -> None:
         work_per_transfer=1.0,
     )
 
-    batch = Batch(
-        entries=[
-            BatchEntry(
-                Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.RUNNING),
-                ["a"],
-                LookupResult(blocks={"a": ("pull", "src")}),
-            ),
-            BatchEntry(
-                Request("r2", 0.0, ["b"], RequestPD.DECODE, RequestStatus.RUNNING),
-                ["b"],
-                LookupResult(blocks={"b": ("pull", "src")}),
-            ),
-        ]
+    r1 = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.RUNNING)
+    r1.prefix_block_count = 1
+    r2 = Request("r2", 0.0, ["b"], RequestPD.DECODE, RequestStatus.RUNNING)
+    r2.prefix_block_count = 1
+    work = make_work(
+        [
+            WorkEntry(r1, ["a"], EntryPlan(blocks={"a": ("pull", "src")})),
+            WorkEntry(r2, ["b"], EntryPlan(blocks={"b": ("pull", "src")})),
+        ],
+        engine_id="d",
     )
-    batch.entries[0].req.prefix_block_count = 1
-    batch.entries[1].req.prefix_block_count = 1
 
-    tasks = eng.execute_batch(batch, 0.0, BatchContext(batch_id=0, engine_id="e0"))
+    tasks = eng.execute_work(work)
     pulls = [t for t in tasks if isinstance(t, BatchLoadTask)]
     assert len(pulls) == 2
     for pull in pulls:
