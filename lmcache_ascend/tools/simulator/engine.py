@@ -1,23 +1,21 @@
-from .chunk_hash import chunk_key_for_hbm_block
 from .content_key import ContentKey
 from .effect_interpreter import BatchExecutor, ExecuteContext
 from .kv_controller import KVController
-from .memory import BlockState, KVBlock, Memory, collect_content_copies
-from .plan import BatchPlan, RetentionProfile, ScheduleResult, SimContext, StoreOp, WorkEntry
-from .policies import (
+from .lookup import LookupPolicy
+from .memory import KVBlock, Memory, collect_content_copies
+from .placement import HBMOnly, PlacementPolicy
+from .plan import BatchPlan, RetentionProfile, SimContext, StoreOp, WorkEntry
+from .request import Request, RequestPD, RequestStatus
+from .resource import BandwidthResource, ComputeResource
+from .retention import (
     ConsumeOnPull,
     GlobalCopyCap,
-    HBMOnly,
-    LookupPolicy,
-    PlacementPolicy,
     RetentionPolicy,
     SingleCopyPerTier,
     UnboundedRetention,
 )
-from .request import Request, RequestPD, RequestStatus
-from .resource import BandwidthResource, ComputeResource
 from .scheduler import Scheduler
-from .tasks import Task, TaskPool
+from .tasks import TaskPool
 
 
 class Engine:
@@ -96,9 +94,7 @@ class Engine:
 
         self.controller = KVController(
             policy,
-            local_memory=local_memory,
             placement=self.placement_policy,
-            retention=self.retention_policy,
         )
         self.scheduler = Scheduler(
             self.controller,
@@ -238,6 +234,35 @@ class Engine:
             entry.plan.spill_store_ops[id(victim)] = ops
         return ops
 
+    def _execute_context(self, scheduled_at: float) -> ExecuteContext:
+        return ExecuteContext(
+            pool=self.pool,
+            memories=self.memories,
+            local_memory=self.local_memory,
+            compute_res=self.compute_res,
+            transfer_links=self.transfer_links,
+            write_links=self.write_links,
+            work_per_transfer=self.work_per_transfer,
+            work_per_store=self.work_per_store,
+            work_per_evict=self.work_per_evict,
+            work_per_prefill_token=self.work_per_prefill_token,
+            work_per_decode_req=self.work_per_decode_req,
+            sync_evict=self.sync_evict,
+            scheduled_at=scheduled_at,
+            retention=self.retention_profile,
+            pull_sources=self.policy.pull_sources,
+            on_hbm_evict=self._on_hbm_evict,
+            on_hbm_resident=self._on_hbm_resident,
+            on_tier_resident=self._on_tier_resident,
+            after_pull=self._after_pull,
+            expand_async_stores=self._expand_async_stores,
+            expand_spill=self._expand_spill_stores,
+            peak_duplicate_count=self._peak_duplicate_count,
+        )
+
+    def _execute_plan(self, plan: BatchPlan) -> None:
+        BatchExecutor(self._execute_context(plan.scheduled_at)).execute(plan)
+
     def try_schedule_and_execute(self, now: float) -> BatchPlan | None:
         """Admit → plan → execute in one call; returns ``None`` when idle."""
         scheduled = self.scheduler.schedule(
@@ -258,31 +283,7 @@ class Engine:
             total_num_scheduled_tokens=scheduled.total_num_scheduled_tokens,
             retention=self.retention_profile,
         )
-        ctx = ExecuteContext(
-            pool=self.pool,
-            memories=self.memories,
-            local_memory=self.local_memory,
-            compute_res=self.compute_res,
-            transfer_links=self.transfer_links,
-            write_links=self.write_links,
-            work_per_transfer=self.work_per_transfer,
-            work_per_store=self.work_per_store,
-            work_per_evict=self.work_per_evict,
-            work_per_prefill_token=self.work_per_prefill_token,
-            work_per_decode_req=self.work_per_decode_req,
-            sync_evict=self.sync_evict,
-            scheduled_at=now,
-            retention=self.retention_profile,
-            pull_sources=self.policy.pull_sources,
-            on_hbm_evict=self._on_hbm_evict,
-            on_hbm_resident=self._on_hbm_resident,
-            on_tier_resident=self._on_tier_resident,
-            after_pull=self._after_pull,
-            expand_async_stores=self._expand_async_stores,
-            expand_spill=self._expand_spill_stores,
-            peak_duplicate_count=self._peak_duplicate_count,
-        )
-        BatchExecutor(ctx).execute(plan)
+        self._execute_plan(plan)
         return plan
 
     def apply_plan(self, plan: BatchPlan, now: float) -> tuple[list[Request], list[Request]]:
@@ -322,59 +323,6 @@ class Engine:
 
     def release_held_kv(self, req_id: str) -> None:
         self.memories[self.local_memory].free_request(req_id)
-
-    def schedule_batch(self, now: float) -> ScheduleResult:
-        return self.scheduler.schedule(
-            now,
-            engine_id=self.engine_id,
-            ctx=self.planning_context(now),
-        )
-
-    def make_work(
-        self, scheduled: ScheduleResult, *, batch_id: int, now: float
-    ) -> BatchPlan:
-        return BatchPlan(
-            batch_id=batch_id,
-            engine_id=self.engine_id,
-            scheduled_at=now,
-            entries=list(scheduled.entries),
-            preempted=list(scheduled.preempted),
-            total_num_scheduled_tokens=scheduled.total_num_scheduled_tokens,
-            retention=self.retention_profile,
-        )
-
-    def execute_work(self, work: BatchPlan) -> list[Task]:
-        ctx = ExecuteContext(
-            pool=self.pool,
-            memories=self.memories,
-            local_memory=self.local_memory,
-            compute_res=self.compute_res,
-            transfer_links=self.transfer_links,
-            write_links=self.write_links,
-            work_per_transfer=self.work_per_transfer,
-            work_per_store=self.work_per_store,
-            work_per_evict=self.work_per_evict,
-            work_per_prefill_token=self.work_per_prefill_token,
-            work_per_decode_req=self.work_per_decode_req,
-            sync_evict=self.sync_evict,
-            scheduled_at=work.scheduled_at,
-            retention=self.retention_profile,
-            pull_sources=self.policy.pull_sources,
-            on_hbm_evict=self._on_hbm_evict,
-            on_hbm_resident=self._on_hbm_resident,
-            on_tier_resident=self._on_tier_resident,
-            after_pull=self._after_pull,
-            expand_async_stores=self._expand_async_stores,
-            expand_spill=self._expand_spill_stores,
-            peak_duplicate_count=self._peak_duplicate_count,
-        )
-        BatchExecutor(ctx).execute(work)
-        return [t for t in self.pool.tasks if t.batch_id == work.batch_id]
-
-    def apply_work(
-        self, work: BatchPlan, now: float
-    ) -> tuple[list[Request], list[Request]]:
-        return self.apply_plan(work, now)
 
 
 def _retention_profile(policy: RetentionPolicy) -> RetentionProfile:

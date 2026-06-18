@@ -1,13 +1,12 @@
-"""KV planning: lookup + placement + retention at schedule time (authoritative plan)."""
+"""Schedule-time lookup + EntryPlan enrichment."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .chunk_hash import chunk_key_for_hbm_block
-from .memory import BlockState, KVBlock
-from .plan import EntryPlan, SimContext, StoreOp
-from .policies import LookupPolicy, PlacementPolicy, RetentionPolicy
+from .lookup import LookupPolicy
+from .placement import PlacementPolicy
+from .plan import EntryPlan, SimContext
 from .task_outcomes import TaskOutcome
 
 if TYPE_CHECKING:
@@ -16,20 +15,16 @@ if TYPE_CHECKING:
 
 
 class KVController:
-    """Schedule-time entry point: emits a fully-specified ``EntryPlan`` per request."""
+    """Schedule-time entry point: lookup plus per-block outcome metadata."""
 
     def __init__(
         self,
         lookup: LookupPolicy,
         *,
-        local_memory: str,
         placement: PlacementPolicy | None = None,
-        retention: RetentionPolicy | None = None,
     ):
         self.lookup = lookup
-        self.local_memory = local_memory
         self.placement = placement
-        self.retention = retention
         self.policy = lookup
 
     def begin_batch(self) -> None:
@@ -46,7 +41,7 @@ class KVController:
         ctx: SimContext | None = None,
         known_requests: list[Request] | None = None,
     ) -> EntryPlan | None:
-        result = self.lookup.lookup(
+        plan = self.lookup.lookup(
             memories,
             block_hashes,
             allow_compute=allow_compute,
@@ -54,17 +49,15 @@ class KVController:
             block_size=block_size,
             ctx=ctx,
         )
-        if result is None:
+        if plan is None:
             return None
 
-        plan = result
-        self._plan_hbm_effects(memories, block_hashes, plan, req=req)
+        self._plan_hbm_effects(block_hashes, plan, req=req)
         self._plan_spills(plan, known_requests or [])
         return plan
 
     def _plan_hbm_effects(
         self,
-        memories: dict[str, Memory],
         block_hashes: list[str],
         plan: EntryPlan,
         *,
@@ -90,9 +83,6 @@ class KVController:
                     block_hash=block_hash,
                     src_key=action[1],
                 )
-            if self.placement is None:
-                continue
-            plan.hbm_mirror_tiers[block_hash] = self.placement.mirror_tier_keys()
 
     @staticmethod
     def _req_for_block(block_hash: str, known_requests: list[Request]) -> Request | None:
@@ -106,10 +96,7 @@ class KVController:
         plan: EntryPlan,
         known_requests: list[Request],
     ) -> None:
-        if self.placement is None:
-            return
         for victim in plan.evicts:
-            spill_req = self._req_for_block(victim.hash, known_requests)
-            plan.spill_reqs[id(victim)] = spill_req
-            if spill_req is None:
-                continue
+            plan.spill_reqs[id(victim)] = self._req_for_block(
+                victim.hash, known_requests
+            )

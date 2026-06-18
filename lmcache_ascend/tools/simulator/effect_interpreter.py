@@ -15,8 +15,8 @@ from .chunk_hash import (
 from .content_key import ContentKey
 from .cost_model import batch_forward_work, record_entry_metrics
 from .memory import BlockState, KVBlock, Memory, collect_content_copies
-from .plan import BatchPlan, ExecuteResult, RetentionProfile, StoreOp, WorkEntry
-from .policies import first_resident_pull_source
+from .lookup import first_resident_pull_source
+from .plan import BatchPlan, RetentionProfile, StoreOp, WorkEntry
 from .request import Request
 from .resource import BandwidthResource, ComputeResource
 from .task_outcomes import TaskOutcome
@@ -105,7 +105,7 @@ class BatchExecutor:
     def __init__(self, ctx: ExecuteContext):
         self._ctx = ctx
 
-    def execute(self, work: BatchPlan) -> ExecuteResult:
+    def execute(self, work: BatchPlan) -> None:
         applicator = OutcomeApplicator(
             self._ctx,
             work,
@@ -222,11 +222,6 @@ class BatchExecutor:
                         applicator=applicator,
                     )
 
-        return ExecuteResult(
-            tasks=all_tasks,
-            peak_duplicate_count=self._ctx.peak_duplicate_count,
-        )
-
     def _local(self) -> Memory:
         return self._ctx.memories[self._ctx.local_memory]
 
@@ -238,7 +233,7 @@ class BatchExecutor:
         all_tasks: list[Task],
     ) -> None:
         self._ctx.pool.add(task, prereqs, batch_id=batch_id)
-        all_tasks.append(task            )
+        all_tasks.append(task)
 
     def _reserve(self, entry: WorkEntry, *, now: float) -> None:
         local = self._local()

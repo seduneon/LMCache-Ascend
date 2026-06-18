@@ -118,10 +118,6 @@ class Memory:
         """Record last use time (simulation clock) for LRU eviction."""
         block.touch(t)
 
-    def count_resident(self, block_hash: str) -> int:
-        return len(self.resident_copies(block_hash))
-
-
 def collect_content_copies(
     memories: dict[str, Memory],
     tier_keys: list[str],

@@ -1,7 +1,7 @@
 """KV cache policy-lab simulator (discrete-event, vLLM-shaped scheduler).
 
 Lifecycle:
-  arrive → admit (scheduler) → plan (kv_controller + policies) → execute (BatchExecutor) → commit
+  arrive → admit (scheduler) → plan (kv_controller + lookup) → execute (BatchExecutor) → commit
 
 Public batch API:
   Engine.try_schedule_and_execute(now) → BatchPlan | None
@@ -14,6 +14,6 @@ Layers:
   kv_controller — schedule-time lookup + EntryPlan enrichment (Plan)
   effect_interpreter — mechanical BatchExecutor (Execute)
   plan         — BatchPlan, EntryPlan, StoreOp, SimContext
-  policies     — lookup / placement / retention plugin surface (sweep.py)
+  lookup / placement / retention — plugin surface (sweep.py)
   memory, tasks, resource, request — domain types
 """

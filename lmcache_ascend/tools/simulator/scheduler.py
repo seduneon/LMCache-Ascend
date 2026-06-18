@@ -6,7 +6,7 @@ from collections import deque
 from .kv_controller import KVController
 from .memory import Memory
 from .plan import EntryPlan, ScheduleResult, SimContext, WorkEntry
-from .policies import LookupPolicy, local_satisfied
+from .lookup import LookupPolicy, local_satisfied
 from .request import Request, RequestPD, RequestStatus
 
 
@@ -28,9 +28,7 @@ class Scheduler:
         if isinstance(controller_or_policy, KVController):
             self.controller = controller_or_policy
         else:
-            self.controller = KVController(
-                controller_or_policy, local_memory=local_memory
-            )
+            self.controller = KVController(controller_or_policy)
         self.policy = self.controller.policy
         self.memories = memories
         self.local_memory = local_memory

@@ -12,19 +12,18 @@ from typing import Callable
 from .engine import Engine
 from .memory import Memory
 from .pd import PDConfig
-from .policies import (
+from .lookup import (
     ComputeOnlyLookupPolicy,
-    ConsumeOnPull,
     CostBasedPullLookupPolicy,
-    GlobalCopyCap,
-    HBMAndDRAM,
-    HBMOnly,
     LookupPolicy,
     OrderedPullLookupPolicy,
-    PlacementPolicy,
+)
+from .placement import HBMAndDRAM, HBMOnly, PlacementPolicy, TieredPlacement
+from .retention import (
+    ConsumeOnPull,
+    GlobalCopyCap,
     RetentionPolicy,
     SingleCopyPerTier,
-    TieredPlacement,
     UnboundedRetention,
 )
 from .request import Request, RequestPD, RequestStatus

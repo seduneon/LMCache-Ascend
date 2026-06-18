@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -14,20 +15,26 @@ from simulator.pd import PDConfig
 from simulator.request import Request, RequestPD, RequestStatus
 from simulator.simulator import Simulator
 from simulator.tasks import TaskPool
-from simulator.tests.test_discovery import (
-    ensure_path,
-    run_critical_tests,
-    run_unit_tests,
-)
-from simulator.tests.test_sweep_regression import run_sweep_regression_tests
+
+
+def _run_test_functions(module_name: str) -> None:
+    mod = importlib.import_module(module_name)
+    for name in sorted(n for n in dir(mod) if n.startswith("test_")):
+        getattr(mod, name)()
+        print(f"{name} ok")
+
+
+def run_unit_tests() -> None:
+    _run_test_functions("simulator.tests.test_unit")
+
+
+def run_critical_tests() -> None:
+    _run_test_functions("simulator.tests.test_critical")
 
 
 def run_pd_demo() -> None:
     from simulator.memory import Memory
-    from simulator.policies import (
-        ComputeOnlyLookupPolicy,
-        CostBasedPullLookupPolicy,
-    )
+    from simulator.lookup import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
     from simulator.resource import BandwidthResource, ComputeResource
 
     pool = TaskPool()
@@ -92,7 +99,7 @@ def run_pd_demo() -> None:
 
 def run_deadlock_test() -> None:
     from simulator.memory import Memory
-    from simulator.policies import ComputeOnlyLookupPolicy
+    from simulator.lookup import ComputeOnlyLookupPolicy
     from simulator.resource import ComputeResource
 
     pool = TaskPool()
@@ -144,7 +151,7 @@ def run_deadlock_test() -> None:
 
 def run_limits_test() -> None:
     from simulator.memory import Memory
-    from simulator.policies import ComputeOnlyLookupPolicy
+    from simulator.lookup import ComputeOnlyLookupPolicy
     from simulator.scheduler import Scheduler
 
     memories = {"hbm": Memory(size=100, name="hbm")}
@@ -180,7 +187,7 @@ def run_limits_test() -> None:
 
 def run_chunked_prefill_test() -> None:
     from simulator.memory import Memory
-    from simulator.policies import ComputeOnlyLookupPolicy
+    from simulator.lookup import ComputeOnlyLookupPolicy
     from simulator.resource import ComputeResource
 
     memories = {"hbm": Memory(size=100, name="hbm")}
@@ -217,10 +224,7 @@ def run_chunked_prefill_test() -> None:
 
 def run_pd_read_test() -> None:
     from simulator.memory import Memory
-    from simulator.policies import (
-        ComputeOnlyLookupPolicy,
-        CostBasedPullLookupPolicy,
-    )
+    from simulator.lookup import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
     from simulator.resource import BandwidthResource, ComputeResource
 
     pool = TaskPool()
@@ -276,7 +280,7 @@ def run_pd_read_test() -> None:
 
 def run_remote_kv_admit_test() -> None:
     from simulator.memory import BlockState, Memory
-    from simulator.policies import OrderedPullLookupPolicy
+    from simulator.lookup import OrderedPullLookupPolicy
     from simulator.scheduler import Scheduler
 
     memories = {
@@ -315,7 +319,7 @@ def run_remote_kv_admit_test() -> None:
 
 def run_pd_backpressure_test() -> None:
     from simulator.memory import BlockState, Memory
-    from simulator.policies import OrderedPullLookupPolicy
+    from simulator.lookup import OrderedPullLookupPolicy
     from simulator.scheduler import Scheduler
 
     memories = {
@@ -354,7 +358,7 @@ def run_pd_backpressure_test() -> None:
 
 def run_remote_kv_max_seqs_test() -> None:
     from simulator.memory import BlockState, Memory
-    from simulator.policies import OrderedPullLookupPolicy
+    from simulator.lookup import OrderedPullLookupPolicy
     from simulator.scheduler import Scheduler
 
     memories = {
@@ -389,7 +393,7 @@ def run_remote_kv_max_seqs_test() -> None:
 def run_remote_kv_queue_rotation_test() -> None:
     """WAITING_REMOTE_KV at head does not block unrelated waiting admits behind it."""
     from simulator.memory import Memory
-    from simulator.policies import ComputeOnlyLookupPolicy
+    from simulator.lookup import ComputeOnlyLookupPolicy
     from simulator.scheduler import Scheduler
 
     memories = {"hbm": Memory(size=100, name="hbm")}
@@ -415,7 +419,7 @@ def run_remote_kv_queue_rotation_test() -> None:
 def run_waiting_preempt_test() -> None:
     """WAITING admit uses preempt path when HBM is full."""
     from simulator.memory import BlockState, Memory
-    from simulator.policies import ComputeOnlyLookupPolicy
+    from simulator.lookup import ComputeOnlyLookupPolicy
     from simulator.scheduler import Scheduler
 
     memories = {"hbm": Memory(size=4, name="hbm")}
@@ -443,7 +447,7 @@ def run_waiting_preempt_test() -> None:
 
 def run_pd_config_validation_test() -> None:
     from simulator.memory import Memory
-    from simulator.policies import ComputeOnlyLookupPolicy
+    from simulator.lookup import ComputeOnlyLookupPolicy
     from simulator.resource import ComputeResource
 
     pool = TaskPool()
@@ -520,11 +524,9 @@ _ALL["stress-benchmark"] = [run_stress_benchmark_cli]
 _ALL["stress-seeds"] = [run_stress_seed_sweep_cli]
 _ALL["critical"] = [run_critical_tests]
 _ALL["unit"] = [run_unit_tests]
-_ALL["sweep-regression"] = [run_sweep_regression_tests]
 
 
 def main(argv: list[str] | None = None) -> None:
-    ensure_path()
     argv = argv if argv is not None else sys.argv[1:]
     if argv:
         key = argv[0]

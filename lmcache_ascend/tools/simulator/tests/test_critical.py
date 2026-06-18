@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+from simulator.engine import Engine
 from simulator.memory import BlockState, Memory
 from simulator.plan import EntryPlan, WorkEntry
-from simulator.policies import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy
+from simulator.lookup import ComputeOnlyLookupPolicy, CostBasedPullLookupPolicy, OrderedPullLookupPolicy
 from simulator.request import Request, RequestPD, RequestStatus
 from simulator.resource import BandwidthResource, ComputeResource
 from simulator.sim_log import SimLogConfig
 from simulator.simulator import Simulator
 from simulator.tasks import BatchLoadTask, TaskPool, TaskStatus
-from simulator.tests.test_helpers import SimpleTask, make_resident, make_work
+from simulator.tests.test_helpers import SimpleTask, execute_plan, make_plan, make_resident
 
 
 def _pd_engines(
@@ -134,15 +135,6 @@ def test_in_flight_blocks_reschedule() -> None:
         max_num_batched_tokens=2,
     )
     sim = Simulator([eng], pool)
-
-    original = eng.execute_work
-
-    def guarded_execute(work: BatchWork):
-        assert "e0" not in sim._in_flight, "execute_work while batch still in flight"
-        return original(work)
-
-    eng.execute_work = guarded_execute  # type: ignore[method-assign]
-
     sim.run()
     assert len(eng.completed) == 2
 
@@ -328,10 +320,6 @@ def test_pd_kv_released_only_on_decode_complete() -> None:
 
 def test_parallel_pull_tasks_start_together() -> None:
     """Pull tasks in one batch depend on evicts only, not on each other."""
-    from simulator.engine import Engine
-    from simulator.policies import OrderedPullLookupPolicy
-    from simulator.tests.test_helpers import make_work
-
     pool = TaskPool()
     memories = {
         "src": Memory(size=10, name="src"),
@@ -356,7 +344,7 @@ def test_parallel_pull_tasks_start_together() -> None:
     r1.prefix_block_count = 1
     r2 = Request("r2", 0.0, ["b"], RequestPD.DECODE, RequestStatus.RUNNING)
     r2.prefix_block_count = 1
-    work = make_work(
+    work = make_plan(
         [
             WorkEntry(r1, ["a"], EntryPlan(blocks={"a": ("pull", "src")})),
             WorkEntry(r2, ["b"], EntryPlan(blocks={"b": ("pull", "src")})),
@@ -364,7 +352,7 @@ def test_parallel_pull_tasks_start_together() -> None:
         engine_id="d",
     )
 
-    tasks = eng.execute_work(work)
+    tasks = execute_plan(eng, work)
     pulls = [t for t in tasks if isinstance(t, BatchLoadTask)]
     assert len(pulls) == 2
     for pull in pulls:

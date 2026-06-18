@@ -2,7 +2,21 @@
 
 from __future__ import annotations
 
-from simulator.plan import BatchWork, EntryPlan, WorkEntry
+from simulator.plan import EntryPlan, WorkEntry
+from simulator.eviction import LRUEviction
+from simulator.lookup import (
+    ComputeOnlyLookupPolicy,
+    CostBasedPullLookupPolicy,
+    OrderedPullLookupPolicy,
+    local_satisfied,
+)
+from simulator.placement import HBMAndDRAM, HBMOnly, TieredPlacement
+from simulator.retention import (
+    ConsumeOnPull,
+    GlobalCopyCap,
+    SingleCopyPerTier,
+    UnboundedRetention,
+)
 from simulator.chunk_hash import (
     chunk_key_for_hbm_block,
     lmcache_chunk_hash,
@@ -11,23 +25,9 @@ from simulator.chunk_hash import (
 )
 from simulator.content_key import ContentKey, tier_storage_key
 from simulator.memory import BlockState, KVBlock, Memory, collect_content_copies
-from simulator.policies import (
-    ComputeOnlyLookupPolicy,
-    CostBasedPullLookupPolicy,
-    ConsumeOnPull,
-    GlobalCopyCap,
-    HBMAndDRAM,
-    HBMOnly,
-    LRUEviction,
-    OrderedPullLookupPolicy,
-    SingleCopyPerTier,
-    TieredPlacement,
-    UnboundedRetention,
-    local_satisfied,
-)
 from simulator.tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
 from simulator.task_outcomes import TaskOutcome
-from simulator.tests.test_helpers import SimpleTask, make_resident, make_work
+from simulator.tests.test_helpers import SimpleTask, make_resident
 
 from simulator.engine import Engine
 from simulator.request import Request, RequestPD, RequestStatus
@@ -764,7 +764,7 @@ def test_global_copy_cap_trims_across_tiers() -> None:
         req=req,
     )
 
-    total = sum(mem.count_resident("a") for mem in memories.values())
+    total = sum(len(mem.resident_copies("a")) for mem in memories.values())
     assert total == 2
 
 
@@ -841,8 +841,9 @@ def test_batch_load_task_amortizes_work() -> None:
         Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
     )
     eng.release_arrivals(0.0)
-    scheduled = eng.schedule_batch(0.0)
-    tasks = eng.execute_work(eng.make_work(scheduled, batch_id=0, now=0.0))
+    plan = eng.try_schedule_and_execute(0.0)
+    assert plan is not None
+    tasks = [t for t in pool.tasks if t.batch_id == plan.batch_id]
     assert any(isinstance(t, BatchLoadTask) for t in tasks)
 
     t0 = Simulator([eng], pool).run()
@@ -880,10 +881,11 @@ def test_pull_dedupe_across_requests_in_batch() -> None:
         Request("r2", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
     )
     eng.release_arrivals(0.0)
-    scheduled = eng.schedule_batch(0.0)
-    assert len(scheduled.entries) == 2
+    plan = eng.try_schedule_and_execute(0.0)
+    assert plan is not None
+    assert len(plan.entries) == 2
 
-    tasks = eng.execute_work(eng.make_work(scheduled, batch_id=0, now=0.0))
+    tasks = [t for t in pool.tasks if t.batch_id == plan.batch_id]
     batch_loads = [t for t in tasks if isinstance(t, BatchLoadTask)]
     assert len(batch_loads) == 1
     assert len(batch_loads[0].blocks) == 8
@@ -913,7 +915,8 @@ def test_sync_evict_frees_before_pull() -> None:
         Request("r1", 0.0, ["new"], RequestPD.PREFILL, RequestStatus.PENDING)
     )
     eng.release_arrivals(0.0)
-    eng.execute_work(eng.make_work(eng.schedule_batch(0.0), batch_id=0, now=0.0))
+    plan = eng.try_schedule_and_execute(0.0)
+    assert plan is not None
     assert memories["hbm"].best_resident("old") is None
     assert memories["hbm"].find_reserved_for("new", "r1") is not None
 
@@ -962,7 +965,7 @@ def test_global_copy_cap_ssd_chunk_tier() -> None:
     assert len(copies) == 2
 
 
-def test_execute_work_tags_pool_tasks() -> None:
+def test_execute_plan_tags_pool_tasks() -> None:
     pool = TaskPool()
     memories = {
         "hbm": Memory(size=10, name="hbm"),
@@ -986,12 +989,12 @@ def test_execute_work_tags_pool_tasks() -> None:
         Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.PENDING)
     )
     eng.release_arrivals(0.0)
-    scheduled = eng.schedule_batch(0.0)
-    eng.execute_work(eng.make_work(scheduled, batch_id=3, now=0.0))
+    plan = eng.try_schedule_and_execute(0.0)
+    assert plan is not None
 
-    tagged = [t for t in pool.tasks if t.batch_id == 3]
+    tagged = [t for t in pool.tasks if t.batch_id == plan.batch_id]
     assert tagged
-    assert all(t.batch_id == 3 for t in tagged)
+    assert all(t.batch_id == plan.batch_id for t in tagged)
 
 
 def test_batch_complete_waits_for_tagged_tasks() -> None:

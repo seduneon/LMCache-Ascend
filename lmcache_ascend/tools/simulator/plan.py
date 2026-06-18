@@ -1,4 +1,4 @@
-"""Plan layer: authoritative ``BatchPlan`` consumed mechanically by Execute."""
+"""Plan layer: ``BatchPlan`` consumed by ``BatchExecutor``."""
 
 from __future__ import annotations
 
@@ -50,7 +50,6 @@ class EntryPlan:
     store_ops: dict[str, list[StoreOp]] = field(default_factory=dict)
     spill_store_ops: dict[int, list[StoreOp]] = field(default_factory=dict)
     spill_reqs: dict[int, Request | None] = field(default_factory=dict)
-    hbm_mirror_tiers: dict[str, tuple[str, ...]] = field(default_factory=dict)
     resident_outcomes: dict[str, TaskOutcome] = field(default_factory=dict)
     pull_outcomes: dict[str, TaskOutcome] = field(default_factory=dict)
 
@@ -86,10 +85,6 @@ class BatchPlan:
     preempted: list[Request] = field(default_factory=list)
     total_num_scheduled_tokens: int = 0
     retention: RetentionProfile = field(default_factory=RetentionProfile)
-
-
-# Backward-compatible alias (Phase 3 merged artifact)
-BatchWork = BatchPlan
 
 
 @dataclass(frozen=True)
@@ -130,11 +125,3 @@ class SimContext:
             block_size=block_size,
             queues=QueueSnapshot(compute_depth=compute_depth, link_depth=link_depth),
         )
-
-
-@dataclass
-class ExecuteResult:
-    """Output of ``BatchExecutor.execute()``."""
-
-    tasks: list
-    peak_duplicate_count: int

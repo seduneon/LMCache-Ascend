@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from simulator.engine import Engine
 from simulator.memory import BlockState, Memory
 from simulator.plan import BatchPlan, WorkEntry
 from simulator.tasks import Task
@@ -30,7 +31,9 @@ def make_plan(
     )
 
 
-make_work = make_plan  # backward-compatible alias for tests
+def execute_plan(eng: Engine, plan: BatchPlan) -> list[Task]:
+    eng._execute_plan(plan)
+    return [t for t in eng.pool.tasks if t.batch_id == plan.batch_id]
 
 
 def make_resident(memory: Memory, block_hash: str, req_id: str = "producer") -> None:
