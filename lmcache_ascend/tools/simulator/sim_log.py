@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from request import RequestStatus
-from tasks import EvictTask, ForwardTask, LoadTask, Task
+from tasks import BatchLoadTask, EvictTask, ForwardTask, StoreTask, Task
 
 if TYPE_CHECKING:
     from engine import Engine
@@ -77,8 +77,10 @@ class SimLogger:
     def _task_kind(task: Task) -> str:
         if isinstance(task, ForwardTask):
             return f"fwd×{len(task.blocks)}"
-        if isinstance(task, LoadTask):
-            return "load"
+        if isinstance(task, BatchLoadTask):
+            return f"pull×{len(task.blocks)}"
+        if isinstance(task, StoreTask):
+            return "store"
         if isinstance(task, EvictTask):
             return "evict"
         return type(task).__name__

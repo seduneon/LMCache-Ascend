@@ -8,7 +8,7 @@ Core modules:
   workload    — synthetic PD workload generator
   sweep       — policy preset sweep + CSV export
   memory      — tier slot budgets
-  tasks       — forward / load / evict tasks
+  tasks       — forward / pull / store / evict tasks
   resource    — compute and bandwidth queues
   request     — request state and metrics
   pd          — prefill/decode read-mode config

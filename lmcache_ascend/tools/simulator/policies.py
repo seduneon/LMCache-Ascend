@@ -8,20 +8,12 @@ from typing import TYPE_CHECKING, Literal
 from content_key import ContentKey
 from chunk_hash import (
     chunk_key_for_hbm_block,
-    lmcache_chunk_hash,
     tier_covers_hbm_block,
     tier_inflight_hbm_block,
     transfer_work_units,
 )
 from cost_model import block_recompute_work
-from memory import (
-    BlockState,
-    KVBlock,
-    Memory,
-    collect_content_copies,
-    collect_resident_copies,
-    count_resident_across_tiers,
-)
+from memory import BlockState, KVBlock, Memory, collect_content_copies
 from request import Request
 
 if TYPE_CHECKING:
@@ -72,21 +64,6 @@ class EvictionPolicy(ABC):
         if len(evicts) < deficit:
             return None
         return evicts
-
-
-class FirstAvailableEviction(EvictionPolicy):
-    def pick_victims(self, hbm: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
-        victims: list[KVBlock] = []
-        for block_hash, copies in hbm.blocks.items():
-            if block_hash in exclude:
-                continue
-            for block in copies:
-                if not hbm.can_evict_block(block):
-                    continue
-                victims.append(block)
-                if len(victims) >= count:
-                    return victims
-        return victims
 
 
 class LRUEviction(EvictionPolicy):
@@ -580,23 +557,6 @@ def remote_wait_source(
         if tier_inflight_hbm_block(src, req, block_hash):
             return src_key
     return None
-
-
-def remote_pull_satisfied(
-    memories: dict[str, Memory],
-    pull_sources: list[str],
-    block_hash: str,
-    *,
-    req: Request | None = None,
-) -> bool:
-    """True when a pull source has the chunk resident or an in-flight load/store for it."""
-    for src_key in pull_sources:
-        src = memories[src_key]
-        if tier_covers_hbm_block(src, req, block_hash):
-            return True
-        if tier_inflight_hbm_block(src, req, block_hash):
-            return True
-    return False
 
 
 def first_resident_pull_source(

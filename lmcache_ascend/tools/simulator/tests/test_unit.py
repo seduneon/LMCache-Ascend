@@ -15,7 +15,6 @@ from policies import (
     ComputeOnlyLookupPolicy,
     CostBasedPullLookupPolicy,
     ConsumeOnPull,
-    FirstAvailableEviction,
     GlobalCopyCap,
     HBMAndDRAM,
     HBMOnly,
@@ -26,29 +25,14 @@ from policies import (
     UnboundedRetention,
     local_satisfied,
 )
-from tasks import BatchLoadTask, ForwardTask, StoreTask, Task, TaskPool, TaskStatus
+from tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
+from tests.test_helpers import SimpleTask, make_resident
 
 from engine import Engine
 from request import Request, RequestPD, RequestStatus
 from resource import BandwidthResource, ComputeResource
-from simulator import Simulator
 from scheduler import Scheduler
 from simulator import Simulator
-
-
-class _SimpleTask(Task):
-    def on_start(self) -> None:
-        pass
-
-    def on_end(self) -> None:
-        pass
-
-
-def _make_resident(memory: Memory, block_hash: str, req_id: str = "producer") -> None:
-    memory.append_reserved(block_hash, req_id)
-    block = memory.find_reserved_for(block_hash, req_id)
-    assert block is not None
-    block.state = BlockState.RESIDENT
 
 
 def test_hbm_and_dram_placement_creates_copy() -> None:
@@ -430,8 +414,8 @@ def test_pull_only_rejects_compute_fallback() -> None:
         "src": Memory(size=10, name="src"),
         "dst": Memory(size=10, name="dst"),
     }
-    _make_resident(memories["src"], "a")
-    _make_resident(memories["src"], "b")
+    make_resident(memories["src"], "a")
+    make_resident(memories["src"], "b")
     policy = OrderedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
 
     assert policy.resolve_actions(memories, ["a", "b", "c"])["c"] == "compute"
@@ -442,8 +426,8 @@ def test_task_prereq_ordering() -> None:
     pool = TaskPool()
     res = ComputeResource(base_speed=1.0)
 
-    first = _SimpleTask(1.0, res)
-    second = _SimpleTask(1.0, res)
+    first = SimpleTask(1.0, res)
+    second = SimpleTask(1.0, res)
     pool.add(second, [first])
     pool.add(first, [])
 
@@ -472,7 +456,7 @@ def test_finish_frees_kv() -> None:
     sched = Scheduler(ComputeOnlyLookupPolicy("hbm"), memories, "hbm")
     req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
     req.prefix_block_count = 1
-    _make_resident(memories["hbm"], "a", "r1")
+    make_resident(memories["hbm"], "a", "r1")
     sched.running.append(req)
 
     sched.finish_request(req)
@@ -486,8 +470,8 @@ def test_cost_model_picks_faster_pull_source() -> None:
         "slow": Memory(size=10, name="slow"),
         "dst": Memory(size=10, name="dst"),
     }
-    _make_resident(memories["fast"], "a")
-    _make_resident(memories["slow"], "a")
+    make_resident(memories["fast"], "a")
+    make_resident(memories["slow"], "a")
 
     fast_link = BandwidthResource(base_speed=10.0)
     slow_link = BandwidthResource(base_speed=1.0)
@@ -508,7 +492,7 @@ def test_cost_model_prefers_compute_under_load() -> None:
         "src": Memory(size=10, name="src"),
         "dst": Memory(size=10, name="dst"),
     }
-    _make_resident(memories["src"], "a")
+    make_resident(memories["src"], "a")
 
     compute_res = ComputeResource(base_speed=10.0)
     congested_link = BandwidthResource(base_speed=1.0)
@@ -532,7 +516,7 @@ def test_cost_model_prefill_recompute_expensive() -> None:
         "src": Memory(size=10, name="src"),
         "dst": Memory(size=10, name="dst"),
     }
-    _make_resident(memories["src"], "a")
+    make_resident(memories["src"], "a")
 
     req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
     req.prefix_block_count = 1
@@ -561,7 +545,7 @@ def test_cost_model_decode_recompute_cheap() -> None:
         "src": Memory(size=10, name="src"),
         "dst": Memory(size=10, name="dst"),
     }
-    _make_resident(memories["src"], "a")
+    make_resident(memories["src"], "a")
 
     req = Request(
         "r1",
@@ -595,8 +579,8 @@ def test_cost_model_pending_pulls_in_allocation() -> None:
         "src": Memory(size=10, name="src"),
         "dst": Memory(size=10, name="dst"),
     }
-    _make_resident(memories["src"], "a")
-    _make_resident(memories["src"], "b")
+    make_resident(memories["src"], "a")
+    make_resident(memories["src"], "b")
 
     req = Request("r1", 0.0, ["a", "b"], RequestPD.PREFILL, RequestStatus.RUNNING)
     req.prefix_block_count = 2
@@ -623,7 +607,7 @@ def test_cost_model_link_scheduled_load() -> None:
         "src": Memory(size=10, name="src"),
         "dst": Memory(size=10, name="dst"),
     }
-    _make_resident(memories["src"], "a")
+    make_resident(memories["src"], "a")
 
     compute_res = ComputeResource(base_speed=10.0)
     link = BandwidthResource(base_speed=2.0, latency=0.0)
@@ -646,7 +630,7 @@ def test_cost_model_pull_only_ignores_compute() -> None:
         "src": Memory(size=10, name="src"),
         "dst": Memory(size=10, name="dst"),
     }
-    _make_resident(memories["src"], "a")
+    make_resident(memories["src"], "a")
 
     compute_res = ComputeResource(base_speed=100.0)
     slow_link = BandwidthResource(base_speed=0.1)

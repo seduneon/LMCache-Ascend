@@ -122,34 +122,6 @@ class Memory:
         return len(self.resident_copies(block_hash))
 
 
-def count_resident_across_tiers(
-    memories: dict[str, Memory],
-    tier_keys: list[str],
-    content_key: str,
-) -> int:
-    total = 0
-    for key in tier_keys:
-        mem = memories.get(key)
-        if mem is not None:
-            total += mem.count_resident(content_key)
-    return total
-
-
-def collect_resident_copies(
-    memories: dict[str, Memory],
-    tier_keys: list[str],
-    content_key: str,
-) -> list[tuple[str, KVBlock]]:
-    copies: list[tuple[str, KVBlock]] = []
-    for key in tier_keys:
-        mem = memories.get(key)
-        if mem is None:
-            continue
-        for block in mem.resident_copies(content_key):
-            copies.append((key, block))
-    return copies
-
-
 def collect_content_copies(
     memories: dict[str, Memory],
     tier_keys: list[str],

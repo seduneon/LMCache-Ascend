@@ -7,7 +7,7 @@ from chunk_hash import (
     tier_covers_hbm_block,
     tier_inflight_hbm_block,
 )
-from content_key import ContentKey, content_from_resident
+from content_key import ContentKey
 from cost_model import batch_forward_work, entry_has_compute
 from memory import BlockState, KVBlock, Memory, collect_content_copies
 from policies import (
@@ -16,6 +16,7 @@ from policies import (
     LookupResult,
     PlacementPolicy,
     RetentionPolicy,
+    StoreOp,
     UnboundedRetention,
     first_resident_pull_source,
 )
@@ -174,7 +175,7 @@ class Engine:
     def _track_duplicates(
         self, req: Request | None, tier_key: str, block_hash: str
     ) -> None:
-        content = content_from_resident(req, tier_key, block_hash, self.memories)
+        content = ContentKey.for_storage_key(block_hash)
         count = len(
             collect_content_copies(
                 self.memories,
@@ -184,6 +185,68 @@ class Engine:
             )
         )
         self._peak_duplicate_count = max(self._peak_duplicate_count, count)
+
+    def _append_store_op(
+        self,
+        op: StoreOp,
+        *,
+        req: Request,
+        hbm_hashes: list[str],
+        prereqs: list[Task],
+        batch_ctx: BatchContext,
+        all_tasks: list[Task],
+        on_resident,
+        store_tasks: list[Task] | None = None,
+    ) -> bool:
+        tier_block = self._tier_block_for_store(op)
+        if tier_block is None:
+            return False
+        link = self.write_links.get(op.tier_key)
+        if link is None:
+            return False
+        tier = self.memories[op.tier_key]
+        store_work = self.work_per_store * chunk_transfer_work(tier, req, hbm_hashes)
+        store = StoreTask(
+            work_left=store_work,
+            resource=link,
+            tier=tier,
+            tier_block=tier_block,
+            on_resident=on_resident,
+        )
+        self._pool_add(store, prereqs, batch_ctx, all_tasks)
+        if store_tasks is not None:
+            store_tasks.append(store)
+        return True
+
+    def _schedule_async_stores(
+        self,
+        ops: list[StoreOp],
+        *,
+        req: Request,
+        hbm_hash: str,
+        prereqs: list[Task],
+        batch_ctx: BatchContext,
+        all_tasks: list[Task],
+        seen_store: set[tuple[str, ContentKey]],
+        store_tasks: list[Task] | None = None,
+    ) -> None:
+        for op in ops:
+            dedupe = (op.tier_key, op.content)
+            if dedupe in seen_store:
+                continue
+            seen_store.add(dedupe)
+            self._append_store_op(
+                op,
+                req=req,
+                hbm_hashes=[hbm_hash],
+                prereqs=prereqs,
+                batch_ctx=batch_ctx,
+                all_tasks=all_tasks,
+                on_resident=lambda b, t, tk=op.tier_key, r=req: self._on_tier_block_resident(
+                    tk, b, r, t
+                ),
+                store_tasks=store_tasks,
+            )
 
     def _on_block_resident(self, block: KVBlock, req: Request, now: float) -> None:
         self.placement_policy.place_copy(
@@ -272,17 +335,6 @@ class Engine:
             if spill_stores:
                 local = self._local()
                 for op in spill_stores:
-                    tier_block = self._tier_block_for_store(op)
-                    if tier_block is None:
-                        continue
-                    link = self.write_links.get(op.tier_key)
-                    if link is None:
-                        continue
-                    tier = self.memories[op.tier_key]
-                    store_work = self.work_per_store * chunk_transfer_work(
-                        tier, spill_req, [victim.hash]
-                    )
-
                     def on_spill_done(
                         b: KVBlock,
                         t: float,
@@ -293,14 +345,15 @@ class Engine:
                         self._on_tier_block_resident(tk, b, r, t)
                         local.remove_block(v)
 
-                    store = StoreTask(
-                        work_left=store_work,
-                        resource=link,
-                        tier=tier,
-                        tier_block=tier_block,
+                    self._append_store_op(
+                        op,
+                        req=spill_req,
+                        hbm_hashes=[victim.hash],
+                        prereqs=[],
+                        batch_ctx=batch_ctx,
+                        all_tasks=all_tasks,
                         on_resident=on_spill_done,
                     )
-                    self._pool_add(store, [], batch_ctx, all_tasks)
                 return
         self._local().remove_block(victim)
 
@@ -379,32 +432,16 @@ class Engine:
                 block_hash=block_hash,
                 req=entry.req,
             )
-            for op in ops:
-                dedupe = (op.tier_key, op.content)
-                if dedupe in seen_store:
-                    continue
-                seen_store.add(dedupe)
-                tier_block = self._tier_block_for_store(op)
-                if tier_block is None:
-                    continue
-                write_link = self.write_links.get(op.tier_key)
-                if write_link is None:
-                    continue
-                tier = self.memories[op.tier_key]
-                store_work = self.work_per_store * chunk_transfer_work(
-                    tier, entry.req, [block_hash]
-                )
-                store = StoreTask(
-                    work_left=store_work,
-                    resource=write_link,
-                    tier=tier,
-                    tier_block=tier_block,
-                    on_resident=lambda b, t, tk=op.tier_key, r=entry.req: self._on_tier_block_resident(
-                        tk, b, r, t
-                    ),
-                )
-                self._pool_add(store, [pull_task], batch_ctx, all_tasks)
-                store_tasks.append(store)
+            self._schedule_async_stores(
+                ops,
+                req=entry.req,
+                hbm_hash=block_hash,
+                prereqs=[pull_task],
+                batch_ctx=batch_ctx,
+                all_tasks=all_tasks,
+                seen_store=seen_store,
+                store_tasks=store_tasks,
+            )
 
     def execute_batch(
         self, batch: Batch, now: float, batch_ctx: BatchContext
@@ -506,32 +543,16 @@ class Engine:
                     block_hash=block.hash,
                     req=req,
                 )
-                for op in ops:
-                    dedupe = (op.tier_key, op.content)
-                    if dedupe in seen_store:
-                        continue
-                    seen_store.add(dedupe)
-                    tier_block = self._tier_block_for_store(op)
-                    if tier_block is None:
-                        continue
-                    link = self.write_links.get(op.tier_key)
-                    if link is None:
-                        continue
-                    tier = self.memories[op.tier_key]
-                    store_work = self.work_per_store * chunk_transfer_work(
-                        tier, req, [block.hash]
-                    )
-                    store = StoreTask(
-                        work_left=store_work,
-                        resource=link,
-                        tier=tier,
-                        tier_block=tier_block,
-                        on_resident=lambda b, t, tk=op.tier_key, r=req: self._on_tier_block_resident(
-                            tk, b, r, t
-                        ),
-                    )
-                    self._pool_add(store, [forward], batch_ctx, all_tasks)
-                    store_tasks.append(store)
+                self._schedule_async_stores(
+                    ops,
+                    req=req,
+                    hbm_hash=block.hash,
+                    prereqs=[forward],
+                    batch_ctx=batch_ctx,
+                    all_tasks=all_tasks,
+                    seen_store=seen_store,
+                    store_tasks=store_tasks,
+                )
 
         return all_tasks
 

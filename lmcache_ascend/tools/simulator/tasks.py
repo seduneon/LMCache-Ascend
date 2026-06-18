@@ -188,30 +188,6 @@ class ForwardTask(Task):
                 self._on_resident(block, self.now)
 
 
-class LoadTask(MemoryTask):
-    def __init__(
-        self,
-        work_left: float,
-        resource: Resource,
-        memory: Memory,
-        block: KVBlock,
-        on_resident: Callable[[KVBlock, float], None] | None = None,
-    ):
-        super().__init__(work_left, resource, memory, block)
-        self._on_resident = on_resident
-
-    def on_start(self) -> None:
-        self.block.state = BlockState.LOADING
-        self.block.task = self
-
-    def on_end(self) -> None:
-        self.block.state = BlockState.RESIDENT
-        self.block.task = None
-        self.memory.touch(self.block, self.now)
-        if self._on_resident is not None:
-            self._on_resident(self.block, self.now)
-
-
 class BatchLoadTask(Task):
     """Pull multiple HBM blocks in one transfer (chunk latency amortized once)."""
 

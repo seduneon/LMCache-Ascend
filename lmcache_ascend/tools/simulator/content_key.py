@@ -62,13 +62,3 @@ def tier_storage_key(
     if mem.chunk_blocks <= 1:
         return hbm_hash
     return chunk_key_for_hbm_block(req, hbm_hash, mem.chunk_blocks)
-
-
-def content_from_resident(
-    req: Request | None,
-    tier_key: str,
-    storage_key: str,
-    memories: dict[str, Memory],
-) -> ContentKey:
-    """Map a resident tier slot back to logical content."""
-    return ContentKey.for_storage_key(storage_key)

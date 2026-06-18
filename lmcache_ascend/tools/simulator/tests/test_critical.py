@@ -10,22 +10,8 @@ from resource import BandwidthResource, ComputeResource
 from scheduler import Batch, BatchEntry
 from sim_log import SimLogConfig
 from simulator import Simulator
-from tasks import Task, TaskPool, TaskStatus
-
-
-class _SimpleTask(Task):
-    def on_start(self) -> None:
-        pass
-
-    def on_end(self) -> None:
-        pass
-
-
-def _make_resident(memory: Memory, block_hash: str, req_id: str = "producer") -> None:
-    memory.append_reserved(block_hash, req_id)
-    block = memory.find_reserved_for(block_hash, req_id)
-    assert block is not None
-    block.state = BlockState.RESIDENT
+from tasks import TaskPool, TaskStatus
+from tests.test_helpers import SimpleTask, make_resident
 
 
 def _pd_engines(
@@ -354,7 +340,7 @@ def test_parallel_pull_tasks_start_together() -> None:
         "dst": Memory(size=10, name="dst"),
     }
     for block_hash in ("a", "b"):
-        _make_resident(memories["src"], block_hash)
+        make_resident(memories["src"], block_hash)
 
     eng = Engine(
         "d",
@@ -397,7 +383,7 @@ def test_parallel_pull_tasks_start_together() -> None:
 
 def test_task_latency_before_work() -> None:
     res = ComputeResource(base_speed=2.0, latency=0.25)
-    task = _SimpleTask(1.0, res)
+    task = SimpleTask(1.0, res)
     task.reserve_resource()
     task.start(1.0)
     assert task.now == 1.25
