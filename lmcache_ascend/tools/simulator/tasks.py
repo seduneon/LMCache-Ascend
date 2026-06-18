@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from enum import StrEnum
 
 from .memory import BlockState, KVBlock, Memory
 from .resource import Resource
-from .task_outcomes import OutcomeHandler, TaskOutcome
+
+BlockCallback = Callable[[KVBlock, float], None]
 
 
 class TaskStatus(StrEnum):
@@ -27,7 +29,6 @@ class Task(ABC):
         self.status = TaskStatus.PENDING
         self.batch_id: int | None = None
         self._resource_reserved = False
-        self.outcome_handler: OutcomeHandler | None = None
 
     def reserve_resource(self) -> None:
         if self._resource_reserved:
@@ -82,10 +83,6 @@ class Task(ABC):
         self.resource.finish()
         self.on_end()
         self.status = TaskStatus.COMPLETED
-
-    def _emit(self, outcome: TaskOutcome, block: KVBlock) -> None:
-        if self.outcome_handler is not None:
-            self.outcome_handler(outcome, block, self.now)
 
     @abstractmethod
     def on_start(self) -> None:
@@ -172,14 +169,11 @@ class ForwardTask(Task):
         work_left: float,
         resource: Resource,
         blocks: list[KVBlock],
-        block_outcomes: dict[int, TaskOutcome],
-        *,
-        outcome_handler: OutcomeHandler | None = None,
+        block_callbacks: dict[int, BlockCallback] | None = None,
     ):
         super().__init__(work_left, resource)
         self.blocks = blocks
-        self._block_outcomes = block_outcomes
-        self.outcome_handler = outcome_handler
+        self._block_callbacks = block_callbacks or {}
 
     def on_start(self) -> None:
         for block in self.blocks:
@@ -189,9 +183,9 @@ class ForwardTask(Task):
         for block in self.blocks:
             block.state = BlockState.RESIDENT
             block.touch(self.now)
-            outcome = self._block_outcomes.get(id(block))
-            if outcome is not None:
-                self._emit(outcome, block)
+            callback = self._block_callbacks.get(id(block))
+            if callback is not None:
+                callback(block, self.now)
 
 
 class BatchLoadTask(Task):
@@ -203,22 +197,19 @@ class BatchLoadTask(Task):
         resource: Resource,
         memory: Memory,
         blocks: list[KVBlock],
-        block_outcomes: dict[int, TaskOutcome],
-        *,
-        outcome_handler: OutcomeHandler | None = None,
+        block_callbacks: dict[int, BlockCallback],
     ):
         super().__init__(work_left, resource)
         self.memory = memory
         self.blocks = list(blocks)
-        self._block_outcomes = dict(block_outcomes)
-        self.outcome_handler = outcome_handler
+        self._block_callbacks = dict(block_callbacks)
 
-    def add_block(self, block: KVBlock, outcome: TaskOutcome) -> None:
+    def add_block(self, block: KVBlock, callback: BlockCallback) -> None:
         """Attach another destination block before the task starts (pull dedupe)."""
         assert self.status == TaskStatus.PENDING, "cannot extend pull after start"
         self.blocks.append(block)
         block.task = self
-        self._block_outcomes[id(block)] = outcome
+        self._block_callbacks[id(block)] = callback
 
     def on_start(self) -> None:
         for block in self.blocks:
@@ -230,9 +221,9 @@ class BatchLoadTask(Task):
             block.state = BlockState.RESIDENT
             block.task = None
             self.memory.touch(block, self.now)
-            outcome = self._block_outcomes.get(id(block))
-            if outcome is not None:
-                self._emit(outcome, block)
+            callback = self._block_callbacks.get(id(block))
+            if callback is not None:
+                callback(block, self.now)
 
 
 class StoreTask(Task):
@@ -244,15 +235,13 @@ class StoreTask(Task):
         resource: Resource,
         tier: Memory,
         tier_block: KVBlock,
-        outcome: TaskOutcome,
         *,
-        outcome_handler: OutcomeHandler | None = None,
+        on_complete: BlockCallback | None = None,
     ):
         super().__init__(work_left, resource)
         self.tier = tier
         self.tier_block = tier_block
-        self._outcome = outcome
-        self.outcome_handler = outcome_handler
+        self._on_complete = on_complete
 
     def on_start(self) -> None:
         self.tier_block.state = BlockState.LOADING
@@ -262,7 +251,8 @@ class StoreTask(Task):
         self.tier_block.state = BlockState.RESIDENT
         self.tier_block.task = None
         self.tier.touch(self.tier_block, self.now)
-        self._emit(self._outcome, self.tier_block)
+        if self._on_complete is not None:
+            self._on_complete(self.tier_block, self.now)
 
 
 class EvictTask(MemoryTask):
@@ -272,17 +262,15 @@ class EvictTask(MemoryTask):
         resource: Resource,
         memory: Memory,
         block: KVBlock,
-        outcome: TaskOutcome | None = None,
         *,
-        outcome_handler: OutcomeHandler | None = None,
+        on_evict_before: BlockCallback | None = None,
     ):
         super().__init__(work_left, resource, memory, block)
-        self._outcome = outcome
-        self.outcome_handler = outcome_handler
+        self._on_evict_before = on_evict_before
 
     def on_start(self) -> None:
-        if self._outcome is not None:
-            self._emit(self._outcome, self.block)
+        if self._on_evict_before is not None:
+            self._on_evict_before(self.block, self.now)
         self.block.state = BlockState.EVICTING
         self.block.task = self
 

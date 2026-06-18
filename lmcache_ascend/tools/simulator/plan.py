@@ -1,4 +1,4 @@
-"""Plan layer: ``BatchPlan`` consumed by ``BatchExecutor``."""
+"""Plan layer: ``BatchPlan`` consumed by ``BatchRunner``."""
 
 from __future__ import annotations
 

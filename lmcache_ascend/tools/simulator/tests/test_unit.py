@@ -25,7 +25,6 @@ from simulator.chunk_hash import (
 from simulator.content_key import ContentKey, tier_storage_key
 from simulator.memory import BlockState, KVBlock, Memory, collect_content_copies
 from simulator.tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
-from simulator.task_outcomes import TaskOutcome
 from simulator.tests.test_helpers import SimpleTask, make_resident
 
 from simulator.engine import Engine
@@ -825,13 +824,7 @@ def test_batch_complete_waits_for_tagged_tasks() -> None:
     ssd.append(tier_block)
 
     forward = ForwardTask(2.0, compute, [reserved], {})
-    store = StoreTask(
-        4.0,
-        write,
-        ssd,
-        tier_block,
-        TaskOutcome(kind="tier_resident", req_id="r", block_hash="a", tier_key="ssd"),
-    )
+    store = StoreTask(4.0, write, ssd, tier_block)
     pool.add(forward, [], batch_id=5)
     pool.add(store, [forward], batch_id=5)
 

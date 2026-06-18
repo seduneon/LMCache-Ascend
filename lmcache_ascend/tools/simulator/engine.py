@@ -1,5 +1,5 @@
 from .content_key import ContentKey
-from .effect_interpreter import BatchExecutor, ExecuteContext
+from .execute import BatchRunner
 from .lookup import LookupPolicy
 from .memory import KVBlock, Memory, collect_content_copies
 from .placement import HBMOnly, PlacementPolicy
@@ -220,35 +220,8 @@ class Engine:
             entry.plan.spill_store_ops[id(victim)] = ops
         return ops
 
-    def _execute_context(self, scheduled_at: float) -> ExecuteContext:
-        return ExecuteContext(
-            pool=self.pool,
-            memories=self.memories,
-            local_memory=self.local_memory,
-            compute_res=self.compute_res,
-            transfer_links=self.transfer_links,
-            write_links=self.write_links,
-            work_per_transfer=self.work_per_transfer,
-            work_per_store=self.work_per_store,
-            work_per_evict=self.work_per_evict,
-            work_per_prefill_token=self.work_per_prefill_token,
-            work_per_decode_req=self.work_per_decode_req,
-            sync_evict=self.sync_evict,
-            scheduled_at=scheduled_at,
-            retention=self.retention_profile,
-            pull_sources=self.policy.pull_sources,
-            resolve_spill_req=self._resolve_spill_req,
-            on_hbm_evict=self._on_hbm_evict,
-            on_hbm_resident=self._on_hbm_resident,
-            on_tier_resident=self._on_tier_resident,
-            after_pull=self._after_pull,
-            expand_async_stores=self._expand_async_stores,
-            expand_spill=self._expand_spill_stores,
-            peak_duplicate_count=self._peak_duplicate_count,
-        )
-
     def _execute_plan(self, plan: BatchPlan) -> None:
-        BatchExecutor(self._execute_context(plan.scheduled_at)).execute(plan)
+        BatchRunner(self, plan.scheduled_at).run(plan)
 
     def try_schedule_and_execute(self, now: float) -> BatchPlan | None:
         """Admit → plan → execute in one call; returns ``None`` when idle."""
