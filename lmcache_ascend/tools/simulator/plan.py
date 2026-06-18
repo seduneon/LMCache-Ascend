@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from .content_key import ContentKey
+from .kv_content import ContentKey
 
 if TYPE_CHECKING:
     from .memory import KVBlock

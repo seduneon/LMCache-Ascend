@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
-from .chunk_hash import (
-    chunk_key_for_hbm_block,
-    chunk_transfer_work,
-    group_pull_blocks,
-    pull_dedupe_key,
-    tier_covers_hbm_block,
-    tier_inflight_hbm_block,
+from .kv_content import (
+    ContentKey,
+    group_pulls,
+    shared_pull_key,
+    storage_key,
+    tier_has_block,
+    tier_has_inflight,
+    transfer_work,
 )
-from .content_key import ContentKey
 from .cost_model import batch_forward_work, record_entry_metrics
 from .lookup import first_resident_pull_source
 from .memory import BlockState, KVBlock, Memory
@@ -71,7 +71,7 @@ class BatchRunner:
                     self._add_task(task, [], plan.batch_id)
                     evict_tasks.append(task)
 
-            for src_key, group_hashes in group_pull_blocks(
+            for src_key, group_hashes in group_pulls(
                 entry.block_hashes,
                 entry.plan.blocks,
                 entry.req,
@@ -199,11 +199,11 @@ class BatchRunner:
     def _attach_remote_wait(self, req: Request, block_hash: str) -> None:
         for src_key in self._engine.policy.pull_sources:
             src = self._engine.memories[src_key]
-            if tier_covers_hbm_block(src, req, block_hash):
+            if tier_has_block(src, req, block_hash):
                 continue
-            if tier_inflight_hbm_block(src, req, block_hash):
-                storage_key = chunk_key_for_hbm_block(req, block_hash, src.chunk_blocks)
-                inflight = src.inflight_incoming(storage_key)
+            if tier_has_inflight(src, req, block_hash):
+                slot = storage_key(req, block_hash, src.chunk_blocks)
+                inflight = src.inflight_incoming(slot)
                 if inflight is not None:
                     inflight.holders.add(req.req_id)
 
@@ -262,7 +262,7 @@ class BatchRunner:
             return False
         tier = self._engine.memories[op.tier_key]
         store = StoreTask(
-            self._engine.work_per_store * chunk_transfer_work(tier, req, hbm_hashes),
+            self._engine.work_per_store * transfer_work(tier, req, hbm_hashes),
             link,
             tier,
             tier_block,
@@ -316,7 +316,7 @@ class BatchRunner:
         if link is None:
             raise RuntimeError(f"transfer link required for pull source {src_key!r}")
         src_mem = self._engine.memories[src_key]
-        dedupe_key = pull_dedupe_key(
+        dedupe_key = shared_pull_key(
             src_key, entry.req, group_hashes[0], self._engine.memories
         )
 
@@ -340,7 +340,7 @@ class BatchRunner:
 
         task = BatchLoadTask(
             self._engine.work_per_transfer
-            * chunk_transfer_work(src_mem, entry.req, group_hashes),
+            * transfer_work(src_mem, entry.req, group_hashes),
             link,
             local,
             [dst_blocks[0]],

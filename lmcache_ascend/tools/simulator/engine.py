@@ -1,4 +1,4 @@
-from .content_key import ContentKey
+from .kv_content import ContentKey
 from .execute import BatchRunner
 from .lookup import LookupPolicy
 from .memory import KVBlock, Memory, collect_content_copies
@@ -137,7 +137,7 @@ class Engine:
         self, req: Request | None, tier_key: str, block_hash: str
     ) -> None:
         del tier_key
-        content = ContentKey.for_storage_key(block_hash)
+        content = ContentKey.from_slot(block_hash)
         count = len(
             collect_content_copies(
                 self.memories,

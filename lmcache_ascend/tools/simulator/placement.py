@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from .content_key import ContentKey
-from .chunk_hash import chunk_key_for_hbm_block
+from .kv_content import ContentKey, storage_key
 from .eviction import EvictionPolicy, LRUEviction
 from .memory import BlockState, KVBlock, Memory
 from .plan import StoreOp
@@ -111,7 +110,7 @@ class HBMAndDRAM(PlacementPolicy):
         now: float,
     ) -> bool:
         dram = memories[self.dram_memory]
-        chunk_key = chunk_key_for_hbm_block(req, block_hash, dram.chunk_blocks)
+        chunk_key = storage_key(req, block_hash, dram.chunk_blocks)
         if self._allocator.tier_covers(dram, chunk_key):
             return dram.best_resident(chunk_key) is not None
 
@@ -192,7 +191,7 @@ class TieredPlacement(PlacementPolicy):
         now: float,
     ) -> bool:
         tier = memories[tier_key]
-        chunk_key = chunk_key_for_hbm_block(req, block_hash, tier.chunk_blocks)
+        chunk_key = storage_key(req, block_hash, tier.chunk_blocks)
         if self._allocator.tier_covers(tier, chunk_key):
             return True
 
@@ -220,7 +219,7 @@ class TieredPlacement(PlacementPolicy):
         block_hash: str,
     ) -> KVBlock | None:
         tier = memories[tier_key]
-        chunk_key = chunk_key_for_hbm_block(req, block_hash, tier.chunk_blocks)
+        chunk_key = storage_key(req, block_hash, tier.chunk_blocks)
         return self._allocator.ensure_slot(
             tier,
             chunk_key,
@@ -303,7 +302,7 @@ class TieredPlacement(PlacementPolicy):
             if tier_key not in self._paid_write_tiers:
                 continue
             tier = memories[tier_key]
-            chunk_key = chunk_key_for_hbm_block(req, block_hash, tier.chunk_blocks)
+            chunk_key = storage_key(req, block_hash, tier.chunk_blocks)
             if tier.best_resident(chunk_key) is not None:
                 continue
             if tier.inflight_incoming(chunk_key) is not None:
@@ -315,7 +314,7 @@ class TieredPlacement(PlacementPolicy):
             ops.append(
                 StoreOp(
                     tier_key=tier_key,
-                    content=ContentKey.for_hbm_block(block_hash),
+                    content=ContentKey.from_block(block_hash),
                     storage_key=chunk_key,
                     hbm_block_hash=block_hash,
                 )

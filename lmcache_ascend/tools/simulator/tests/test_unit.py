@@ -16,13 +16,13 @@ from simulator.retention import (
     SingleCopyPerTier,
     UnboundedRetention,
 )
-from simulator.chunk_hash import (
-    chunk_key_for_hbm_block,
-    lmcache_chunk_hash,
-    tier_covers_hbm_block,
-    transfer_work_units,
+from simulator.kv_content import (
+    ContentKey,
+    content_id,
+    storage_key,
+    tier_has_block,
+    transfer_block_count,
 )
-from simulator.content_key import ContentKey, tier_storage_key
 from simulator.memory import BlockState, KVBlock, Memory, collect_content_copies
 from simulator.tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
 from simulator.tests.test_helpers import SimpleTask, make_resident
@@ -151,17 +151,17 @@ def test_spill_on_evict_without_prior_mirror() -> None:
     assert memories["dram"].best_resident("a") is not None
 
 
-def test_lmcache_chunk_hash_groups_aligned_blocks() -> None:
-    assert lmcache_chunk_hash(["a"]) == "a"
-    assert lmcache_chunk_hash(["a", "b", "c", "d"]) == "chunk:a|b|c|d"
+def test_content_id_groups_aligned_blocks() -> None:
+    assert content_id(["a"]) == "a"
+    assert content_id(["a", "b", "c", "d"]) == "chunk:a|b|c|d"
 
 
-def test_chunk_key_for_hbm_block_aligned_group() -> None:
+def test_storage_key_aligned_group() -> None:
     req = Request("r1", 0.0, ["a", "b", "c", "d", "e"], RequestPD.PREFILL, RequestStatus.RUNNING)
     req.prefix_block_count = 5
     dram = Memory(size=10, name="dram", chunk_blocks=4)
-    assert chunk_key_for_hbm_block(req, "c", dram.chunk_blocks) == "chunk:a|b|c|d"
-    assert chunk_key_for_hbm_block(req, "e", dram.chunk_blocks) == "e"
+    assert storage_key(req, "c", dram.chunk_blocks) == "chunk:a|b|c|d"
+    assert storage_key(req, "e", dram.chunk_blocks) == "e"
 
 
 def test_chunked_dram_mirror_and_pull() -> None:
@@ -183,8 +183,8 @@ def test_chunked_dram_mirror_and_pull() -> None:
 
     policy = OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"])
     assert policy.resolve_actions(memories, ["c"], req=req)["c"] == ("pull", "dram")
-    assert tier_covers_hbm_block(memories["dram"], req, "c")
-    assert transfer_work_units(memories["dram"], req, "c") == 4
+    assert tier_has_block(memories["dram"], req, "c")
+    assert transfer_block_count(memories["dram"], req, "c") == 4
 
 
 def test_chunked_dram_pull_transfer_cost_e2e() -> None:
@@ -741,10 +741,10 @@ def test_content_key_same_across_tiers() -> None:
     hbm = Memory(size=10, name="hbm", chunk_blocks=1)
     dram = Memory(size=10, name="dram", chunk_blocks=4)
 
-    content = ContentKey.for_hbm_block("c")
+    content = ContentKey.from_block("c")
     assert str(content) == "c"
-    assert tier_storage_key(content, hbm, req, "c") == "c"
-    assert tier_storage_key(content, dram, req, "c") == "chunk:a|b|c|d"
+    assert storage_key(req, "c", hbm.chunk_blocks) == "c"
+    assert storage_key(req, "c", dram.chunk_blocks) == "chunk:a|b|c|d"
 
     dram.append(KVBlock("chunk:a|b|c|d", BlockState.RESIDENT))
     copies = collect_content_copies({"hbm": hbm, "dram": dram}, ["hbm", "dram"], content, req=req)
@@ -774,7 +774,7 @@ def test_global_copy_cap_ssd_chunk_tier() -> None:
         req=req,
     )
 
-    content = ContentKey.for_hbm_block("a")
+    content = ContentKey.from_block("a")
     copies = collect_content_copies(memories, ["hbm", "dram", "other"], content, req=req)
     assert len(copies) == 2
 

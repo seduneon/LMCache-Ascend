@@ -38,13 +38,13 @@ def remote_wait_source(
     req: Request | None = None,
 ) -> str | None:
     """Pull source with in-flight chunk (resident copy not ready yet)."""
-    from .chunk_hash import tier_covers_hbm_block, tier_inflight_hbm_block
+    from .kv_content import tier_has_block, tier_has_inflight
 
     for src_key in pull_sources:
         src = memories[src_key]
-        if tier_covers_hbm_block(src, req, block_hash):
+        if tier_has_block(src, req, block_hash):
             continue
-        if tier_inflight_hbm_block(src, req, block_hash):
+        if tier_has_inflight(src, req, block_hash):
             return src_key
     return None
 
@@ -56,11 +56,11 @@ def first_resident_pull_source(
     *,
     req: Request | None = None,
 ) -> str | None:
-    from .chunk_hash import tier_covers_hbm_block
+    from .kv_content import tier_has_block
 
     for src_key in pull_sources:
         src = memories[src_key]
-        if tier_covers_hbm_block(src, req, block_hash):
+        if tier_has_block(src, req, block_hash):
             return src_key
     return None
 

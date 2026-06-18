@@ -5,8 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from enum import StrEnum
 
-from .chunk_hash import chunk_key_for_hbm_block
-from .content_key import ContentKey
+from .kv_content import ContentKey, storage_key
 from .memory import KVBlock, Memory, collect_content_copies
 from .request import Request
 
@@ -54,8 +53,8 @@ class RetentionPolicy(ABC):
         if self.pull_disposition() != PullDisposition.CONSUME:
             return
         src = memories[src_key]
-        storage_key = chunk_key_for_hbm_block(req, block_hash, src.chunk_blocks)
-        src_block = src.best_resident(storage_key)
+        slot = storage_key(req, block_hash, src.chunk_blocks)
+        src_block = src.best_resident(slot)
         if src_block is None or not src.can_evict_block(src_block):
             return
         src.remove_block(src_block)
@@ -121,7 +120,7 @@ class GlobalCopyCap(RetentionPolicy):
         super().on_block_resident(
             memories, tier_key=tier_key, block=block, now=now, req=req
         )
-        content = ContentKey.for_storage_key(block.hash)
+        content = ContentKey.from_slot(block.hash)
         while len(collect_content_copies(memories, self.tier_keys, content, req=req)) > self.max_total:
             copies = collect_content_copies(memories, self.tier_keys, content, req=req)
             evictable = [
