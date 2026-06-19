@@ -13,9 +13,9 @@ Run policy comparisons: `python3.12 simulator.py sweep` (see `sweep.py` and `pre
 | Pull vs recompute (read path) | **~85%** | Bandwidth queues; chunk batch pulls; `"wait"` on remote in-flight; batch-local pull dedupe. |
 | Placement / eviction / duplicates | **~75%** | HBM+DRAM sync + SSD paid writes; `GlobalCopyCap`; sync eviction at allocate. |
 | vLLM scheduler shape | **~80%** | Batching, preempt, chunked prefill, PD read mode. Block-grain, one in-flight batch per engine. |
-| Sweep infrastructure | **~75%** | CLI + CSV; data-driven presets; `build_pd_engines`; peak duplicate metric. Synthetic workload only. |
+| Sweep infrastructure | **~80%** | CLI + CSV; data-driven presets; Mooncake trace replay via `--trace`. |
 
-**Bottom line:** Credible for **single-knob** policy comparisons on synthetic PD workloads. Not trustworthy for joint optimizer claims, trace replay, or production latency numbers.
+**Bottom line:** Credible for **single-knob** policy comparisons on synthetic or Mooncake trace workloads. Not trustworthy for joint optimizer claims or production latency numbers.
 
 ---
 
@@ -43,7 +43,7 @@ Simulator.step()
 | `plan.py` | `ScheduleResult`, `BatchPlan`, `EntryPlan`, `StoreOp` |
 | `execute.py` | `BatchRunner`: reservations, tasks, effect callbacks |
 | `placement.py` / `retention.py` | Effect implementations (mirrors, caps, consume-on-pull) |
-| `eviction.py` | `EvictionPolicy`, `LRUEviction` |
+| `eviction.py` | `LRUEviction`, `FIFOEviction`, `RandomEviction`, `make_hbm_eviction` |
 | `tier_allocator.py` | Shared downstream tier slot acquire + eviction |
 | `kv_content.py` | `ContentKey`, tier slot mapping |
 | `lookup.py` | Compatibility shims (`ComputeOnlyLookupPolicy`, etc.) |
@@ -63,7 +63,7 @@ Sweep presets are data rows in `presets.PRESETS` interpreted by `build_pd_engine
 | Limit | Effect on experiments |
 |-------|------------------------|
 | **Decoupled schedule vs effects** | Lookup/eviction at admit; placement/retention at execute. Joint optimization is future work. |
-| **Synthetic string hashes** | Prefix sharing is workload-shaped, not content-hash-shaped. |
+| **Synthetic string hashes** | Prefix sharing is workload-shaped, not content-hash-shaped. Trace mode uses Mooncake chunk ids as block keys. |
 | **Batch-local pull dedupe** | Same chunk pulled once per batch, not across steps/engines. |
 | **`"wait"` = reschedule** | Remote in-flight chunks block cursor advance. |
 | **One in-flight batch / engine** | No pipeline overlap; block-grain not token-grain. |
@@ -86,8 +86,27 @@ Sweep presets are data rows in `presets.PRESETS` interpreted by `build_pd_engine
 | `consume_on_pull`, `single_copy` | Retention variants on baseline topology |
 | `ssd_tier` | P sync DRAM + async SSD writes; D pull SSD/DRAM/HBM |
 | `global_cap_2` | `GlobalCopyCap(2)` across P and D HBM |
+| `evict_lru`, `evict_fifo`, `evict_random` | LMCache PD: P stores prefix to DRAM on complete then frees P HBM; D pulls **DRAM only**; vLLM APC on **D HBM** only; compare LRU/FIFO/random on HBM and DRAM |
+
+Use `--presets evict_lru,evict_fifo,evict_random` with tight `--hbm` / `--dram` (and `--drop-oversized` on traces) to stress tier eviction. Compare `tier_evictions`, `lifecycle_hbm_frees`, and hit ratios in CSV output — distinct from `prefill_evictions` / policy evictions at admit time.
 
 Use `python3.12 -m simulator.sweep --list-presets` for the catalog.
+
+`--csv` writes a wide compare table (metric rows, preset columns). Use `--raw-csv` for one row per preset/seed run.
+
+### Mooncake trace replay
+
+Bundled trace: `simulator/traces/synthetic_trace.jsonl` (from [Mooncake FAST'25 release](https://github.com/kvcache-ai/Mooncake/blob/main/FAST25-release/traces/synthetic_trace.jsonl)).
+
+```bash
+cd lmcache_ascend/tools
+python3.12 -m simulator.sweep --trace --requests 64 --presets baseline,ordered_pull
+python3.12 -m simulator.sweep --trace /path/to/synthetic_trace.jsonl --requests 128 --trace-offset 100
+```
+
+Mapping: each `hash_id` is one 512-token prefix block; `timestamp` × `--trace-time-scale` (default 0.001, ms→s); `output_length` ÷ `--tokens-per-block` (default **512**) → decode blocks. The same trace slice is replayed for every seed; seed only affects randomized eviction.
+
+Set **`--hbm`** explicitly (default 40). Use **`--drop-oversized`** with trace workloads so requests with `prefix + decode blocks > hbm` are skipped instead of deadlocking the run.
 
 ---
 
@@ -97,5 +116,5 @@ Use `python3.12 -m simulator.sweep --list-presets` for the catalog.
 |------|----------------|
 | Joint planning | Unified placement + eviction + lookup in one optimizer |
 | Pull vs recompute | Prefetch queue; multi-hop interconnect |
-| Infrastructure | Trace replay; tier occupancy time series |
+| Infrastructure | Tier occupancy time series |
 | Scheduler | PD write mode; pipeline overlap |

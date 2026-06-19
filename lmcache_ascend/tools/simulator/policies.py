@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .eviction import EvictionPolicy, LRUEviction
 from .effects import EffectConfig, EffectPolicy
 from .plan import EntryPlan, WorkEntry
 from .request import Request, request_owning_prefix_block
@@ -20,20 +21,30 @@ class EnginePolicies:
         cls,
         local_memory: str,
         *,
+        hbm_eviction: EvictionPolicy | None = None,
         mirror_tiers: tuple[str, ...] = (),
         async_write_tiers: frozenset[str] | None = None,
+        mirror_on_forward: bool = True,
+        tier_eviction: dict[str, EvictionPolicy] | None = None,
         retention: str = "unbounded",
         global_cap_max: int = 0,
         global_cap_tiers: tuple[str, ...] = (),
         global_cap_per_tier: int | None = 1,
     ) -> EnginePolicies:
         return cls(
-            SchedulePolicy(ScheduleConfig(local_memory=local_memory)),
+            SchedulePolicy(
+                ScheduleConfig(
+                    local_memory=local_memory,
+                    hbm_eviction=hbm_eviction or LRUEviction(),
+                )
+            ),
             EffectPolicy(
                 EffectConfig(
                     local_memory=local_memory,
                     mirror_tiers=mirror_tiers,
                     async_write_tiers=async_write_tiers or frozenset(),
+                    mirror_on_forward=mirror_on_forward,
+                    tier_eviction=tier_eviction or {},
                     retention=retention,  # type: ignore[arg-type]
                     global_cap_max=global_cap_max,
                     global_cap_tiers=global_cap_tiers,
@@ -48,8 +59,11 @@ class EnginePolicies:
         local_memory: str,
         pull_sources: tuple[str, ...] | list[str],
         *,
+        hbm_eviction: EvictionPolicy | None = None,
         mirror_tiers: tuple[str, ...] = (),
         async_write_tiers: frozenset[str] | None = None,
+        mirror_on_forward: bool = True,
+        tier_eviction: dict[str, EvictionPolicy] | None = None,
         retention: str = "unbounded",
         global_cap_max: int = 0,
         global_cap_tiers: tuple[str, ...] = (),
@@ -61,6 +75,7 @@ class EnginePolicies:
                     local_memory=local_memory,
                     pull_sources=tuple(pull_sources),
                     pull_mode="ordered_pull",
+                    hbm_eviction=hbm_eviction or LRUEviction(),
                 )
             ),
             EffectPolicy(
@@ -68,6 +83,8 @@ class EnginePolicies:
                     local_memory=local_memory,
                     mirror_tiers=mirror_tiers,
                     async_write_tiers=async_write_tiers or frozenset(),
+                    mirror_on_forward=mirror_on_forward,
+                    tier_eviction=tier_eviction or {},
                     retention=retention,  # type: ignore[arg-type]
                     global_cap_max=global_cap_max,
                     global_cap_tiers=global_cap_tiers,

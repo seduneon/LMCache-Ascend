@@ -49,6 +49,7 @@ class TierAllocator:
             if not victims:
                 return None
             memory.remove_block(victims[0])
+            memory.tier_evictions += 1
 
         block = KVBlock(storage_key, state)
         memory.append(block)

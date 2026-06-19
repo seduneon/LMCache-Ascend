@@ -24,6 +24,8 @@ class EffectConfig:
     local_memory: str
     mirror_tiers: tuple[str, ...] = ()
     async_write_tiers: frozenset[str] = frozenset()
+    mirror_on_forward: bool = True
+    tier_eviction: dict[str, EvictionPolicy] = field(default_factory=dict)
     tier_eviction: dict[str, EvictionPolicy] = field(default_factory=dict)
     retention: Literal[
         "unbounded", "single_copy", "consume_on_pull", "global_cap"
@@ -55,6 +57,7 @@ def _build_placement(config: EffectConfig, retention: RetentionPolicy) -> Placem
         tier_keys,
         tier_eviction=config.tier_eviction or None,
         paid_write_tiers=config.async_write_tiers,
+        mirror_on_forward=config.mirror_on_forward,
     )
     placement.bind_retention(retention)
     return placement
@@ -165,4 +168,20 @@ class EffectPolicy:
             local_memory=self.config.local_memory,
             block_hash=block_hash,
             req=req,
+        )
+
+    def store_prefix_on_complete(
+        self,
+        memories: dict[str, Memory],
+        *,
+        req: Request,
+        now: float,
+        tier_keys: tuple[str, ...],
+    ) -> bool:
+        return self._placement.store_prefix_on_complete(
+            memories,
+            local_memory=self.config.local_memory,
+            req=req,
+            now=now,
+            tier_keys=tier_keys,
         )

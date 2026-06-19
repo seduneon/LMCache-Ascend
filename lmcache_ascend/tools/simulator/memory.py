@@ -24,12 +24,14 @@ class KVBlock:
         task: Task | None = None,
         holders: set[str] | None = None,
         last_touch: float = 0.0,
+        insert_seq: int = 0,
     ):
         self.hash: str = hash
         self.state: BlockState = state
         self.task: Task | None = task
         self.holders: set[str] = holders if holders is not None else set()
         self.last_touch: float = last_touch
+        self.insert_seq: int = insert_seq
 
     def touch(self, t: float) -> None:
         self.last_touch = t
@@ -41,6 +43,9 @@ class Memory:
         self.size = size
         self.chunk_blocks = max(1, chunk_blocks)
         self.blocks: dict[str, list[KVBlock]] = {}
+        self._next_insert_seq = 0
+        self.lifecycle_frees: int = 0
+        self.tier_evictions: int = 0
 
     def get(self, block_hash: str) -> list[KVBlock]:
         return self.blocks.setdefault(block_hash, [])
@@ -52,6 +57,8 @@ class Memory:
         return self.size - self.used_size()
 
     def append(self, block: KVBlock) -> None:
+        block.insert_seq = self._next_insert_seq
+        self._next_insert_seq += 1
         self.get(block.hash).append(block)
 
     def remove_block(self, block: KVBlock) -> None:
@@ -100,15 +107,30 @@ class Memory:
         self.append(block)
         return block
 
-    def free_request(self, req_id: str) -> None:
-        """Drop all KV state for a request (vLLM kv_cache_manager.free)."""
+    def free_request(
+        self,
+        req_id: str,
+        *,
+        retain_hashes: set[str] | None = None,
+    ) -> int:
+        """Drop a request's holders; remove unreferenced blocks unless retained.
+
+        Returns the number of blocks removed from this tier (lifecycle frees).
+        """
+        removed = 0
         for copies in list(self.blocks.values()):
             for block in list(copies):
                 if req_id not in block.holders:
                     continue
                 block.holders.discard(req_id)
-                if not block.holders:
-                    self.remove_block(block)
+                if block.holders:
+                    continue
+                if retain_hashes is not None and block.hash in retain_hashes:
+                    continue
+                self.remove_block(block)
+                removed += 1
+        self.lifecycle_frees += removed
+        return removed
 
     def can_evict_block(self, block: KVBlock) -> bool:
         return block.state == BlockState.RESIDENT and len(block.holders) == 0

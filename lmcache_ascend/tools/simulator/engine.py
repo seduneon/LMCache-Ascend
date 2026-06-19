@@ -1,7 +1,7 @@
 from .kv_content import ContentKey
 from .execute import BatchRunner
 from .memory import KVBlock, Memory, collect_content_copies
-from .plan import BatchPlan, StoreOp, WorkEntry
+from .plan import BatchPlan, StoreOp, WorkEntry, dedupe_batch_evicts
 from .policies import EnginePolicies, enrich_entry_plan
 from .request import Request, RequestPD, RequestStatus, request_owning_prefix_block
 from .resource import BandwidthResource, ComputeResource
@@ -31,6 +31,8 @@ class Engine:
         enable_chunked_prefill: bool = False,
         remote_kv_wait: bool = False,
         hold_kv_on_complete: bool = False,
+        retain_hbm_prefix_cache: bool = False,
+        store_tiers_on_complete: tuple[str, ...] = (),
         work_per_prefill_token: float | None = None,
         work_per_decode_req: float | None = None,
         sync_evict: bool = True,
@@ -64,6 +66,8 @@ class Engine:
             work_per_decode_req if work_per_decode_req is not None else work_per_block
         )
         self.hold_kv_on_complete = hold_kv_on_complete
+        self.retain_hbm_prefix_cache = retain_hbm_prefix_cache
+        self.store_tiers_on_complete = tuple(store_tiers_on_complete)
         self._peak_duplicate_count = 0
         self._next_batch_id = 0
 
@@ -79,6 +83,37 @@ class Engine:
         )
         for req in requests:
             self.scheduler.add_request(req)
+        self.scheduler.set_release_handler(self._release_request_kv)
+
+    def _release_request_kv(
+        self,
+        req: Request,
+        *,
+        preempted: bool,
+        now: float,
+    ) -> None:
+        stored = True
+        if not preempted and self.store_tiers_on_complete:
+            stored = self.policies.effects.store_prefix_on_complete(
+                self.memories,
+                req=req,
+                now=now,
+                tier_keys=self.store_tiers_on_complete,
+            )
+        retain_hashes: set[str] | None = None
+        prefix_hashes = set(req.block_hashes[: req.prefix_block_count])
+        if self.retain_hbm_prefix_cache and not preempted:
+            retain_hashes = prefix_hashes
+        elif (
+            not preempted
+            and self.store_tiers_on_complete
+            and not stored
+        ):
+            retain_hashes = prefix_hashes
+        self.memories[self.local_memory].free_request(
+            req.req_id,
+            retain_hashes=retain_hashes,
+        )
 
     @property
     def waiting(self):
@@ -190,6 +225,7 @@ class Engine:
             preempted=list(scheduled.preempted),
             total_num_scheduled_tokens=scheduled.total_num_scheduled_tokens,
         )
+        dedupe_batch_evicts(plan)
         self._execute_plan(plan)
         return plan
 
@@ -229,4 +265,8 @@ class Engine:
         return finished, remote_kv_done
 
     def release_held_kv(self, req_id: str) -> None:
-        self.memories[self.local_memory].free_request(req_id)
+        req = next((r for r in self.completed if r.req_id == req_id), None)
+        if req is None:
+            self.memories[self.local_memory].free_request(req_id)
+            return
+        self._release_request_kv(req, preempted=False, now=0.0)

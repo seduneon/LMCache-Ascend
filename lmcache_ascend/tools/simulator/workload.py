@@ -19,6 +19,20 @@ class WorkloadConfig:
     arrival_spacing: float = 0.02
     arrival_jitter: float = 0.01
     seed: int = 42
+    trace_path: str | None = None
+    trace_offset: int = 0
+    trace_time_scale: float = 0.001
+    tokens_per_block: int = 512
+    hash_prefix: str = "mooncake"
+
+
+def build_workload(cfg: WorkloadConfig) -> tuple[list[Request], list[str]]:
+    """Synthetic generator or Mooncake trace replay, depending on cfg."""
+    if cfg.trace_path is not None:
+        from .trace import load_mooncake_trace
+
+        return load_mooncake_trace(cfg)
+    return generate_prefill_workload(cfg)
 
 
 def generate_prefill_workload(

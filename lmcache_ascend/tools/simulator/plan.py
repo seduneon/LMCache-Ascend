@@ -69,3 +69,17 @@ class BatchPlan:
     entries: list[WorkEntry] = field(default_factory=list)
     preempted: list[Request] = field(default_factory=list)
     total_num_scheduled_tokens: int = 0
+
+
+def dedupe_batch_evicts(plan: BatchPlan) -> None:
+    """Drop duplicate HBM victims scheduled across entries in one batch."""
+    seen: set[int] = set()
+    for entry in plan.entries:
+        unique = []
+        for victim in entry.plan.evicts:
+            token = id(victim)
+            if token in seen:
+                continue
+            seen.add(token)
+            unique.append(victim)
+        entry.plan.evicts = unique

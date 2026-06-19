@@ -13,6 +13,7 @@ class PDConfig:
 
     mode: Literal["read"] = "read"
     spawn_map: dict[str, str] = field(default_factory=dict)
+    hold_kv_on_complete: bool | None = None
 
     def validate_and_apply(self, engines: dict[str, Engine]) -> None:
         if self.mode != "read":
@@ -31,5 +32,10 @@ class PDConfig:
                     f"decode engine {decode_id!r} needs pull_sources for PD read mode"
                 )
 
-            prefill.hold_kv_on_complete = True
+            hold = (
+                True
+                if self.hold_kv_on_complete is None
+                else self.hold_kv_on_complete
+            )
+            prefill.hold_kv_on_complete = hold
             decode.remote_kv_wait = True

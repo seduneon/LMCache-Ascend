@@ -68,6 +68,23 @@ class PlacementPolicy(ABC):
         """Downstream tiers that receive sync mirrors when HBM blocks become resident."""
         return ()
 
+    def store_prefix_on_complete(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        req: Request,
+        now: float,
+        tier_keys: tuple[str, ...],
+    ) -> bool:
+        """Mirror prefix blocks to downstream tiers at request completion."""
+        del local_memory
+        del memories
+        del req
+        del now
+        del tier_keys
+        return True
+
 
 class HBMOnly(PlacementPolicy):
     """Keep computed KV on local HBM only (default)."""
@@ -92,11 +109,13 @@ class HBMAndDRAM(PlacementPolicy):
         dram_memory: str,
         *,
         dram_eviction_policy: EvictionPolicy | None = None,
+        mirror_on_forward: bool = True,
     ):
         self.dram_memory = dram_memory
         self._dram_eviction = dram_eviction_policy or LRUEviction()
         self._allocator = TierAllocator(self._dram_eviction)
         self._retention: RetentionPolicy = UnboundedRetention()
+        self.mirror_on_forward = mirror_on_forward
 
     def bind_retention(self, retention: RetentionPolicy) -> None:
         self._retention = retention
@@ -138,9 +157,33 @@ class HBMAndDRAM(PlacementPolicy):
         req: Request,
         now: float,
     ) -> None:
+        if not self.mirror_on_forward:
+            return
         self._ensure_dram_resident(
             memories, req=req, block_hash=block.hash, now=now
         )
+
+    def store_prefix_on_complete(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        req: Request,
+        now: float,
+        tier_keys: tuple[str, ...],
+    ) -> bool:
+        del local_memory
+        if self.dram_memory not in tier_keys:
+            return True
+        ok = True
+        for block_hash in req.block_hashes[: req.prefix_block_count]:
+            if block_hash.startswith("blk:"):
+                continue
+            if not self._ensure_dram_resident(
+                memories, req=req, block_hash=block_hash, now=now
+            ):
+                ok = False
+        return ok
 
     def spill_on_evict(
         self,
@@ -168,12 +211,14 @@ class TieredPlacement(PlacementPolicy):
         *,
         tier_eviction: dict[str, EvictionPolicy] | None = None,
         paid_write_tiers: frozenset[str] | None = None,
+        mirror_on_forward: bool = True,
     ):
         self.tier_keys = list(tier_keys)
         self._tier_eviction = tier_eviction or {}
         self._paid_write_tiers = paid_write_tiers or frozenset()
         self._allocator = TierAllocator()
         self._retention: RetentionPolicy = UnboundedRetention()
+        self.mirror_on_forward = mirror_on_forward
 
     def bind_retention(self, retention: RetentionPolicy) -> None:
         self._retention = retention
@@ -237,12 +282,41 @@ class TieredPlacement(PlacementPolicy):
         req: Request,
         now: float,
     ) -> None:
+        if not self.mirror_on_forward:
+            return
         for tier_key in self.tier_keys:
             if tier_key in self._paid_write_tiers:
                 continue
             self._ensure_tier_resident_sync(
                 memories, tier_key=tier_key, req=req, block_hash=block.hash, now=now
             )
+
+    def store_prefix_on_complete(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        req: Request,
+        now: float,
+        tier_keys: tuple[str, ...],
+    ) -> bool:
+        del local_memory
+        ok = True
+        for tier_key in tier_keys:
+            if tier_key not in self.tier_keys or tier_key in self._paid_write_tiers:
+                continue
+            for block_hash in req.block_hashes[: req.prefix_block_count]:
+                if block_hash.startswith("blk:"):
+                    continue
+                if not self._ensure_tier_resident_sync(
+                    memories,
+                    tier_key=tier_key,
+                    req=req,
+                    block_hash=block_hash,
+                    now=now,
+                ):
+                    ok = False
+        return ok
 
     def spill_on_evict(
         self,

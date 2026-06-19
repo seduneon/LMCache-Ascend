@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from simulator.plan import EntryPlan, WorkEntry
-from simulator.eviction import LRUEviction
+from simulator.eviction import FIFOEviction, LRUEviction, RandomEviction
 from simulator.lookup import (
     ComputeOnlyLookupPolicy,
     OrderedPullLookupPolicy,
@@ -369,6 +369,54 @@ def test_lru_eviction_skips_held_and_excluded() -> None:
     policy = LRUEviction()
     victims = policy.pick_victims(mem, 1, exclude={"b"})
     assert victims == [old]
+
+
+def test_fifo_eviction_picks_oldest_insert() -> None:
+    mem = Memory(size=4, name="hbm")
+    first = KVBlock("a", BlockState.RESIDENT)
+    second = KVBlock("b", BlockState.RESIDENT)
+    third = KVBlock("c", BlockState.RESIDENT)
+    for block in (first, second, third):
+        mem.append(block)
+
+    policy = FIFOEviction()
+    victims = policy.pick_victims(mem, 2, exclude=set())
+    assert [v.hash for v in victims] == ["a", "b"]
+
+
+def test_random_eviction_is_seeded() -> None:
+    mem = Memory(size=4, name="hbm")
+    for name in ("a", "b", "c", "d"):
+        mem.append(KVBlock(name, BlockState.RESIDENT))
+
+    a = RandomEviction(seed=7).pick_victims(mem, 2, exclude=set())
+    b = RandomEviction(seed=7).pick_victims(mem, 2, exclude=set())
+    c = RandomEviction(seed=8).pick_victims(mem, 2, exclude=set())
+    assert [v.hash for v in a] == [v.hash for v in b]
+    assert len({v.hash for v in a}) == 2
+    assert {v.hash for v in c} <= {"a", "b", "c", "d"}
+
+
+def test_fifo_eviction_under_allocate_pressure() -> None:
+    memories = {"hbm": Memory(size=2, name="hbm")}
+    policy = ComputeOnlyLookupPolicy(
+        local_memory="hbm",
+        eviction_policy=FIFOEviction(),
+    )
+    sched = Scheduler(policy, memories, "hbm")
+
+    for name in ("old", "mid"):
+        block = KVBlock(name, BlockState.RESIDENT)
+        memories["hbm"].append(block)
+
+    req = Request("r1", 0.0, ["new"], RequestPD.PREFILL, RequestStatus.RUNNING)
+    req.prefix_block_count = 1
+    sched.running.append(req)
+
+    result = sched._allocate_blocks(req, ["new"], set(), [])
+    assert result is not None
+    assert len(result.evicts) == 1
+    assert result.evicts[0].hash == "old"
 
 
 def test_lru_eviction_under_allocate_pressure() -> None:
@@ -828,17 +876,150 @@ def test_batch_complete_waits_for_tagged_tasks() -> None:
 
 
 def test_sweep_smoke() -> None:
+    import csv
+    import tempfile
+    from pathlib import Path
+
     from simulator.sweep import SweepConfig, run_sweep
+
+    with tempfile.TemporaryDirectory() as tmp:
+        csv_path = str(Path(tmp) / "compare.csv")
+        rows = run_sweep(
+            SweepConfig(
+                presets=("baseline", "ordered_pull"),
+                num_requests=8,
+                seeds=1,
+                base_seed=42,
+                csv_path=csv_path,
+            )
+        )
+        assert len(rows) == 2
+        assert all(r.status == "ok" for r in rows)
+        assert rows[0].decode_p99_latency >= 0
+
+        with open(csv_path, newline="", encoding="utf-8") as handle:
+            table = list(csv.reader(handle))
+        assert table[0][0] == "metric"
+        assert table[0][1:] == ["baseline", "ordered_pull"]
+        metrics = {row[0]: row[1:] for row in table[1:]}
+        assert metrics["status"] == ["ok", "ok"]
+        assert "decode_p99_latency" in metrics
+
+
+def test_eviction_preset_sweep_smoke() -> None:
+    from simulator.presets import EVICTION_PRESET_NAMES
+    from simulator.sweep import SimConfig, SweepConfig, run_sweep
 
     rows = run_sweep(
         SweepConfig(
-            presets=("baseline", "ordered_pull"),
-            num_requests=8,
+            presets=EVICTION_PRESET_NAMES,
+            num_requests=12,
             seeds=1,
             base_seed=42,
+            sim=SimConfig(hbm_size=24, dram_size=32),
         )
     )
-    assert len(rows) == 2
+    assert len(rows) == 3
     assert all(r.status == "ok" for r in rows)
-    assert rows[0].decode_p99_latency >= 0
+    by_name = {r.preset: r for r in rows}
+    assert by_name["evict_lru"].preemptions >= 0
+    assert by_name["evict_lru"].lifecycle_hbm_frees >= 0
+    assert by_name["evict_lru"].tier_evictions >= 0
+
+
+def test_load_mooncake_trace() -> None:
+    import json
+
+    from simulator.trace import DEFAULT_TRACE_PATH, load_mooncake_trace
+    from simulator.workload import WorkloadConfig
+
+    cfg = WorkloadConfig(
+        num_requests=8,
+        trace_path=str(DEFAULT_TRACE_PATH),
+        trace_offset=50,
+    )
+    requests, shared_pool = load_mooncake_trace(cfg)
+    assert len(requests) == 8
+    assert requests[0].req_id == "trace:50"
+    assert requests[0].prefix_block_count == len(requests[0].block_hashes)
+    assert all(h.startswith("mooncake:") for h in requests[0].block_hashes)
+    assert requests[0].max_output_blocks >= 1
+
+    with open(DEFAULT_TRACE_PATH, encoding="utf-8") as handle:
+        for _ in range(50):
+            handle.readline()
+        record = json.loads(handle.readline())
+    assert requests[0].max_output_blocks == max(
+        1,
+        (int(record["output_length"]) + cfg.tokens_per_block - 1)
+        // cfg.tokens_per_block,
+    )
+    assert len(shared_pool) >= len(requests[0].block_hashes)
+
+    arrivals = [r.arrival_time for r in requests]
+    assert arrivals == sorted(arrivals)
+
+
+def test_partition_by_hbm() -> None:
+    from simulator.trace import (
+        DEFAULT_TRACE_PATH,
+        is_hbm_admittable,
+        partition_by_hbm,
+        request_block_footprint,
+    )
+    from simulator.workload import WorkloadConfig, build_workload
+
+    reqs, _ = build_workload(
+        WorkloadConfig(num_requests=500, trace_path=str(DEFAULT_TRACE_PATH))
+    )
+    hbm = 128
+    admittable, rejected = partition_by_hbm(reqs, hbm)
+    assert len(admittable) + len(rejected) == len(reqs)
+    assert all(is_hbm_admittable(r, hbm) for r in admittable)
+    assert all(not is_hbm_admittable(r, hbm) for r in rejected)
+    assert len(rejected) >= 1
+    assert max(request_block_footprint(r) for r in rejected) > hbm
+
+
+def test_drop_oversized_sweep_smoke() -> None:
+    from simulator.sweep import SimConfig, SweepConfig, run_sweep
+    from simulator.trace import DEFAULT_TRACE_PATH
+
+    rows = run_sweep(
+        SweepConfig(
+            presets=("baseline",),
+            num_requests=500,
+            seeds=1,
+            base_seed=42,
+            trace_path=str(DEFAULT_TRACE_PATH),
+            hbm=128,
+            drop_oversized=True,
+            sim=SimConfig(max_num_seqs=32, max_num_batched_tokens=128),
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].status == "ok", rows[0].error
+    assert rows[0].num_requests == 500
+    assert rows[0].rejected_requests >= 1
+    assert rows[0].admittable_requests == 500 - rows[0].rejected_requests
+
+
+def test_trace_sweep_smoke() -> None:
+    from simulator.sweep import SimConfig, SweepConfig, run_sweep
+    from simulator.trace import DEFAULT_TRACE_PATH
+
+    rows = run_sweep(
+        SweepConfig(
+            presets=("baseline",),
+            num_requests=12,
+            seeds=1,
+            base_seed=42,
+            trace_path=str(DEFAULT_TRACE_PATH),
+            hbm=128,
+            sim=SimConfig(max_num_seqs=32, max_num_batched_tokens=128),
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0].status == "ok", rows[0].error
+    assert rows[0].num_requests == 12
 

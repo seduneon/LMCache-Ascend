@@ -4,6 +4,7 @@ import heapq
 from collections import deque
 
 from .schedule import SchedulePolicy, local_satisfied
+from .kv_content import tier_has_block, tier_has_inflight
 from .memory import Memory
 from .plan import EntryPlan, ScheduleResult, WorkEntry
 from .request import Request, RequestPD, RequestStatus
@@ -32,6 +33,7 @@ class Scheduler:
         self.block_size = block_size
         self.enable_chunked_prefill = enable_chunked_prefill
         self.remote_kv_wait = remote_kv_wait
+        self._release_handler = None
 
         self.pending: list[tuple[float, str, Request]] = []
         self.waiting: deque[Request] = deque()
@@ -40,6 +42,21 @@ class Scheduler:
 
     def _local(self) -> Memory:
         return self.memories[self.local_memory]
+
+    def set_release_handler(self, handler) -> None:
+        self._release_handler = handler
+
+    def _release_request_memory(
+        self,
+        req: Request,
+        *,
+        preempted: bool,
+        now: float | None,
+    ) -> None:
+        if self._release_handler is not None:
+            self._release_handler(req, preempted=preempted, now=now or 0.0)
+        else:
+            self._local().free_request(req.req_id)
 
     def add_request(self, req: Request) -> None:
         req.status = RequestStatus.PENDING
@@ -122,6 +139,22 @@ class Scheduler:
             if local_satisfied(local, block_hash):
                 continue
             return True
+        return False
+
+    def _prefix_absent_on_all_pull_sources(self, req: Request) -> bool:
+        """True when some missing prefix block is on no pull tier (incl. in-flight)."""
+        local = self._local()
+        for block_hash in self._prefix_block_hashes(req):
+            if local_satisfied(local, block_hash):
+                continue
+            for src_key in self.policy.pull_sources:
+                src = self.memories[src_key]
+                if tier_has_block(src, req, block_hash):
+                    break
+                if tier_has_inflight(src, req, block_hash):
+                    break
+            else:
+                return True
         return False
 
     def _try_admit_remote_kv(
@@ -248,7 +281,8 @@ class Scheduler:
                         engine_id=engine_id,
                     ):
                         break
-                    break
+                    if not self._prefix_absent_on_all_pull_sources(req):
+                        break
 
                 if token_budget <= 0:
                     break
@@ -352,7 +386,7 @@ class Scheduler:
     def _preempt_request(self, req: Request, *, now: float | None = None) -> None:
         """Free KV and return to waiting. No task cancel — batches drain before re-schedule."""
         assert req in self.running
-        self._local().free_request(req.req_id)
+        self._release_request_memory(req, preempted=True, now=now)
 
         req.num_computed_blocks = 0
         req.pending_block_hash = None
@@ -371,6 +405,6 @@ class Scheduler:
         req.status = RequestStatus.COMPLETE
         if now is not None:
             req.metrics.finish(now)
-        self._local().free_request(req.req_id)
+        self._release_request_memory(req, preempted=False, now=now)
         self.running.remove(req)
         self.completed.append(req)
