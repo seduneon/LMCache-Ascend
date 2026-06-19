@@ -94,6 +94,12 @@ Use `python3.12 -m simulator.sweep --list-presets` for the catalog.
 
 `--csv` writes a wide compare table (metric rows, preset columns). Use `--raw-csv` for one row per preset/seed run.
 
+Prefix-aware metrics (prompt KV vs decode `blk:` output slots):
+- `prefix_pull_ratio` — decode prefix pulls / (prefix pulls + prefix recomputes)
+- `dram_hit_rate` — decode prefix pulls from DRAM / all decode prefix pulls
+- `pull_ratio` — legacy: all decode pulls / (pulls + computes); dominated by output tokens
+- `decode_hit_ratio` — decode prefix local HBM hits / prefix block resolutions
+
 ### Mooncake trace replay
 
 Bundled trace: `simulator/traces/synthetic_trace.jsonl` (from [Mooncake FAST'25 release](https://github.com/kvcache-ai/Mooncake/blob/main/FAST25-release/traces/synthetic_trace.jsonl)).

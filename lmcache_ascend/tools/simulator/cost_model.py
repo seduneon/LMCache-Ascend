@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from .plan import BatchPlan, WorkEntry
-from .request import Request
+from .request import Request, RequestPD
+
+
+def is_prefix_block(req: Request, block_hash: str) -> bool:
+    """True for prompt/prefix KV blocks (excludes decode output ``blk:`` slots)."""
+    if req.pd == RequestPD.PREFILL:
+        return True
+    return not block_hash.startswith("blk:")
 
 
 def prefill_work(num_tokens: int, work_per_prefill_token: float) -> float:
@@ -24,14 +31,23 @@ def record_entry_metrics(entry: WorkEntry) -> None:
     metrics.evictions += len(entry.plan.evicts)
     for block_hash in entry.block_hashes:
         action = entry.plan.blocks.get(block_hash)
+        prefix = is_prefix_block(entry.req, block_hash)
         if action == "compute":
             metrics.computes += 1
+            if prefix:
+                metrics.prefix_computes += 1
         elif action == "wait":
             metrics.remote_waits += 1
         elif isinstance(action, tuple) and action[0] == "pull":
             metrics.pulls += 1
+            if prefix:
+                metrics.prefix_pulls += 1
+                if action[1].endswith(":dram"):
+                    metrics.prefix_dram_pulls += 1
         elif action is None:
             metrics.local_hits += 1
+            if prefix:
+                metrics.prefix_local_hits += 1
     if entry_has_compute(entry):
         metrics.forward_steps += 1
 

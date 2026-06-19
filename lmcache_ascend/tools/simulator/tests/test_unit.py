@@ -586,15 +586,54 @@ def test_request_metrics_pd_decode() -> None:
     dm = decode.metrics
 
     assert pm.computes == 3
+    assert pm.prefix_computes == 3
     assert pm.pulls == 0
     assert pm.finished_at is not None
 
     assert dm.remote_kv_admits == 1
     assert dm.pulls == 3
+    assert dm.prefix_pulls == 3
+    assert dm.prefix_computes == 0
     assert dm.remote_kv_time >= 0
     assert dm.computes == 1
     assert dm.finished_at is not None
     assert dm.engine_id == "npu-1"
+
+
+def test_prefix_entry_metrics() -> None:
+    from simulator.cost_model import is_prefix_block, record_entry_metrics
+    from simulator.plan import EntryPlan, WorkEntry
+
+    decode = Request(
+        "d1",
+        0.0,
+        ["p0", "p1", "blk:d1:0"],
+        RequestPD.DECODE,
+        RequestStatus.RUNNING,
+        prefix_block_count=2,
+        max_output_blocks=1,
+    )
+    assert is_prefix_block(decode, "p0")
+    assert not is_prefix_block(decode, "blk:d1:0")
+
+    entry = WorkEntry(
+        decode,
+        ["p0", "blk:d1:0"],
+        EntryPlan(
+            blocks={
+                "p0": ("pull", "npu-0:dram"),
+                "blk:d1:0": "compute",
+            }
+        ),
+        num_scheduled_tokens=1,
+    )
+    record_entry_metrics(entry)
+    m = decode.metrics
+    assert m.pulls == 1
+    assert m.prefix_pulls == 1
+    assert m.prefix_dram_pulls == 1
+    assert m.computes == 1
+    assert m.prefix_computes == 0
 
 
 def test_global_copy_cap_trims_across_tiers() -> None:

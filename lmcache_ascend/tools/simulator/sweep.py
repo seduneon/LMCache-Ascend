@@ -122,12 +122,18 @@ class SweepRow:
     decode_pulls: int = 0
     decode_computes: int = 0
     decode_local_hits: int = 0
+    decode_prefix_pulls: int = 0
+    decode_prefix_computes: int = 0
+    decode_prefix_local_hits: int = 0
+    decode_prefix_dram_pulls: int = 0
     decode_evictions: int = 0
     prefill_computes: int = 0
     prefill_evictions: int = 0
     prefill_local_hits: int = 0
     prefill_hit_ratio: float = 0.0
     decode_hit_ratio: float = 0.0
+    prefix_pull_ratio: float = 0.0
+    dram_hit_rate: float = 0.0
     lifecycle_hbm_frees: int = 0
     tier_evictions: int = 0
     pull_ratio: float = 0.0
@@ -206,18 +212,44 @@ def _aggregate_metrics(
     decode_pulls = sum(r.metrics.pulls for r in npu1.completed)
     decode_computes = sum(r.metrics.computes for r in npu1.completed)
     decode_local = sum(r.metrics.local_hits for r in npu1.completed)
+    decode_prefix_pulls = sum(r.metrics.prefix_pulls for r in npu1.completed)
+    decode_prefix_computes = sum(r.metrics.prefix_computes for r in npu1.completed)
+    decode_prefix_local = sum(r.metrics.prefix_local_hits for r in npu1.completed)
+    decode_prefix_dram_pulls = sum(r.metrics.prefix_dram_pulls for r in npu1.completed)
     decode_evictions = sum(r.metrics.evictions for r in npu1.completed)
 
     decode_actions = decode_pulls + decode_computes
     pull_ratio = decode_pulls / decode_actions if decode_actions else 0.0
 
+    prefix_resolve = decode_prefix_pulls + decode_prefix_computes
+    prefix_pull_ratio = (
+        decode_prefix_pulls / prefix_resolve if prefix_resolve else 0.0
+    )
+    dram_hit_rate = (
+        decode_prefix_dram_pulls / decode_prefix_pulls
+        if decode_prefix_pulls
+        else 0.0
+    )
+
     preemptions = sum(r.metrics.preemptions for r in npu0.completed + npu1.completed)
     prefill_computes = sum(r.metrics.computes for r in npu0.completed)
     prefill_evictions = sum(r.metrics.evictions for r in npu0.completed)
     prefill_local = sum(r.metrics.local_hits for r in npu0.completed)
-    prefill_actions = prefill_computes + prefill_local
-    prefill_hit_ratio = prefill_local / prefill_actions if prefill_actions else 0.0
-    decode_hit_ratio = decode_local / decode_actions if decode_actions else 0.0
+    prefill_prefix_local = sum(r.metrics.prefix_local_hits for r in npu0.completed)
+    prefill_actions = (
+        sum(r.metrics.prefix_computes for r in npu0.completed) + prefill_prefix_local
+    )
+    prefill_hit_ratio = (
+        prefill_prefix_local / prefill_actions if prefill_actions else 0.0
+    )
+    decode_prefix_actions = (
+        decode_prefix_pulls + decode_prefix_computes + decode_prefix_local
+    )
+    decode_hit_ratio = (
+        decode_prefix_local / decode_prefix_actions
+        if decode_prefix_actions
+        else 0.0
+    )
 
     lifecycle_hbm_frees = sum(
         mem.lifecycle_frees for name, mem in memories.items() if name in HBM_TIER_KEYS
@@ -251,12 +283,18 @@ def _aggregate_metrics(
         decode_pulls=decode_pulls,
         decode_computes=decode_computes,
         decode_local_hits=decode_local,
+        decode_prefix_pulls=decode_prefix_pulls,
+        decode_prefix_computes=decode_prefix_computes,
+        decode_prefix_local_hits=decode_prefix_local,
+        decode_prefix_dram_pulls=decode_prefix_dram_pulls,
         decode_evictions=decode_evictions,
         prefill_computes=prefill_computes,
         prefill_evictions=prefill_evictions,
         prefill_local_hits=prefill_local,
         prefill_hit_ratio=prefill_hit_ratio,
         decode_hit_ratio=decode_hit_ratio,
+        prefix_pull_ratio=prefix_pull_ratio,
+        dram_hit_rate=dram_hit_rate,
         lifecycle_hbm_frees=lifecycle_hbm_frees,
         tier_evictions=tier_evictions,
         pull_ratio=pull_ratio,
@@ -579,7 +617,7 @@ def _print_table(rows: list[SweepRow]) -> None:
     header = (
         f"{'preset':<16} {'seed':>6} {'status':<6} "
         f"{'wall_s':>7} {'steps':>7} {'preempt':>7} "
-        f"{'pull%':>6} {'p99_lat':>8} {'pulls':>6} {'dram':>5}"
+        f"{'pfx%':>6} {'dram%':>6} {'p99_lat':>8} {'pfx_pull':>8} {'dram':>5}"
     )
     print(header, flush=True)
     for row in rows:
@@ -593,9 +631,10 @@ def _print_table(rows: list[SweepRow]) -> None:
         print(
             f"{row.preset:<16} {row.seed:>6} {row.status:<6} "
             f"{row.wall_seconds:7.3f} {row.steps:7d} {row.preemptions:7d} "
-            f"{100 * row.pull_ratio:5.1f}% "
+            f"{100 * row.prefix_pull_ratio:5.1f}% "
+            f"{100 * row.dram_hit_rate:5.1f}% "
             f"{row.decode_p99_latency:8.3f} "
-            f"{row.decode_pulls:6d} {row.dram_slots_used:5d}",
+            f"{row.decode_prefix_pulls:8d} {row.dram_slots_used:5d}",
             flush=True,
         )
 

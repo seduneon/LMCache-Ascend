@@ -33,6 +33,10 @@ class RequestMetrics:
     pulls: int = 0
     computes: int = 0
     local_hits: int = 0
+    prefix_pulls: int = 0
+    prefix_computes: int = 0
+    prefix_local_hits: int = 0
+    prefix_dram_pulls: int = 0
     remote_waits: int = 0
     preemptions: int = 0
     remote_kv_admits: int = 0
