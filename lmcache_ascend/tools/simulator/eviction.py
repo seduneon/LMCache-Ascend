@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Literal
 
 from .memory import KVBlock, Memory
@@ -109,11 +110,40 @@ class CostPrefixEviction(EvictionPolicy):
         return candidates[:count]
 
 
-def make_eviction(kind: EvictionKind, *, seed: int = 0) -> EvictionPolicy:
-    if kind == "fifo":
-        return FIFOEviction()
-    if kind == "lfu":
-        return LFUEviction()
-    if kind == "random":
-        return RandomEviction(seed=seed)
+EvictionFactory = Callable[[int], EvictionPolicy]
+
+
+def lru_eviction(_seed: int = 0) -> EvictionPolicy:
     return LRUEviction()
+
+
+def fifo_eviction(_seed: int = 0) -> EvictionPolicy:
+    return FIFOEviction()
+
+
+def lfu_eviction(_seed: int = 0) -> EvictionPolicy:
+    return LFUEviction()
+
+
+def random_eviction(seed: int = 0) -> EvictionPolicy:
+    return RandomEviction(seed=seed)
+
+
+def cost_prefix_eviction(_seed: int = 0) -> EvictionPolicy:
+    return CostPrefixEviction()
+
+
+def eviction_factory_for_kind(kind: EvictionKind, *, seed: int = 0) -> EvictionFactory:
+    if kind == "fifo":
+        return fifo_eviction
+    if kind == "lfu":
+        return lfu_eviction
+    if kind == "random":
+        if seed:
+            return lambda _rng_seed=0: RandomEviction(seed=seed)
+        return random_eviction
+    return lru_eviction
+
+
+def make_eviction(kind: EvictionKind, *, seed: int = 0) -> EvictionPolicy:
+    return eviction_factory_for_kind(kind, seed=seed)(seed)

@@ -13,6 +13,7 @@ from simulator.retention import (
     GlobalCopyCap,
     SingleCopyPerTier,
     UnboundedRetention,
+    consume_on_pull_retention,
 )
 from simulator.kv_content import (
     ContentKey,
@@ -338,7 +339,7 @@ def test_consume_on_pull_e2e() -> None:
         [Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)],
         pool,
         memories,
-        policies_pull("hbm", ["dram"], retention="consume_on_pull"),
+        policies_pull("hbm", ["dram"], retention=consume_on_pull_retention),
         ComputeResource(base_speed=8.0),
         BandwidthResource(base_speed=8.0),
         work_per_block=1.0,

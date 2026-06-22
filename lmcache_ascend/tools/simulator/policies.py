@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .effects import EffectConfig, EffectPolicy
 from .engine_config import EngineConfig, build_placement_spec
 from .read_path import ReadPathSpec
+from .retention import RetentionFactory, consume_on_pull_retention, unbounded_retention
 from .eviction import LRUEviction
 from .plan import EntryPlan, WorkEntry
 from .request import Request, request_owning_prefix_block
@@ -67,10 +68,7 @@ class EnginePolicies:
         mirror_tiers: tuple[str, ...] = (),
         async_write_tiers: frozenset[str] | None = None,
         mirror_on_forward: bool = True,
-        retention: str = "unbounded",
-        global_cap_max: int = 0,
-        global_cap_tiers: tuple[str, ...] = (),
-        global_cap_per_tier: int | None = 1,
+        retention: RetentionFactory | None = None,
     ) -> EnginePolicies:
         g = graph or TierGraph(tiers={})
         if local_memory not in g.tiers and local_eviction is not None:
@@ -91,10 +89,7 @@ class EnginePolicies:
             mirror_tiers=mirror_tiers,
             async_write_tiers=async_write_tiers or frozenset(),
             mirror_on_forward=mirror_on_forward,
-            retention=retention,  # type: ignore[arg-type]
-            global_cap_max=global_cap_max,
-            global_cap_tiers=global_cap_tiers,
-            global_cap_per_tier=global_cap_per_tier,
+            retention=retention or unbounded_retention,
         )
         return cls.from_config(
             EngineConfig(
@@ -117,20 +112,14 @@ class EnginePolicies:
         mirror_tiers: tuple[str, ...] = (),
         async_write_tiers: frozenset[str] | None = None,
         mirror_on_forward: bool = True,
-        retention: str = "unbounded",
-        global_cap_max: int = 0,
-        global_cap_tiers: tuple[str, ...] = (),
-        global_cap_per_tier: int | None = 1,
+        retention: RetentionFactory | None = None,
     ) -> EnginePolicies:
         g = graph or TierGraph(tiers={})
         placement = build_placement_spec(
             mirror_tiers=mirror_tiers,
             async_write_tiers=async_write_tiers or frozenset(),
             mirror_on_forward=mirror_on_forward,
-            retention=retention,  # type: ignore[arg-type]
-            global_cap_max=global_cap_max,
-            global_cap_tiers=global_cap_tiers,
-            global_cap_per_tier=global_cap_per_tier,
+            retention=retention or unbounded_retention,
         )
         return cls.from_config(
             EngineConfig(

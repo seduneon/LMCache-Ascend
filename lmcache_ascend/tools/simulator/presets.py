@@ -7,8 +7,21 @@ from typing import Literal
 
 from .engine import Engine
 from .engine_config import EngineConfig, LifecycleSpec, PlacementSpec, build_placement_spec
-from .eviction import EvictionKind
+from .eviction import (
+    EvictionFactory,
+    fifo_eviction,
+    lfu_eviction,
+    lru_eviction,
+    random_eviction,
+)
 from .read_path import ReadPathSpec
+from .retention import (
+    RetentionFactory,
+    consume_on_pull_retention,
+    global_copy_cap_retention,
+    single_copy_retention,
+    unbounded_retention,
+)
 from .memory import Memory
 from .policies import EnginePolicies
 from .request import Request
@@ -25,15 +38,10 @@ class PresetSpec:
     decode_pull: tuple[str, ...] = ("npu-0:hbm",)
     mirror_tiers: tuple[str, ...] = ()
     async_write_tiers: frozenset[str] = frozenset()
-    retention: Literal[
-        "unbounded", "single_copy", "consume_on_pull", "global_cap"
-    ] = "unbounded"
-    global_cap_max: int = 2
-    global_cap_tiers: tuple[str, ...] = ("npu-0:hbm", "npu-1:hbm")
-    global_cap_per_tier: int | None = None
-    eviction: EvictionKind = "lru"
-    local_eviction: EvictionKind | None = None
-    downstream_eviction: EvictionKind | None = None
+    retention: RetentionFactory = unbounded_retention
+    eviction: EvictionFactory = lru_eviction
+    local_eviction: EvictionFactory | None = None
+    downstream_eviction: EvictionFactory | None = None
     hold_kv_on_complete: bool = True
     prefill_retain_prefix_cache: bool = False
     decode_retain_prefix_cache: bool = False
@@ -48,9 +56,6 @@ def _placement_spec(spec: PresetSpec) -> PlacementSpec:
         async_write_tiers=spec.async_write_tiers,
         mirror_on_forward=spec.mirror_on_forward,
         retention=spec.retention,
-        global_cap_max=spec.global_cap_max,
-        global_cap_tiers=spec.global_cap_tiers,
-        global_cap_per_tier=spec.global_cap_per_tier,
     )
 
 
@@ -110,13 +115,13 @@ PRESETS: dict[str, PresetSpec] = {
         name="consume_on_pull",
         description="baseline + consume source on pull",
         topology="hbm_only",
-        retention="consume_on_pull",
+        retention=consume_on_pull_retention,
     ),
     "single_copy": PresetSpec(
         name="single_copy",
         description="baseline + one copy per tier",
         topology="hbm_only",
-        retention="single_copy",
+        retention=single_copy_retention,
     ),
     "ssd_tier": PresetSpec(
         name="ssd_tier",
@@ -130,10 +135,11 @@ PRESETS: dict[str, PresetSpec] = {
         name="global_cap_2",
         description="baseline + global cap 2 across P/D HBM",
         topology="hbm_only",
-        retention="global_cap",
-        global_cap_max=2,
-        global_cap_tiers=("npu-0:hbm", "npu-1:hbm"),
-        global_cap_per_tier=None,
+        retention=global_copy_cap_retention(
+            max_total=2,
+            tier_keys=("npu-0:hbm", "npu-1:hbm"),
+            per_tier_cap=None,
+        ),
     ),
     "evict_lru": PresetSpec(
         name="evict_lru",
@@ -148,7 +154,7 @@ PRESETS: dict[str, PresetSpec] = {
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
         decode_retain_prefix_cache=True,
-        eviction="lru",
+        eviction=lru_eviction,
     ),
     "evict_fifo": PresetSpec(
         name="evict_fifo",
@@ -163,7 +169,7 @@ PRESETS: dict[str, PresetSpec] = {
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
         decode_retain_prefix_cache=True,
-        eviction="fifo",
+        eviction=fifo_eviction,
     ),
     "evict_random": PresetSpec(
         name="evict_random",
@@ -178,7 +184,7 @@ PRESETS: dict[str, PresetSpec] = {
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
         decode_retain_prefix_cache=True,
-        eviction="random",
+        eviction=random_eviction,
     ),
     "evict_lfu": PresetSpec(
         name="evict_lfu",
@@ -193,7 +199,7 @@ PRESETS: dict[str, PresetSpec] = {
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
         decode_retain_prefix_cache=True,
-        eviction="lfu",
+        eviction=lfu_eviction,
     ),
 }
 
@@ -255,8 +261,8 @@ def build_topology_for_preset(
     tier_keys = TOPOLOGY_TIERS[spec.topology]
     eviction_map = build_eviction_map(
         tier_keys,
-        local_kind=spec.local_eviction or spec.eviction,
-        downstream_kind=spec.downstream_eviction or spec.eviction,
+        local=spec.local_eviction or spec.eviction,
+        downstream=spec.downstream_eviction or spec.eviction,
         rng_seed=rng_seed,
     )
     return build_topology(

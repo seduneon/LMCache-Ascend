@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from enum import StrEnum
-from typing import TYPE_CHECKING
 
 from .eviction import EvictionPolicy, LRUEviction
 from .kv_content import ContentKey, storage_key
 from .memory import KVBlock, Memory, collect_content_copies
 from .request import Request
-
-if TYPE_CHECKING:
-    from .tier import TierGraph
+from .tier import TierGraph
 
 
 class PullDisposition(StrEnum):
@@ -174,3 +172,36 @@ class GlobalCopyCap(RetentionPolicy):
                 mem.remove_block(trimmed[0])
             else:
                 mem.remove_block(victim)
+
+
+from collections.abc import Callable
+
+RetentionFactory = Callable[[TierGraph], RetentionPolicy]
+
+
+def unbounded_retention(graph: TierGraph) -> RetentionPolicy:
+    return UnboundedRetention(graph)
+
+
+def single_copy_retention(graph: TierGraph) -> RetentionPolicy:
+    return SingleCopyPerTier(graph)
+
+
+def consume_on_pull_retention(graph: TierGraph) -> RetentionPolicy:
+    return ConsumeOnPull(graph)
+
+
+def global_copy_cap_retention(
+    max_total: int,
+    tier_keys: tuple[str, ...],
+    per_tier_cap: int | None = 1,
+) -> RetentionFactory:
+    def factory(graph: TierGraph) -> RetentionPolicy:
+        return GlobalCopyCap(
+            max_total,
+            list(tier_keys),
+            per_tier_cap=per_tier_cap,
+            graph=graph,
+        )
+
+    return factory

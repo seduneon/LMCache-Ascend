@@ -9,29 +9,8 @@ from .memory import KVBlock, Memory
 from .placement import HBMOnly, PlacementPolicy, TieredPlacement
 from .plan import StoreOp
 from .request import Request
-from .retention import (
-    ConsumeOnPull,
-    GlobalCopyCap,
-    RetentionPolicy,
-    SingleCopyPerTier,
-    UnboundedRetention,
-)
+from .retention import RetentionPolicy
 from .tier import TierGraph
-
-
-def _build_retention(graph: TierGraph, spec: PlacementSpec) -> RetentionPolicy:
-    if spec.retention == "single_copy":
-        return SingleCopyPerTier(graph)
-    if spec.retention == "consume_on_pull":
-        return ConsumeOnPull(graph)
-    if spec.retention == "global_cap":
-        return GlobalCopyCap(
-            spec.global_cap_max,
-            list(spec.global_cap_tiers),
-            per_tier_cap=spec.global_cap_per_tier,
-            graph=graph,
-        )
-    return UnboundedRetention(graph)
 
 
 def _build_placement(
@@ -60,7 +39,7 @@ class EffectPolicy:
 
     def __init__(self, config: EffectConfig):
         self.config = config
-        self._retention = _build_retention(config.graph, config.placement)
+        self._retention = config.placement.retention(config.graph)
         self._placement = _build_placement(config.graph, config.placement, self._retention)
 
     def on_local_resident(

@@ -5,20 +5,25 @@ from __future__ import annotations
 from typing import Callable
 
 from .engine_config import PlacementSpec, build_placement_spec
-from .eviction import EvictionKind, EvictionPolicy, make_eviction
-from .read_path import ReadPathKind, ReadPathSpec
-from .retention import (
-    ConsumeOnPull,
-    GlobalCopyCap,
-    RetentionPolicy,
-    SingleCopyPerTier,
-    UnboundedRetention,
+from .eviction import (
+    EvictionFactory,
+    fifo_eviction,
+    lfu_eviction,
+    lru_eviction,
+    random_eviction,
 )
-from .tier import TierGraph
+from .read_path import ReadPathSpec
+from .retention import (
+    RetentionFactory,
+    consume_on_pull_retention,
+    global_copy_cap_retention,
+    single_copy_retention,
+    unbounded_retention,
+)
 
 ReadPathFactory = Callable[..., ReadPathSpec]
-EvictionFactory = Callable[..., EvictionPolicy]
-RetentionFactory = Callable[[TierGraph, PlacementSpec], RetentionPolicy]
+EvictionFactoryBuilder = Callable[..., EvictionFactory]
+RetentionFactoryBuilder = Callable[..., RetentionFactory]
 PlacementFactory = Callable[..., PlacementSpec]
 
 READ_PATH_REGISTRY: dict[str, ReadPathFactory] = {
@@ -31,22 +36,23 @@ READ_PATH_REGISTRY: dict[str, ReadPathFactory] = {
     ),
 }
 
-EVICTION_REGISTRY: dict[str, EvictionFactory] = {
-    "lru": lambda seed=0, **_: make_eviction("lru", seed=seed),
-    "fifo": lambda seed=0, **_: make_eviction("fifo", seed=seed),
-    "lfu": lambda seed=0, **_: make_eviction("lfu", seed=seed),
-    "random": lambda seed=0, **_: make_eviction("random", seed=seed),
+EVICTION_FACTORY_REGISTRY: dict[str, EvictionFactoryBuilder] = {
+    "lru": lambda **_: lru_eviction,
+    "fifo": lambda **_: fifo_eviction,
+    "lfu": lambda **_: lfu_eviction,
+    "random": lambda seed=0, **_: (
+        (lambda _rng_seed=0: random_eviction(seed)) if seed else random_eviction
+    ),
 }
 
-RETENTION_REGISTRY: dict[str, RetentionFactory] = {
-    "unbounded": lambda graph, _spec: UnboundedRetention(graph),
-    "single_copy": lambda graph, _spec: SingleCopyPerTier(graph),
-    "consume_on_pull": lambda graph, _spec: ConsumeOnPull(graph),
-    "global_cap": lambda graph, spec: GlobalCopyCap(
-        spec.global_cap_max,
-        list(spec.global_cap_tiers),
-        per_tier_cap=spec.global_cap_per_tier,
-        graph=graph,
+RETENTION_FACTORY_REGISTRY: dict[str, RetentionFactoryBuilder] = {
+    "unbounded": lambda **_: unbounded_retention,
+    "single_copy": lambda **_: single_copy_retention,
+    "consume_on_pull": lambda **_: consume_on_pull_retention,
+    "global_cap": lambda max_total=2, tier_keys=(), per_tier_cap=1, **_: global_copy_cap_retention(
+        max_total=int(max_total),
+        tier_keys=tuple(tier_keys),
+        per_tier_cap=per_tier_cap,
     ),
 }
 
@@ -57,24 +63,31 @@ def make_read_path(name: str, **kwargs) -> ReadPathSpec:
     return READ_PATH_REGISTRY[name](**kwargs)
 
 
-def make_retention(name: str, graph: TierGraph, spec: PlacementSpec) -> RetentionPolicy:
-    if name not in RETENTION_REGISTRY:
+def make_eviction_factory(name: str, **kwargs) -> EvictionFactory:
+    if name not in EVICTION_FACTORY_REGISTRY:
+        raise KeyError(f"unknown eviction: {name!r}")
+    return EVICTION_FACTORY_REGISTRY[name](**kwargs)
+
+
+def make_retention_factory(name: str, **kwargs) -> RetentionFactory:
+    if name not in RETENTION_FACTORY_REGISTRY:
         raise KeyError(f"unknown retention: {name!r}")
-    return RETENTION_REGISTRY[name](graph, spec)
+    return RETENTION_FACTORY_REGISTRY[name](**kwargs)
 
 
 def make_placement(
-  name: str = "default",
-  *,
-  mirror_tiers: tuple[str, ...] = (),
-  async_write_tiers: frozenset[str] = frozenset(),
-  **kwargs,
+    name: str = "default",
+    *,
+    mirror_tiers: tuple[str, ...] = (),
+    async_write_tiers: frozenset[str] = frozenset(),
+    retention: RetentionFactory | None = None,
+    **kwargs,
 ) -> PlacementSpec:
-    del name
+    del name, kwargs
     return build_placement_spec(
         mirror_tiers=mirror_tiers,
         async_write_tiers=async_write_tiers,
-        **kwargs,
+        retention=retention,
     )
 
 
@@ -83,4 +96,8 @@ def list_read_paths() -> list[str]:
 
 
 def list_evictions() -> list[str]:
-    return sorted(EVICTION_REGISTRY)
+    return sorted(EVICTION_FACTORY_REGISTRY)
+
+
+def list_retentions() -> list[str]:
+    return sorted(RETENTION_FACTORY_REGISTRY)

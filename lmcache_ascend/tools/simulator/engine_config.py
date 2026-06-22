@@ -7,6 +7,7 @@ from typing import Literal
 
 from .placement import PlacementEdge
 from .read_path import ReadPathSpec
+from .retention import RetentionFactory, unbounded_retention
 
 
 @dataclass(frozen=True)
@@ -20,12 +21,7 @@ class LifecycleSpec:
 class PlacementSpec:
     edges: tuple[PlacementEdge, ...] = ()
     mirror_on_forward: bool = True
-    retention: Literal[
-        "unbounded", "single_copy", "consume_on_pull", "global_cap"
-    ] = "unbounded"
-    global_cap_max: int = 0
-    global_cap_tiers: tuple[str, ...] = ()
-    global_cap_per_tier: int | None = 1
+    retention: RetentionFactory = unbounded_retention
 
 
 def placement_edges(
@@ -49,22 +45,15 @@ def build_placement_spec(
     mirror_tiers: tuple[str, ...] = (),
     async_write_tiers: frozenset[str] = frozenset(),
     mirror_on_forward: bool = True,
-    retention: Literal[
-        "unbounded", "single_copy", "consume_on_pull", "global_cap"
-    ] = "unbounded",
-    global_cap_max: int = 0,
-    global_cap_tiers: tuple[str, ...] = (),
-    global_cap_per_tier: int | None = 1,
+    retention: RetentionFactory | None = None,
 ) -> PlacementSpec:
     tier_keys = tuple(dict.fromkeys((*mirror_tiers, *async_write_tiers)))
     return PlacementSpec(
         edges=placement_edges(tier_keys, async_write_tiers=async_write_tiers),
         mirror_on_forward=mirror_on_forward,
-        retention=retention,
-        global_cap_max=global_cap_max,
-        global_cap_tiers=global_cap_tiers,
-        global_cap_per_tier=global_cap_per_tier,
+        retention=retention or unbounded_retention,
     )
+
 
 @dataclass(frozen=True)
 class EngineConfig:
