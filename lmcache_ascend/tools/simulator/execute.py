@@ -13,8 +13,8 @@ from .kv_content import (
     tier_has_inflight,
     transfer_work,
 )
-from .cost_model import batch_forward_work, record_entry_metrics
-from .schedule import first_resident_pull_source
+from .estimate import batch_forward_work, record_entry_metrics
+from .block_resolve import first_resident_pull_source
 from .memory import BlockState, KVBlock, Memory
 from .plan import BatchPlan, StoreOp, WorkEntry
 from .request import Request
@@ -47,7 +47,9 @@ class BatchRunner:
             self._reserve(entry)
 
             for victim in entry.plan.evicts:
-                spill_req = self._engine._resolve_spill_req(victim.hash)
+                spill_req = self._engine.cache.resolve_spill_req(
+                    victim.hash, self._engine.known_requests()
+                )
                 if self._engine.sync_evict:
                     self._sync_evict(
                         victim,
@@ -133,36 +135,51 @@ class BatchRunner:
         return self._engine.memories[self._engine.local_memory]
 
     def _add_task(self, task: Task, prereqs: list[Task], batch_id: int) -> None:
+        if self._engine.event_trace is not None:
+            task.trace_meta = {
+                "engine_id": self._engine.engine_id,
+                "batch_id": batch_id,
+            }
         self._engine.pool.add(task, prereqs, batch_id=batch_id)
 
     def _local_resident_cb(self, req: Request) -> BlockCallback:
+        cache = self._engine.cache
+
         def cb(block: KVBlock, now: float) -> None:
-            self._engine._on_local_resident(block, req, now)
+            cache.on_local_resident(block, req, now)
 
         return cb
 
     def _local_evict_cb(self, req: Request) -> BlockCallback:
+        cache = self._engine.cache
+
         def cb(block: KVBlock, now: float) -> None:
-            self._engine._on_local_evict(block, req, now)
+            cache.on_local_evict(block, req, now)
 
         return cb
 
     def _pull_complete_cb(self, req: Request, src_key: str) -> BlockCallback:
+        cache = self._engine.cache
+
         def cb(block: KVBlock, now: float) -> None:
-            self._engine._on_local_resident(block, req, now)
-            self._engine._after_pull(src_key, block.hash, req, now)
+            cache.on_local_resident(block, req, now)
+            cache.after_pull(src_key, block.hash, req)
 
         return cb
 
     def _tier_resident_cb(self, req: Request, tier_key: str) -> BlockCallback:
+        cache = self._engine.cache
+
         def cb(block: KVBlock, now: float) -> None:
-            self._engine._on_tier_resident(tier_key, block, req, now)
+            cache.on_tier_resident(tier_key, block, req, now)
 
         return cb
 
     def _spill_complete_cb(self, req: Request, tier_key: str) -> BlockCallback:
+        cache = self._engine.cache
+
         def cb(block: KVBlock, now: float) -> None:
-            self._engine._on_tier_resident(tier_key, block, req, now)
+            cache.on_tier_resident(tier_key, block, req, now)
             victim = self._spill_removals.pop(id(block), None)
             if victim is not None:
                 self._local().remove_block(victim)
@@ -216,7 +233,7 @@ class BatchRunner:
         batch_id: int,
     ) -> None:
         if spill_req is not None:
-            self._engine._on_local_evict(victim, spill_req, self._at)
+            self._engine.cache.on_local_evict(victim, spill_req, self._at)
         spill_ops = entry.plan.spill_store_ops.get(id(victim), [])
         if spill_req is not None and spill_ops:
             for op in spill_ops:

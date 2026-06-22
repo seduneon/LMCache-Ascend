@@ -459,6 +459,74 @@ def test_lookup_compute() -> None:
     assert result.evicts == []
 
 
+def test_min_cost_pull_prefers_dram_when_compute_expensive() -> None:
+    from simulator.estimate import CostContext
+    from simulator.read_path import ReadPathSpec
+    from simulator.resource import BandwidthResource, ComputeResource
+    from simulator.schedule import ScheduleConfig, SchedulePolicy
+
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    make_resident(memories["dram"], "a")
+    policy = SchedulePolicy(
+        ScheduleConfig(
+            local_memory="hbm",
+            pull_sources=("dram",),
+            read_path=ReadPathSpec(kind="min_cost"),
+        )
+    )
+    req = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.RUNNING)
+    req.prefix_block_count = 1
+    cost_ctx = CostContext(
+        memories=memories,
+        transfer_links={"dram": BandwidthResource(base_speed=100.0)},
+        compute_res=ComputeResource(base_speed=1.0),
+        work_per_transfer=1.0,
+        work_per_prefill_token=1.0,
+        work_per_decode_req=1000.0,
+    )
+    action = policy.resolve_block(
+        memories, "a", allow_compute=True, req=req, cost_ctx=cost_ctx
+    )
+    assert action == ("pull", "dram")
+
+
+def test_threshold_pull_when_cheaper() -> None:
+    from simulator.estimate import CostContext
+    from simulator.read_path import ReadPathSpec
+    from simulator.resource import BandwidthResource, ComputeResource
+    from simulator.schedule import ScheduleConfig, SchedulePolicy
+
+    memories = {
+        "hbm": Memory(size=10, name="hbm"),
+        "dram": Memory(size=10, name="dram"),
+    }
+    make_resident(memories["dram"], "a")
+    policy = SchedulePolicy(
+        ScheduleConfig(
+            local_memory="hbm",
+            pull_sources=("dram",),
+            read_path=ReadPathSpec(kind="threshold", threshold_ratio=0.5),
+        )
+    )
+    req = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.RUNNING)
+    req.prefix_block_count = 1
+    cost_ctx = CostContext(
+        memories=memories,
+        transfer_links={"dram": BandwidthResource(base_speed=100.0)},
+        compute_res=ComputeResource(base_speed=10.0),
+        work_per_transfer=1.0,
+        work_per_prefill_token=1.0,
+        work_per_decode_req=10.0,
+    )
+    action = policy.resolve_block(
+        memories, "a", allow_compute=True, req=req, cost_ctx=cost_ctx
+    )
+    assert action == ("pull", "dram")
+
+
 def test_pull_only_rejects_compute_fallback() -> None:
     memories = {
         "src": Memory(size=10, name="src"),
@@ -611,7 +679,7 @@ def test_request_metrics_pd_decode() -> None:
 
 
 def test_prefix_entry_metrics() -> None:
-    from simulator.cost_model import is_prefix_block, record_entry_metrics
+    from simulator.estimate import is_prefix_block, record_entry_metrics
     from simulator.plan import EntryPlan, WorkEntry
 
     decode = Request(
@@ -981,7 +1049,7 @@ def test_eviction_preset_sweep_smoke() -> None:
             sim=SimConfig.with_block_slots(hbm=24, dram=32),
         )
     )
-    assert len(rows) == 3
+    assert len(rows) == len(EVICTION_PRESET_NAMES)
     assert all(r.status == "ok" for r in rows)
     by_name = {r.preset: r for r in rows}
     assert by_name["evict_lru"].preemptions >= 0
@@ -992,7 +1060,7 @@ def test_eviction_preset_sweep_smoke() -> None:
 def test_load_mooncake_trace() -> None:
     import json
 
-    from simulator.trace import DEFAULT_TRACE_PATH, load_mooncake_trace
+    from simulator.mooncake_trace import DEFAULT_TRACE_PATH, load_mooncake_trace
     from simulator.workload import WorkloadConfig
 
     cfg = WorkloadConfig(
@@ -1023,7 +1091,7 @@ def test_load_mooncake_trace() -> None:
 
 
 def test_partition_by_hbm() -> None:
-    from simulator.trace import (
+    from simulator.mooncake_trace import (
         DEFAULT_TRACE_PATH,
         is_hbm_admittable,
         partition_by_hbm,
@@ -1045,7 +1113,7 @@ def test_partition_by_hbm() -> None:
 
 def test_drop_oversized_sweep_smoke() -> None:
     from simulator.sweep import SimConfig, SweepConfig, run_sweep
-    from simulator.trace import DEFAULT_TRACE_PATH
+    from simulator.mooncake_trace import DEFAULT_TRACE_PATH
 
     rows = run_sweep(
         SweepConfig(
@@ -1072,7 +1140,7 @@ def test_drop_oversized_sweep_smoke() -> None:
 
 def test_trace_sweep_smoke() -> None:
     from simulator.sweep import SimConfig, SweepConfig, run_sweep
-    from simulator.trace import DEFAULT_TRACE_PATH
+    from simulator.mooncake_trace import DEFAULT_TRACE_PATH
 
     rows = run_sweep(
         SweepConfig(
@@ -1093,4 +1161,53 @@ def test_trace_sweep_smoke() -> None:
     assert len(rows) == 1
     assert rows[0].status == "ok", rows[0].error
     assert rows[0].num_requests == 12
+
+
+def test_event_trace_analyzer_roundtrip() -> None:
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from simulator.analyze import analyze, load_events
+    from simulator.presets import PRESETS
+    from simulator.sweep import SimConfig, SweepConfig, run_sweep_case
+    from simulator.workload import WorkloadConfig
+
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_path = Path(tmp) / "trace.jsonl"
+        os.environ["SIM_TRACE"] = "1"
+        os.environ["SIM_TRACE_PATH"] = str(trace_path)
+        try:
+            row = run_sweep_case(
+                PRESETS["min_cost_pull"],
+                WorkloadConfig(num_requests=8, seed=42),
+                SimConfig.with_block_slots(hbm=16, dram=32),
+                sweep_cfg=SweepConfig(read_path="min_cost"),
+            )
+            assert row.status == "ok", row.error
+            assert trace_path.is_file()
+            events = load_events(trace_path)
+            summary = analyze(events)
+            assert summary["event_count"] > 0
+            assert summary["decisions"]
+        finally:
+            os.environ.pop("SIM_TRACE", None)
+            os.environ.pop("SIM_TRACE_PATH", None)
+
+
+def test_policy_matrix_sweep_smoke() -> None:
+    from simulator.sweep import SimConfig, SweepConfig, run_sweep
+
+    rows = run_sweep(
+        SweepConfig(
+            presets=("min_cost_pull", "evict_lfu", "evict_lru"),
+            num_requests=8,
+            seeds=1,
+            base_seed=7,
+            sim=SimConfig.with_block_slots(hbm=24, dram=32),
+        )
+    )
+    assert len(rows) == 3
+    assert all(r.status == "ok" for r in rows)
+    assert rows[0].read_path == "min_cost"
 

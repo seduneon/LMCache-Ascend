@@ -7,9 +7,10 @@ from .events import DecodeSpawn, KvRelease, SimEvent
 from .pd import PDConfig
 from .plan import BatchPlan
 from .request import Request, RequestPD, RequestStatus
+from .event_trace import EventTraceWriter, trace_config_from_env
 from .sim_log import SimLogger
 from .sim_progress import SimProgress
-from .tasks import TaskPool, TaskStatus
+from .tasks import BatchLoadTask, EvictTask, ForwardTask, StoreTask, Task, TaskPool, TaskStatus
 
 
 class Simulator:
@@ -22,6 +23,7 @@ class Simulator:
         pd: PDConfig | None = None,
         log: SimLogger | None = None,
         progress: SimProgress | None = None,
+        event_trace: EventTraceWriter | None = None,
     ):
         self.engines = {eng.engine_id: eng for eng in engines}
         self.pool = pool
@@ -32,6 +34,11 @@ class Simulator:
         self.now = 0.0
         self.log = log
         self.progress = progress
+        self.event_trace = event_trace
+        if self.event_trace is not None:
+            self.event_trace.open()
+        for eng in engines:
+            eng.event_trace = event_trace
         self._in_flight: dict[str, BatchPlan] = {}
         self.event_steps = 0
 
@@ -92,13 +99,78 @@ class Simulator:
             "queues non-empty but no runnable tasks and no pending arrivals"
         )
 
+    def _trace_task_kind(self, task: Task) -> str:
+        if isinstance(task, BatchLoadTask):
+            return "pull"
+        if isinstance(task, StoreTask):
+            return "store"
+        if isinstance(task, ForwardTask):
+            return "forward"
+        if isinstance(task, EvictTask):
+            return "evict"
+        return type(task).__name__
+
+    def _emit_task_starts(self) -> None:
+        if self.event_trace is None:
+            return
+        for task in self.pool.running():
+            meta = task.trace_meta
+            if meta is None or meta.get("started"):
+                continue
+            meta["started"] = True
+            meta["start_t"] = task.now
+            self.event_trace.on_task_start(
+                now=task.now,
+                engine_id=meta.get("engine_id", ""),
+                batch_id=meta.get("batch_id"),
+                task_kind=self._trace_task_kind(task),
+                tier=getattr(task, "memory", None) and task.memory.name,
+                work=task.work_left,
+                resource_busy=task.resource.queued_load(),
+            )
+
+    def _emit_task_ends(self) -> None:
+        if self.event_trace is None:
+            return
+        for task in self.pool.tasks:
+            if task.status != TaskStatus.COMPLETED:
+                continue
+            meta = task.trace_meta
+            if meta is None or meta.get("ended"):
+                continue
+            meta["ended"] = True
+            start_t = meta.get("start_t", self.now)
+            self.event_trace.on_task_end(
+                now=self.now,
+                engine_id=meta.get("engine_id", ""),
+                batch_id=meta.get("batch_id"),
+                task_kind=self._trace_task_kind(task),
+                tier=getattr(task, "memory", None) and task.memory.name,
+                start_t=start_t,
+            )
+
     def _advance_to(self, t_next: float) -> None:
         if self.log:
             self.log.on_time_advance(self, t_next, len(self.pool.running()))
+        if self.event_trace is not None:
+            tiers = {
+                eng.local_memory: {
+                    "used": eng.memories[eng.local_memory].used_size(),
+                    "size": eng.memories[eng.local_memory].size,
+                }
+                for eng in self.engines.values()
+            }
+            for eng in self.engines.values():
+                for name, mem in eng.memories.items():
+                    if name not in tiers:
+                        tiers[name] = {"used": mem.used_size(), "size": mem.size}
+            self.event_trace.on_tier_sample(now=t_next, tiers=tiers)
         self.now = t_next
         self.pool.advance_running_to(self.now)
         self.pool.finish_done()
+        self._emit_task_ends()
         self.pool.start_ready(self.now)
+        self._emit_task_starts()
         self.pool.compact()
 
     def dispatch(self, event: SimEvent) -> None:
@@ -258,6 +330,8 @@ class Simulator:
             self.progress.finish(self, hit_max_steps=hit_max_steps)
         if self.log:
             self.log.on_run_end(self, steps=steps, hit_max_steps=hit_max_steps)
+        if self.event_trace is not None:
+            self.event_trace.close()
 
         return self.now
 

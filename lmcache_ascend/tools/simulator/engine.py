@@ -1,9 +1,10 @@
-from .kv_content import ContentKey
+from .connector import TierCacheConnector
+from .engine_config import LifecycleSpec
 from .execute import BatchRunner
-from .memory import KVBlock, Memory, collect_content_copies
-from .plan import BatchPlan, StoreOp, WorkEntry, dedupe_batch_evicts
-from .policies import EnginePolicies, enrich_entry_plan
-from .request import Request, RequestPD, RequestStatus, request_owning_prefix_block
+from .memory import KVBlock, Memory
+from .plan import BatchPlan, dedupe_batch_evicts
+from .policies import EnginePolicies
+from .request import Request, RequestPD, RequestStatus
 from .resource import BandwidthResource, ComputeResource
 from .scheduler import Scheduler
 from .tasks import TaskPool
@@ -45,6 +46,8 @@ class Engine:
         work_per_prefill_token: float | None = None,
         work_per_decode_req: float | None = None,
         sync_evict: bool = True,
+        interconnect: BandwidthResource | None = None,
+        event_trace=None,
     ):
         self.engine_id = engine_id
         self.pool = pool
@@ -80,8 +83,47 @@ class Engine:
         self.hold_kv_on_complete = hold_kv_on_complete
         self.retain_prefix_cache = retain_prefix_cache
         self.store_tiers_on_complete = tuple(store_tiers_on_complete)
-        self._peak_duplicate_count = 0
+        self.interconnect = interconnect
+        self.event_trace = event_trace
         self._next_batch_id = 0
+        if event_trace is not None:
+            for tier in merged_graph.tiers.values():
+                tier_key = tier.key
+
+                def _tier_evict_cb(
+                    now: float, block: KVBlock, *, key: str = tier_key
+                ) -> None:
+                    event_trace.on_evict(
+                        now=now,
+                        engine_id=engine_id,
+                        tier=key,
+                        block_hash=block.hash,
+                        policy="tier",
+                    )
+
+                tier.on_tier_evict = _tier_evict_cb
+
+        lifecycle = LifecycleSpec(
+            hold_kv_on_complete=hold_kv_on_complete,
+            retain_prefix_cache=retain_prefix_cache,
+            store_on_complete=tuple(store_tiers_on_complete),
+        )
+        self.cache = TierCacheConnector(
+            engine_id=engine_id,
+            policies=policies,
+            memories=memories,
+            graph=merged_graph,
+            lifecycle=lifecycle,
+            local_tier=self.local_memory,
+            compute_res=compute_res,
+            transfer_links=self.transfer_links,
+            write_links=self.write_links,
+            work_per_transfer=self.work_per_transfer,
+            work_per_prefill_token=self.work_per_prefill_token,
+            work_per_decode_req=self.work_per_decode_req,
+            interconnect=interconnect,
+            event_trace=event_trace,
+        )
 
         self.scheduler = Scheduler(
             schedule,
@@ -95,37 +137,7 @@ class Engine:
         )
         for req in requests:
             self.scheduler.add_request(req)
-        self.scheduler.set_release_handler(self._release_request_kv)
-
-    def _release_request_kv(
-        self,
-        req: Request,
-        *,
-        preempted: bool,
-        now: float,
-    ) -> None:
-        stored = True
-        if not preempted and self.store_tiers_on_complete:
-            stored = self.policies.effects.store_prefix_on_complete(
-                self.memories,
-                req=req,
-                now=now,
-                tier_keys=self.store_tiers_on_complete,
-            )
-        retain_hashes: set[str] | None = None
-        prefix_hashes = set(req.block_hashes[: req.prefix_block_count])
-        if self.retain_prefix_cache and not preempted:
-            retain_hashes = prefix_hashes
-        elif (
-            not preempted
-            and self.store_tiers_on_complete
-            and not stored
-        ):
-            retain_hashes = prefix_hashes
-        self.memories[self.local_memory].free_request(
-            req.req_id,
-            retain_hashes=retain_hashes,
-        )
+        self.scheduler.set_release_handler(self.cache.release_request_kv)
 
     @property
     def waiting(self):
@@ -149,6 +161,13 @@ class Engine:
 
     def schedule_request(self, req: Request) -> None:
         self.scheduler.add_request(req)
+        if self.event_trace is not None:
+            self.event_trace.on_request_phase(
+                now=req.arrival_time,
+                engine_id=self.engine_id,
+                req_id=req.req_id,
+                phase=f"{req.pd.value}_admitted",
+            )
 
     def release_arrivals(self, now: float) -> None:
         self.scheduler.release_arrivals(now)
@@ -156,72 +175,30 @@ class Engine:
     def next_arrival(self) -> float | None:
         return self.scheduler.next_arrival()
 
-    def _known_requests(self) -> list[Request]:
+    def known_requests(self) -> list[Request]:
         return [
             *self.scheduler.waiting,
             *self.scheduler.running,
             *self.scheduler.completed,
         ]
 
-    def _resolve_spill_req(self, block_hash: str) -> Request | None:
-        return request_owning_prefix_block(block_hash, self._known_requests())
-
-    def _track_duplicates(self, req: Request | None, block_hash: str) -> None:
-        content = ContentKey.from_slot(block_hash)
-        count = len(
-            collect_content_copies(
-                self.memories,
-                list(self.memories.keys()),
-                content,
-                req=req,
-            )
-        )
-        self._peak_duplicate_count = max(self._peak_duplicate_count, count)
-
-    def _on_local_resident(self, block: KVBlock, req: Request, now: float) -> None:
-        self.policies.effects.on_local_resident(self.memories, block, req, now)
-        self._track_duplicates(req, block.hash)
-    def _on_tier_resident(
-        self, tier_key: str, block: KVBlock, req: Request, now: float
-    ) -> None:
-        self.policies.effects.on_tier_resident(
-            self.memories, tier_key, block, req, now
-        )
-        self._track_duplicates(req, block.hash)
-
-    def _after_pull(
-        self, src_key: str, block_hash: str, req: Request, now: float
-    ) -> None:
-        del now
-        self.policies.effects.after_pull(
-            self.memories, src_key, block_hash, req
-        )
-
-    def _on_local_evict(self, victim: KVBlock, spill_req: Request, now: float) -> None:
-        self.policies.effects.on_local_evict(self.memories, victim, spill_req, now)
-    def _enrich_scheduled(self, scheduled) -> None:
-        known = self._known_requests()
-        for entry in scheduled.entries:
-            enrich_entry_plan(
-                entry.plan,
-                entry=entry,
-                effects=self.policies.effects,
-                memories=self.memories,
-                known_requests=known,
-            )
-
     def _execute_plan(self, plan: BatchPlan) -> None:
         BatchRunner(self, plan.scheduled_at).run(plan)
 
     def try_schedule_and_execute(self, now: float) -> BatchPlan | None:
         """Admit → plan → enrich → execute; returns ``None`` when idle."""
+        self.scheduler.set_cost_context(self.cache.build_cost_context(now))
+        if self.event_trace is not None:
+            self.scheduler.set_trace_writer(
+                self.event_trace, engine_id=self.engine_id
+            )
         scheduled = self.scheduler.schedule(
             now,
             engine_id=self.engine_id,
         )
         if not scheduled.entries:
             return None
-        self._enrich_scheduled(scheduled)
+        self.cache.enrich_plan(scheduled, known_requests=self.known_requests())
         batch_id = self._next_batch_id
         self._next_batch_id += 1
         plan = BatchPlan(
@@ -268,6 +245,13 @@ class Engine:
                 else:
                     self.scheduler.finish_request(req, now=now)
                 finished.append(req)
+                if self.event_trace is not None:
+                    self.event_trace.on_request_phase(
+                        now=now,
+                        engine_id=self.engine_id,
+                        req_id=req.req_id,
+                        phase=f"{req.pd.value}_complete",
+                    )
 
         return finished, remote_kv_done
 
@@ -276,4 +260,4 @@ class Engine:
         if req is None:
             self.memories[self.local_memory].free_request(req_id)
             return
-        self._release_request_kv(req, preempted=False, now=0.0)
+        self.cache.release_request_kv(req, preempted=False, now=0.0)

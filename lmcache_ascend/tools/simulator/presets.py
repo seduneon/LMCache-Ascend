@@ -8,6 +8,7 @@ from typing import Literal
 from .engine import Engine
 from .engine_config import EngineConfig, LifecycleSpec, PlacementSpec, build_placement_spec
 from .eviction import EvictionKind
+from .read_path import ReadPathSpec
 from .memory import Memory
 from .policies import EnginePolicies
 from .request import Request
@@ -38,6 +39,7 @@ class PresetSpec:
     decode_retain_prefix_cache: bool = False
     store_on_complete: tuple[str, ...] = ()
     mirror_on_forward: bool = True
+    decode_read_path: ReadPathSpec | None = None
 
 
 def _placement_spec(spec: PresetSpec) -> PlacementSpec:
@@ -72,6 +74,7 @@ def decode_config(spec: PresetSpec, topo: Topology) -> EngineConfig:
         local_tier=topo.decode_local_tier,
         pull_sources=topo.decode_pull_sources(spec.decode_pull),
         pull_mode="ordered_pull",
+        read_path=spec.decode_read_path,
         placement=_placement_spec(spec),
         lifecycle=LifecycleSpec(
             retain_prefix_cache=spec.decode_retain_prefix_cache,
@@ -89,6 +92,12 @@ PRESETS: dict[str, PresetSpec] = {
         name="ordered_pull",
         description="Same as baseline (explicit ordered-pull decode)",
         topology="hbm_only",
+    ),
+    "min_cost_pull": PresetSpec(
+        name="min_cost_pull",
+        description="baseline topology; decode uses min-cost pull vs recompute",
+        topology="hbm_only",
+        decode_read_path=ReadPathSpec(kind="min_cost"),
     ),
     "dram_tier": PresetSpec(
         name="dram_tier",
@@ -171,12 +180,28 @@ PRESETS: dict[str, PresetSpec] = {
         decode_retain_prefix_cache=True,
         eviction="random",
     ),
+    "evict_lfu": PresetSpec(
+        name="evict_lfu",
+        description=(
+            "LMCache PD: P offloads prefix to DRAM on complete and frees P HBM; "
+            "D pulls prefix from DRAM only; D keeps APC on D HBM; LFU on all tiers"
+        ),
+        topology="hbm_dram",
+        decode_pull=("npu-0:dram",),
+        mirror_tiers=("npu-0:dram",),
+        mirror_on_forward=False,
+        store_on_complete=("npu-0:dram",),
+        hold_kv_on_complete=False,
+        decode_retain_prefix_cache=True,
+        eviction="lfu",
+    ),
 }
 
 EVICTION_PRESET_NAMES: tuple[str, ...] = (
     "evict_lru",
     "evict_fifo",
     "evict_random",
+    "evict_lfu",
 )
 
 DEFAULT_PRESET_NAMES: tuple[str, ...] = (

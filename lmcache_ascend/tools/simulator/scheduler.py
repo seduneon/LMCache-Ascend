@@ -3,7 +3,7 @@ from __future__ import annotations
 import heapq
 from collections import deque
 
-from .schedule import SchedulePolicy, local_satisfied
+from .block_resolve import local_satisfied
 from .kv_content import tier_has_block, tier_has_inflight
 from .memory import Memory
 from .plan import EntryPlan, ScheduleResult, WorkEntry
@@ -34,6 +34,9 @@ class Scheduler:
         self.enable_chunked_prefill = enable_chunked_prefill
         self.remote_kv_wait = remote_kv_wait
         self._release_handler = None
+        self._cost_ctx = None
+        self._trace_writer = None
+        self._trace_engine_id: str | None = None
 
         self.pending: list[tuple[float, str, Request]] = []
         self.waiting: deque[Request] = deque()
@@ -42,6 +45,13 @@ class Scheduler:
 
     def _local(self) -> Memory:
         return self.memories[self.local_memory]
+
+    def set_cost_context(self, cost_ctx) -> None:
+        self._cost_ctx = cost_ctx
+
+    def set_trace_writer(self, writer, *, engine_id: str) -> None:
+        self._trace_writer = writer
+        self._trace_engine_id = engine_id
 
     def set_release_handler(self, handler) -> None:
         self._release_handler = handler
@@ -356,6 +366,9 @@ class Scheduler:
                 allow_compute=not pull_only,
                 req=req,
                 block_size=self.block_size,
+                cost_ctx=self._cost_ctx,
+                trace_writer=self._trace_writer,
+                engine_id=self._trace_engine_id,
             )
             if plan is not None:
                 return plan

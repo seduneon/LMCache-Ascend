@@ -5,20 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from .block_resolve import (
+    BlockResolution,
+    first_resident_pull_source,
+    local_satisfied,
+    remote_wait_source,
+)
 from .eviction import EvictionPolicy, LRUEviction
 from .memory import Memory
 from .plan import BlockAction, BlockActions, EntryPlan
+from .read_path import ReadPathPolicy, ReadPathSpec, read_path_from_pull_mode
 from .request import Request
 
 _LOCAL = Literal["local"]
-BlockResolution = BlockAction | _LOCAL | None
-
-
-def local_satisfied(local: Memory, block_hash: str) -> bool:
-    return (
-        local.best_resident(block_hash) is not None
-        or local.inflight_incoming(block_hash) is not None
-    )
 
 
 def slots_needed(actions: BlockActions) -> int:
@@ -30,53 +29,26 @@ def slots_needed(actions: BlockActions) -> int:
     )
 
 
-def remote_wait_source(
-    memories: dict[str, Memory],
-    pull_sources: list[str],
-    block_hash: str,
-    *,
-    req: Request | None = None,
-) -> str | None:
-    from .kv_content import tier_has_block, tier_has_inflight
-
-    for src_key in pull_sources:
-        src = memories[src_key]
-        if tier_has_block(src, req, block_hash):
-            continue
-        if tier_has_inflight(src, req, block_hash):
-            return src_key
-    return None
-
-
-def first_resident_pull_source(
-    memories: dict[str, Memory],
-    pull_sources: list[str],
-    block_hash: str,
-    *,
-    req: Request | None = None,
-) -> str | None:
-    from .kv_content import tier_has_block
-
-    for src_key in pull_sources:
-        src = memories[src_key]
-        if tier_has_block(src, req, block_hash):
-            return src_key
-    return None
-
-
 @dataclass(frozen=True)
 class ScheduleConfig:
     local_memory: str
     pull_sources: tuple[str, ...] = ()
     pull_mode: Literal["compute_only", "ordered_pull"] = "compute_only"
+    read_path: ReadPathSpec | None = None
     local_eviction: EvictionPolicy = field(default_factory=LRUEviction)
+
+    def resolved_read_path(self) -> ReadPathSpec:
+        if self.read_path is not None:
+            return self.read_path
+        return read_path_from_pull_mode(self.pull_mode)
 
 
 class SchedulePolicy:
-    """Resolve per-block actions and HBM evictions at admit time."""
+    """Resolve per-block actions and local-tier evictions at admit time."""
 
     def __init__(self, config: ScheduleConfig):
         self.config = config
+        self._read_path = ReadPathPolicy(config.resolved_read_path())
 
     @property
     def local_memory(self) -> str:
@@ -90,6 +62,10 @@ class SchedulePolicy:
     def eviction_policy(self) -> EvictionPolicy:
         return self.config.local_eviction
 
+    @property
+    def read_path_policy(self) -> ReadPathPolicy:
+        return self._read_path
+
     def lookup(
         self,
         memories: dict[str, Memory],
@@ -98,6 +74,9 @@ class SchedulePolicy:
         allow_compute: bool = True,
         req: Request | None = None,
         block_size: int = 1,
+        cost_ctx=None,
+        trace_writer=None,
+        engine_id: str | None = None,
     ) -> EntryPlan | None:
         del block_size
         actions = self.resolve_actions(
@@ -105,6 +84,9 @@ class SchedulePolicy:
             block_hashes,
             allow_compute=allow_compute,
             req=req,
+            cost_ctx=cost_ctx,
+            trace_writer=trace_writer,
+            engine_id=engine_id,
         )
         if actions is None:
             return None
@@ -122,6 +104,9 @@ class SchedulePolicy:
         *,
         allow_compute: bool = True,
         req: Request | None = None,
+        cost_ctx=None,
+        trace_writer=None,
+        engine_id: str | None = None,
     ) -> BlockActions | None:
         actions: BlockActions = {}
         for block_hash in block_hashes:
@@ -130,7 +115,15 @@ class SchedulePolicy:
                 block_hash,
                 allow_compute=allow_compute,
                 req=req,
+                cost_ctx=cost_ctx,
             )
+            if trace_writer is not None and req is not None:
+                trace_writer.on_decision(
+                    now=cost_ctx.now if cost_ctx is not None else 0.0,
+                    engine_id=engine_id or "",
+                    req_id=req.req_id,
+                    decision=self._read_path.last_decision,
+                )
             if resolution is None:
                 return None
             if resolution == "local":
@@ -145,25 +138,14 @@ class SchedulePolicy:
         *,
         allow_compute: bool,
         req: Request | None = None,
+        cost_ctx=None,
     ) -> BlockResolution:
-        local = memories[self.local_memory]
-        if local_satisfied(local, block_hash):
-            return "local"
-
-        if self.config.pull_mode == "compute_only":
-            if allow_compute:
-                return "compute"
-            return None
-
-        if remote_wait_source(memories, self.pull_sources, block_hash, req=req) is not None:
-            return "wait"
-
-        src_key = first_resident_pull_source(
-            memories, self.pull_sources, block_hash, req=req
+        return self._read_path.resolve(
+            memories,
+            local_memory=self.local_memory,
+            pull_sources=self.pull_sources,
+            block_hash=block_hash,
+            allow_compute=allow_compute,
+            req=req,
+            cost_ctx=cost_ctx,
         )
-        if src_key is not None:
-            return ("pull", src_key)
-
-        if allow_compute:
-            return "compute"
-        return None

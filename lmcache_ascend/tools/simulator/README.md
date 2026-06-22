@@ -35,7 +35,7 @@ Simulator.step()
 
 | Module | Role |
 |--------|------|
-| `tier.py` | `Tier` (memory + eviction), `TierGraph` |
+| `tier.py` | `Tier`, `TierGraph`, `TierAllocator` |
 | `engine_config.py` | `EngineConfig`, `LifecycleSpec`, `PlacementSpec` per engine |
 | `policies.py` | `EnginePolicies.from_config()` — schedule + effects bundle |
 | `schedule.py` | `SchedulePolicy`: block resolution + local-tier eviction at admit |
@@ -47,7 +47,8 @@ Simulator.step()
 | `placement.py` | `PlacementEdge`, `ensure_downstream_copy`, `TieredPlacement` |
 | `retention.py` | Duplicate caps, consume-on-pull, global copy limits |
 | `eviction.py` | `LRUEviction`, `FIFOEviction`, `RandomEviction`, `make_eviction` |
-| `tier_allocator.py` | Downstream tier slot acquire via `tier.eviction` |
+| `estimate.py` | Forward/recompute work units + `CostContext` pull/compute estimates |
+| `mooncake_trace.py` | Mooncake JSONL workload replay (`load_mooncake_trace`) |
 | `kv_content.py` | `ContentKey`, tier slot mapping |
 | `events.py` | Cross-engine messages (`DecodeSpawn`, `KvRelease`) |
 

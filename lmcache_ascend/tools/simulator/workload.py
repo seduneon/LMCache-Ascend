@@ -29,7 +29,7 @@ class WorkloadConfig:
 def build_workload(cfg: WorkloadConfig) -> tuple[list[Request], list[str]]:
     """Synthetic generator or Mooncake trace replay, depending on cfg."""
     if cfg.trace_path is not None:
-        from .trace import load_mooncake_trace
+        from .mooncake_trace import load_mooncake_trace
 
         return load_mooncake_trace(cfg)
     return generate_prefill_workload(cfg)

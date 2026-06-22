@@ -29,6 +29,7 @@ class Task(ABC):
         self.status = TaskStatus.PENDING
         self.batch_id: int | None = None
         self._resource_reserved = False
+        self.trace_meta: dict | None = None
 
     def reserve_resource(self) -> None:
         if self._resource_reserved:

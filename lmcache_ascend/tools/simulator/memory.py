@@ -32,9 +32,11 @@ class KVBlock:
         self.holders: set[str] = holders if holders is not None else set()
         self.last_touch: float = last_touch
         self.insert_seq: int = insert_seq
+        self.access_count: int = 0
 
     def touch(self, t: float) -> None:
         self.last_touch = t
+        self.access_count += 1
 
 
 class Memory:

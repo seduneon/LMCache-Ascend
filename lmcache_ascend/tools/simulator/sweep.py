@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
+import json
 import statistics
 import sys
 import time
@@ -20,6 +22,9 @@ from .presets import (
     build_pd_engines,
 )
 from .request import RequestPD, RequestStatus
+from .registry import make_read_path
+from .resource import BandwidthResource
+from .event_trace import EventTraceWriter, trace_config_from_env
 from .sim_log import SimLogConfig, SimLogger
 from .sim_progress import SimProgress, SimProgressConfig
 from .simulator import Simulator
@@ -32,7 +37,7 @@ from .capacity import (
     gib_for_blocks,
     kv_bytes_per_token,
 )
-from .trace import (
+from .mooncake_trace import (
     DEFAULT_TRACE_PATH,
     MOONCAKE_TOKENS_PER_BLOCK,
     partition_by_hbm,
@@ -58,6 +63,7 @@ class SimConfig:
     max_num_batched_tokens: int = 24
     compute_speed: float = 64.0
     link_speed: float = 32.0
+    interconnect_speed: float | None = None
     link_latency: float = 0.01
     work_per_block: float = 1.0
     work_per_transfer: float = 1.0
@@ -205,6 +211,7 @@ class SweepRow:
     ssd_slots_used: int = 0
     peak_duplicate_count: int = 0
     tier_used_at_end: str = ""
+    read_path: str = ""
 
 
 SWEEP_CSV_FIELDS = [f.name for f in SweepRow.__dataclass_fields__.values()]
@@ -267,6 +274,7 @@ def _aggregate_metrics(
     memories: dict,
     admittable_requests: int,
     rejected_requests: int,
+    read_path: str = "",
 ) -> SweepRow:
     decode_latencies = [
         r.metrics.latency
@@ -330,7 +338,7 @@ def _aggregate_metrics(
     dram_slots_used = dram.used_size() if dram is not None else 0
     ssd = memories.get("npu-0:ssd")
     ssd_slots_used = ssd.used_size() if ssd is not None else 0
-    peak_dup = max(npu0._peak_duplicate_count, npu1._peak_duplicate_count)
+    peak_dup = max(npu0.cache.peak_duplicate_count, npu1.cache.peak_duplicate_count)
 
     return SweepRow(
         preset=preset,
@@ -367,6 +375,21 @@ def _aggregate_metrics(
         ssd_slots_used=ssd_slots_used,
         peak_duplicate_count=peak_dup,
         tier_used_at_end=tier_used_at_end,
+        read_path=read_path,
+    )
+
+
+def _effective_preset(preset: PresetSpec, sweep_cfg: SweepConfig) -> PresetSpec:
+    from dataclasses import replace
+
+    if not sweep_cfg.read_path:
+        return preset
+    return replace(
+        preset,
+        decode_read_path=make_read_path(
+            sweep_cfg.read_path,
+            threshold_ratio=sweep_cfg.pull_threshold,
+        ),
     )
 
 
@@ -376,7 +399,12 @@ def run_sweep_case(
     sim_cfg: SimConfig,
     *,
     drop_oversized: bool = False,
+    sweep_cfg: SweepConfig | None = None,
 ) -> SweepRow:
+    preset = _effective_preset(preset, sweep_cfg) if sweep_cfg else preset
+    read_path_label = ""
+    if preset.decode_read_path is not None:
+        read_path_label = preset.decode_read_path.kind
     requests, _ = build_workload(workload)
     resources = sim_cfg.resources(tokens_per_block=workload.tokens_per_block)
     hbm_slots = resources.hbm_size
@@ -408,6 +436,14 @@ def run_sweep_case(
         rng_seed=workload.seed,
         tokens_per_block=workload.tokens_per_block,
     )
+    if sim_cfg.interconnect_speed is not None:
+        interconnect = BandwidthResource(
+            base_speed=sim_cfg.interconnect_speed,
+            latency=sim_cfg.link_latency,
+        )
+        for eng in (npu0, npu1):
+            eng.interconnect = interconnect
+            eng.cache.interconnect = interconnect
 
     progress = (
         SimProgress(
@@ -419,6 +455,10 @@ def run_sweep_case(
         if sim_cfg.show_progress
         else None
     )
+    trace_writer = None
+    trace_cfg = trace_config_from_env()
+    if trace_cfg.enabled:
+        trace_writer = EventTraceWriter(trace_cfg)
     sim = Simulator(
         [npu0, npu1],
         pool,
@@ -428,6 +468,7 @@ def run_sweep_case(
         ),
         log=SimLogger(SimLogConfig(enabled=False)),
         progress=progress,
+        event_trace=trace_writer,
     )
 
     wall_timeout = sim_cfg.wall_timeout_s
@@ -522,6 +563,7 @@ def run_sweep_case(
         memories=memories,
         admittable_requests=admittable_requests,
         rejected_requests=rejected_requests,
+        read_path=read_path_label,
     )
 
 
@@ -539,6 +581,9 @@ class SweepConfig:
     trace_time_scale: float = 0.001
     tokens_per_block: int = MOONCAKE_TOKENS_PER_BLOCK
     drop_oversized: bool = False
+    read_path: str | None = None
+    pull_threshold: float = 1.0
+    experiment_spec: str | None = None
 
 
 def _workload_config(cfg: SweepConfig, seed: int) -> WorkloadConfig:
@@ -616,9 +661,60 @@ def _print_tier_capacity(sim_cfg: SimConfig, *, tokens_per_block: int) -> None:
     print(f"tier capacity: {'; '.join(parts)}", flush=True)
 
 
+def _expand_sweep_configs(cfg: SweepConfig) -> list[SweepConfig]:
+    """Expand a JSON experiment spec into a cartesian product of sweep axes."""
+    if not cfg.experiment_spec:
+        return [cfg]
+    from dataclasses import replace
+
+    with open(cfg.experiment_spec, encoding="utf-8") as handle:
+        spec = json.load(handle)
+    presets = tuple(spec.get("presets", cfg.presets))
+    read_paths = spec.get("read_paths", [cfg.read_path])
+    pull_thresholds = spec.get("pull_thresholds", [cfg.pull_threshold])
+    link_speeds = spec.get("link_speeds", [cfg.sim.link_speed])
+    interconnect_speeds = spec.get(
+        "interconnect_speeds", [cfg.sim.interconnect_speed]
+    )
+    compute_speeds = spec.get("compute_speeds", [cfg.sim.compute_speed])
+    seeds = spec.get("seeds", cfg.seeds)
+    num_requests = spec.get("num_requests", cfg.num_requests)
+
+    expanded: list[SweepConfig] = []
+    for preset, read_path, pull_thr, link, ic, compute in itertools.product(
+        presets,
+        read_paths,
+        pull_thresholds,
+        link_speeds,
+        interconnect_speeds,
+        compute_speeds,
+    ):
+        sim = replace(
+            cfg.sim,
+            link_speed=float(link),
+            interconnect_speed=ic,
+            compute_speed=float(compute),
+        )
+        expanded.append(
+            replace(
+                cfg,
+                presets=(preset,),
+                num_requests=num_requests,
+                seeds=seeds,
+                sim=sim,
+                read_path=read_path,
+                pull_threshold=float(pull_thr),
+                experiment_spec=None,
+            )
+        )
+    return expanded
+
+
 def run_sweep(cfg: SweepConfig) -> list[SweepRow]:
     rows: list[SweepRow] = []
-    unknown = [name for name in cfg.presets if name not in PRESETS]
+    configs = _expand_sweep_configs(cfg)
+    preset_names = {name for c in configs for name in c.presets}
+    unknown = [name for name in preset_names if name not in PRESETS]
     if unknown:
         raise ValueError(f"unknown presets: {unknown} (choose from {sorted(PRESETS)})")
 
@@ -639,18 +735,21 @@ def run_sweep(cfg: SweepConfig) -> list[SweepRow]:
                 flush=True,
             )
 
-    for preset_name in cfg.presets:
-        preset = PRESETS[preset_name]
-        for i in range(cfg.seeds):
-            seed = cfg.base_seed + i
-            workload = _workload_config(cfg, seed)
-            row = run_sweep_case(
-                preset,
-                workload,
-                sim_cfg,
-                drop_oversized=cfg.drop_oversized,
-            )
-            rows.append(row)
+    for sweep_cfg in configs:
+        case_sim = sweep_cfg.sim
+        for preset_name in sweep_cfg.presets:
+            preset = PRESETS[preset_name]
+            for i in range(sweep_cfg.seeds):
+                seed = sweep_cfg.base_seed + i
+                workload = _workload_config(sweep_cfg, seed)
+                row = run_sweep_case(
+                    preset,
+                    workload,
+                    case_sim,
+                    drop_oversized=sweep_cfg.drop_oversized,
+                    sweep_cfg=sweep_cfg,
+                )
+                rows.append(row)
 
     if cfg.raw_csv_path:
         _write_raw_csv(cfg.raw_csv_path, rows)
@@ -788,6 +887,40 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--read-path",
+        default=None,
+        help="Override decode read-path policy (ordered_pull, min_cost, threshold, ...)",
+    )
+    parser.add_argument(
+        "--pull-threshold",
+        type=float,
+        default=1.0,
+        help="Threshold ratio for threshold read-path policy",
+    )
+    parser.add_argument(
+        "--link-speed",
+        type=float,
+        default=None,
+        help="Override per-tier read link base speed (GiB/s)",
+    )
+    parser.add_argument(
+        "--interconnect-speed",
+        type=float,
+        default=None,
+        help="Optional shared interconnect base speed (GiB/s)",
+    )
+    parser.add_argument(
+        "--compute-speed",
+        type=float,
+        default=None,
+        help="Override compute resource base speed",
+    )
+    parser.add_argument(
+        "--experiment-spec",
+        metavar="PATH",
+        help="JSON file enumerating sweep axes (cartesian product)",
+    )
+    parser.add_argument(
         "--dram-chunk-blocks",
         type=int,
         default=4,
@@ -855,6 +988,9 @@ def main(argv: list[str] | None = None) -> None:
         tokens_per_block=args.tokens_per_block,
         dram_chunk_blocks=args.dram_chunk_blocks,
         show_progress=args.progress,
+        link_speed=args.link_speed if args.link_speed is not None else 32.0,
+        interconnect_speed=args.interconnect_speed,
+        compute_speed=args.compute_speed if args.compute_speed is not None else 64.0,
     )
     cfg = SweepConfig(
         presets=preset_names,
@@ -869,6 +1005,9 @@ def main(argv: list[str] | None = None) -> None:
         trace_time_scale=args.trace_time_scale,
         tokens_per_block=args.tokens_per_block,
         drop_oversized=args.drop_oversized,
+        read_path=args.read_path,
+        pull_threshold=args.pull_threshold,
+        experiment_spec=args.experiment_spec,
     )
 
     rows = run_sweep(cfg)

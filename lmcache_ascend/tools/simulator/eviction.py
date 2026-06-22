@@ -8,7 +8,7 @@ from typing import Literal
 
 from .memory import KVBlock, Memory
 
-EvictionKind = Literal["lru", "fifo", "random"]
+EvictionKind = Literal["lru", "fifo", "random", "lfu"]
 
 
 def _evictable_candidates(memory: Memory, exclude: set[str]) -> list[KVBlock]:
@@ -23,6 +23,11 @@ def _evictable_candidates(memory: Memory, exclude: set[str]) -> list[KVBlock]:
 
 
 class EvictionPolicy(ABC):
+    def score(self, block: KVBlock, *, now: float = 0.0) -> float:
+        """Lower score = evict first."""
+        del now
+        return block.last_touch
+
     @abstractmethod
     def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
         pass
@@ -42,18 +47,39 @@ class EvictionPolicy(ABC):
 class LRUEviction(EvictionPolicy):
     """Evict resident, unheld blocks with the oldest ``last_touch`` first."""
 
+    def score(self, block: KVBlock, *, now: float = 0.0) -> float:
+        del now
+        return block.last_touch
+
     def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
         candidates = _evictable_candidates(memory, exclude)
-        candidates.sort(key=lambda block: block.last_touch)
+        candidates.sort(key=lambda block: self.score(block))
+        return candidates[:count]
+
+
+class LFUEviction(EvictionPolicy):
+    """Evict blocks with lowest access count."""
+
+    def score(self, block: KVBlock, *, now: float = 0.0) -> float:
+        del now
+        return float(block.access_count)
+
+    def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+        candidates = _evictable_candidates(memory, exclude)
+        candidates.sort(key=lambda block: self.score(block))
         return candidates[:count]
 
 
 class FIFOEviction(EvictionPolicy):
     """Evict resident, unheld blocks with the oldest ``insert_seq`` first."""
 
+    def score(self, block: KVBlock, *, now: float = 0.0) -> float:
+        del now
+        return float(block.insert_seq)
+
     def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
         candidates = _evictable_candidates(memory, exclude)
-        candidates.sort(key=lambda block: block.insert_seq)
+        candidates.sort(key=lambda block: self.score(block))
         return candidates[:count]
 
 
@@ -70,9 +96,24 @@ class RandomEviction(EvictionPolicy):
         return self._rng.sample(candidates, count)
 
 
+class CostPrefixEviction(EvictionPolicy):
+    """Keep frequently touched blocks; deprioritize suffix-like newer inserts."""
+
+    def score(self, block: KVBlock, *, now: float = 0.0) -> float:
+        del now
+        return block.access_count * 1_000_000.0 - float(block.insert_seq)
+
+    def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+        candidates = _evictable_candidates(memory, exclude)
+        candidates.sort(key=lambda block: self.score(block))
+        return candidates[:count]
+
+
 def make_eviction(kind: EvictionKind, *, seed: int = 0) -> EvictionPolicy:
     if kind == "fifo":
         return FIFOEviction()
+    if kind == "lfu":
+        return LFUEviction()
     if kind == "random":
         return RandomEviction(seed=seed)
     return LRUEviction()

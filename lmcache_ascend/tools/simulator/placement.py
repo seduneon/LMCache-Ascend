@@ -11,8 +11,7 @@ from .memory import BlockState, KVBlock, Memory
 from .plan import StoreOp
 from .request import Request
 from .retention import RetentionPolicy, UnboundedRetention
-from .tier import TierGraph
-from .tier_allocator import TierAllocator
+from .tier import TierAllocator, TierGraph
 
 
 @dataclass(frozen=True)
@@ -55,6 +54,7 @@ def ensure_downstream_copy(
             chunk_key,
             state=BlockState.RESIDENT,
             exclude=exclude | {chunk_key},
+            now=now,
         )
         if copy is None:
             return False, []
@@ -73,6 +73,7 @@ def ensure_downstream_copy(
         chunk_key,
         state=BlockState.RESERVED,
         exclude=exclude | {chunk_key},
+        now=now,
     )
     if copy is None:
         return False, []
@@ -136,6 +137,18 @@ class PlacementPolicy(ABC):
     ) -> list[StoreOp]:
         return []
 
+    def choose_targets(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block_hash: str,
+        req: Request,
+    ) -> tuple[str, ...]:
+        """Optional dynamic downstream targets; default uses static edges only."""
+        del memories, local_memory, block_hash, req
+        return ()
+
     def store_prefix_on_complete(
         self,
         memories: dict[str, Memory],
@@ -171,6 +184,8 @@ class HBMOnly(PlacementPolicy):
 class TieredPlacement(PlacementPolicy):
     """Mirror/spill local tier to downstream tiers via ``PlacementEdge`` rules."""
 
+    PRESSURE_THRESHOLD = 0.9
+
     def __init__(
         self,
         graph: TierGraph,
@@ -190,6 +205,47 @@ class TieredPlacement(PlacementPolicy):
     def _edges_for(self, trigger: str) -> list[PlacementEdge]:
         return [edge for edge in self._edges if edge.trigger == trigger]
 
+    def _active_dst_tiers(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block_hash: str,
+        req: Request,
+        trigger: str,
+    ) -> set[str]:
+        dynamic = self.choose_targets(
+            memories,
+            local_memory=local_memory,
+            block_hash=block_hash,
+            req=req,
+        )
+        if dynamic:
+            return set(dynamic)
+        return {edge.dst_tier for edge in self._edges if edge.trigger == trigger}
+
+    def choose_targets(
+        self,
+        memories: dict[str, Memory],
+        *,
+        local_memory: str,
+        block_hash: str,
+        req: Request,
+    ) -> tuple[str, ...]:
+        """Skip downstream tiers under pressure; empty tuple uses static edges only."""
+        del local_memory, block_hash, req
+        targets: list[str] = []
+        for edge in self._edges:
+            if edge.trigger != "forward":
+                continue
+            memory = memories.get(edge.dst_tier)
+            if memory is None or memory.size <= 0:
+                continue
+            util = memory.used_size() / memory.size
+            if util < self.PRESSURE_THRESHOLD:
+                targets.append(edge.dst_tier)
+        return tuple(targets)
+
     def _run_sync_edges(
         self,
         memories: dict[str, Memory],
@@ -198,10 +254,24 @@ class TieredPlacement(PlacementPolicy):
         block_hash: str,
         req: Request,
         now: float,
+        local_memory: str | None = None,
     ) -> bool:
         ok = True
+        active = (
+            self._active_dst_tiers(
+                memories,
+                local_memory=local_memory or "",
+                block_hash=block_hash,
+                req=req,
+                trigger=trigger,
+            )
+            if local_memory is not None
+            else {edge.dst_tier for edge in self._edges if edge.trigger == trigger}
+        )
         for edge in self._edges_for(trigger):
             if edge.delivery != "sync":
+                continue
+            if edge.dst_tier not in active:
                 continue
             success, _ = ensure_downstream_copy(
                 self._graph,
@@ -255,7 +325,12 @@ class TieredPlacement(PlacementPolicy):
         if not self.mirror_on_forward:
             return
         self._run_sync_edges(
-            memories, trigger="forward", block_hash=block.hash, req=req, now=now
+            memories,
+            trigger="forward",
+            block_hash=block.hash,
+            req=req,
+            now=now,
+            local_memory=local_memory,
         )
 
     def store_prefix_on_complete(

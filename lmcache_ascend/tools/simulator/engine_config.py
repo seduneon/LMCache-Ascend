@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from .placement import PlacementEdge
+from .read_path import ReadPathSpec
 
 
 @dataclass(frozen=True)
@@ -71,5 +72,13 @@ class EngineConfig:
     local_tier: str
     pull_sources: tuple[str, ...] = ()
     pull_mode: Literal["compute_only", "ordered_pull"] = "compute_only"
+    read_path: ReadPathSpec | None = None
     placement: PlacementSpec = field(default_factory=PlacementSpec)
     lifecycle: LifecycleSpec = field(default_factory=LifecycleSpec)
+
+    def resolved_read_path(self) -> ReadPathSpec:
+        if self.read_path is not None:
+            return self.read_path
+        from .read_path import read_path_from_pull_mode
+
+        return read_path_from_pull_mode(self.pull_mode)

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .effects import EffectConfig, EffectPolicy
 from .engine_config import EngineConfig, build_placement_spec
+from .read_path import ReadPathSpec
 from .eviction import LRUEviction
 from .plan import EntryPlan, WorkEntry
 from .request import Request, request_owning_prefix_block
@@ -27,6 +28,7 @@ class EnginePolicies:
                     local_memory=config.local_tier,
                     pull_sources=config.pull_sources,
                     pull_mode=config.pull_mode,
+                    read_path=config.read_path,
                     local_eviction=local_eviction,
                 )
             ),
@@ -49,6 +51,7 @@ class EnginePolicies:
                 local_tier=schedule_cfg.local_memory,
                 pull_sources=schedule_cfg.pull_sources,
                 pull_mode=schedule_cfg.pull_mode,
+                read_path=schedule_cfg.read_path,
                 placement=placement,
             ),
             graph,
