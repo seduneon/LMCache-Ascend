@@ -22,7 +22,8 @@ from .presets import (
     build_pd_engines,
 )
 from .request import RequestPD, RequestStatus
-from .registry import make_read_path
+from .read_path import READ_PATH
+from .policy_registry import PolicyContext
 from .resource import BandwidthResource
 from .event_trace import EventTraceWriter, trace_config_from_env
 from .sim_log import SimLogConfig, SimLogger
@@ -386,9 +387,9 @@ def _effective_preset(preset: PresetSpec, sweep_cfg: SweepConfig) -> PresetSpec:
         return preset
     return replace(
         preset,
-        decode_read_path=make_read_path(
+        decode_read_path=READ_PATH.create(
             sweep_cfg.read_path,
-            threshold_ratio=sweep_cfg.pull_threshold,
+            PolicyContext(params={"threshold_ratio": sweep_cfg.pull_threshold}),
         ),
     )
 

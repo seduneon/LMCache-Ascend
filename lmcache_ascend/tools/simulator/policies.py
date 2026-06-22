@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from .effects import EffectConfig, EffectPolicy
 from .engine_config import EngineConfig, build_placement_spec
 from .read_path import ReadPathSpec
-from .retention import RetentionFactory, consume_on_pull_retention, unbounded_retention
 from .eviction import LRUEviction
 from .plan import EntryPlan, WorkEntry
 from .request import Request, request_owning_prefix_block
@@ -68,7 +67,8 @@ class EnginePolicies:
         mirror_tiers: tuple[str, ...] = (),
         async_write_tiers: frozenset[str] | None = None,
         mirror_on_forward: bool = True,
-        retention: RetentionFactory | None = None,
+        retention: str = "unbounded",
+        retention_params: dict | None = None,
     ) -> EnginePolicies:
         g = graph or TierGraph(tiers={})
         if local_memory not in g.tiers and local_eviction is not None:
@@ -89,7 +89,8 @@ class EnginePolicies:
             mirror_tiers=mirror_tiers,
             async_write_tiers=async_write_tiers or frozenset(),
             mirror_on_forward=mirror_on_forward,
-            retention=retention or unbounded_retention,
+            retention_name=retention,
+            retention_params=retention_params,
         )
         return cls.from_config(
             EngineConfig(
@@ -112,14 +113,16 @@ class EnginePolicies:
         mirror_tiers: tuple[str, ...] = (),
         async_write_tiers: frozenset[str] | None = None,
         mirror_on_forward: bool = True,
-        retention: RetentionFactory | None = None,
+        retention: str = "unbounded",
+        retention_params: dict | None = None,
     ) -> EnginePolicies:
         g = graph or TierGraph(tiers={})
         placement = build_placement_spec(
             mirror_tiers=mirror_tiers,
             async_write_tiers=async_write_tiers or frozenset(),
             mirror_on_forward=mirror_on_forward,
-            retention=retention or unbounded_retention,
+            retention_name=retention,
+            retention_params=retention_params,
         )
         return cls.from_config(
             EngineConfig(

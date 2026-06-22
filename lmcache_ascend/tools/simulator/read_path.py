@@ -14,6 +14,9 @@ from .block_resolve import (
     local_satisfied,
     remote_wait_source,
 )
+from .policy_registry import PolicyContext, Registry
+
+READ_PATH = Registry["ReadPathSpec"]("read_path")
 
 ReadPathKind = Literal[
     "ordered_pull",
@@ -46,6 +49,32 @@ def read_path_from_pull_mode(
     if pull_mode == "compute_only":
         return ReadPathSpec(kind="compute_only")
     return ReadPathSpec(kind="ordered_pull")
+
+
+@READ_PATH.register("ordered_pull")
+def _ordered_pull(_ctx: PolicyContext) -> ReadPathSpec:
+    return ReadPathSpec(kind="ordered_pull")
+
+
+@READ_PATH.register("compute_only")
+def _compute_only(_ctx: PolicyContext) -> ReadPathSpec:
+    return ReadPathSpec(kind="compute_only")
+
+
+@READ_PATH.register("min_cost")
+def _min_cost(_ctx: PolicyContext) -> ReadPathSpec:
+    return ReadPathSpec(kind="min_cost")
+
+
+@READ_PATH.register("min_cost_with_wait")
+def _min_cost_with_wait(_ctx: PolicyContext) -> ReadPathSpec:
+    return ReadPathSpec(kind="min_cost_with_wait")
+
+
+@READ_PATH.register("threshold")
+def _threshold(ctx: PolicyContext) -> ReadPathSpec:
+    ratio = float(ctx.params.get("threshold_ratio", 1.0))
+    return ReadPathSpec(kind="threshold", threshold_ratio=ratio)
 
 
 class ReadPathPolicy:

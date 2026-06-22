@@ -11,7 +11,8 @@ from .capacity import (
     kv_bytes_per_token as resolve_kv_bpt,
     resolve_tier_slots,
 )
-from .eviction import EvictionFactory, EvictionPolicy, LRUEviction, lru_eviction
+from .eviction import EVICTION, EvictionPolicy, LRUEviction
+from .policy_registry import PolicyContext
 from .memory import Memory
 from .tier import Tier, TierGraph
 
@@ -102,16 +103,15 @@ class SimResources:
 def build_eviction_map(
     tier_keys: tuple[str, ...],
     *,
-    local: EvictionFactory | None = None,
-    downstream: EvictionFactory | None = None,
+    local: str = "lru",
+    downstream: str = "lru",
     rng_seed: int = 0,
     overrides: dict[str, EvictionPolicy] | None = None,
 ) -> dict[str, EvictionPolicy]:
-    """Assign eviction policy per tier key (local vs downstream factories)."""
-    local_factory = local or lru_eviction
-    downstream_factory = downstream or lru_eviction
-    local_policy = local_factory(rng_seed)
-    downstream_policy = downstream_factory(rng_seed)
+    """Assign eviction policy per tier key (local vs downstream names)."""
+    ctx = PolicyContext(seed=rng_seed)
+    local_policy = EVICTION.create(local, ctx)
+    downstream_policy = EVICTION.create(downstream, ctx)
     result: dict[str, EvictionPolicy] = {}
     for key in tier_keys:
         if overrides and key in overrides:

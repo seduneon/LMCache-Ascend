@@ -8,8 +8,9 @@ from .engine_config import PlacementSpec
 from .memory import KVBlock, Memory
 from .placement import HBMOnly, PlacementPolicy, TieredPlacement
 from .plan import StoreOp
+from .policy_registry import PolicyContext
 from .request import Request
-from .retention import RetentionPolicy
+from .retention import RETENTION, RetentionPolicy
 from .tier import TierGraph
 
 
@@ -39,7 +40,14 @@ class EffectPolicy:
 
     def __init__(self, config: EffectConfig):
         self.config = config
-        self._retention = config.placement.retention(config.graph)
+        placement = config.placement
+        self._retention = RETENTION.create(
+            placement.retention_name,
+            PolicyContext(
+                graph=config.graph,
+                params=placement.retention_params,
+            ),
+        )
         self._placement = _build_placement(config.graph, config.placement, self._retention)
 
     def on_local_resident(

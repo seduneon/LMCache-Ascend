@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import random
 from abc import ABC, abstractmethod
-from collections.abc import Callable
-from typing import Literal
 
 from .memory import KVBlock, Memory
+from .policy_registry import PolicyContext, Registry
 
-EvictionKind = Literal["lru", "fifo", "random", "lfu"]
+EVICTION = Registry["EvictionPolicy"]("eviction")
 
 
 def _evictable_candidates(memory: Memory, exclude: set[str]) -> list[KVBlock]:
@@ -110,40 +109,26 @@ class CostPrefixEviction(EvictionPolicy):
         return candidates[:count]
 
 
-EvictionFactory = Callable[[int], EvictionPolicy]
-
-
-def lru_eviction(_seed: int = 0) -> EvictionPolicy:
+@EVICTION.register("lru")
+def _lru(_ctx: PolicyContext) -> EvictionPolicy:
     return LRUEviction()
 
 
-def fifo_eviction(_seed: int = 0) -> EvictionPolicy:
+@EVICTION.register("fifo")
+def _fifo(_ctx: PolicyContext) -> EvictionPolicy:
     return FIFOEviction()
 
 
-def lfu_eviction(_seed: int = 0) -> EvictionPolicy:
+@EVICTION.register("lfu")
+def _lfu(_ctx: PolicyContext) -> EvictionPolicy:
     return LFUEviction()
 
 
-def random_eviction(seed: int = 0) -> EvictionPolicy:
-    return RandomEviction(seed=seed)
+@EVICTION.register("random")
+def _random(ctx: PolicyContext) -> EvictionPolicy:
+    return RandomEviction(seed=ctx.seed)
 
 
-def cost_prefix_eviction(_seed: int = 0) -> EvictionPolicy:
+@EVICTION.register("cost_prefix")
+def _cost_prefix(_ctx: PolicyContext) -> EvictionPolicy:
     return CostPrefixEviction()
-
-
-def eviction_factory_for_kind(kind: EvictionKind, *, seed: int = 0) -> EvictionFactory:
-    if kind == "fifo":
-        return fifo_eviction
-    if kind == "lfu":
-        return lfu_eviction
-    if kind == "random":
-        if seed:
-            return lambda _rng_seed=0: RandomEviction(seed=seed)
-        return random_eviction
-    return lru_eviction
-
-
-def make_eviction(kind: EvictionKind, *, seed: int = 0) -> EvictionPolicy:
-    return eviction_factory_for_kind(kind, seed=seed)(seed)

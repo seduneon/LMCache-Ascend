@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from enum import StrEnum
 
 from .eviction import EvictionPolicy, LRUEviction
 from .kv_content import ContentKey, storage_key
 from .memory import KVBlock, Memory, collect_content_copies
+from .policy_registry import PolicyContext, Registry
 from .request import Request
 from .tier import TierGraph
+
+RETENTION = Registry["RetentionPolicy"]("retention")
 
 
 class PullDisposition(StrEnum):
@@ -174,34 +176,31 @@ class GlobalCopyCap(RetentionPolicy):
                 mem.remove_block(victim)
 
 
-from collections.abc import Callable
-
-RetentionFactory = Callable[[TierGraph], RetentionPolicy]
-
-
-def unbounded_retention(graph: TierGraph) -> RetentionPolicy:
-    return UnboundedRetention(graph)
+@RETENTION.register("unbounded")
+def _unbounded(ctx: PolicyContext) -> RetentionPolicy:
+    return UnboundedRetention(ctx.graph)
 
 
-def single_copy_retention(graph: TierGraph) -> RetentionPolicy:
-    return SingleCopyPerTier(graph)
+@RETENTION.register("single_copy")
+def _single_copy(ctx: PolicyContext) -> RetentionPolicy:
+    return SingleCopyPerTier(ctx.graph)
 
 
-def consume_on_pull_retention(graph: TierGraph) -> RetentionPolicy:
-    return ConsumeOnPull(graph)
+@RETENTION.register("consume_on_pull")
+def _consume_on_pull(ctx: PolicyContext) -> RetentionPolicy:
+    return ConsumeOnPull(ctx.graph)
 
 
-def global_copy_cap_retention(
-    max_total: int,
-    tier_keys: tuple[str, ...],
-    per_tier_cap: int | None = 1,
-) -> RetentionFactory:
-    def factory(graph: TierGraph) -> RetentionPolicy:
-        return GlobalCopyCap(
-            max_total,
-            list(tier_keys),
-            per_tier_cap=per_tier_cap,
-            graph=graph,
+@RETENTION.register("global_cap")
+def _global_cap(ctx: PolicyContext) -> RetentionPolicy:
+    params = ctx.params
+    if "max_total" not in params or "tier_keys" not in params:
+        raise ValueError(
+            "global_cap retention requires max_total and tier_keys in params"
         )
-
-    return factory
+    return GlobalCopyCap(
+        int(params["max_total"]),
+        list(params["tier_keys"]),
+        per_tier_cap=params.get("per_tier_cap", 1),
+        graph=ctx.graph,
+    )

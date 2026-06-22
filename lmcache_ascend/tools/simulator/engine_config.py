@@ -7,7 +7,6 @@ from typing import Literal
 
 from .placement import PlacementEdge
 from .read_path import ReadPathSpec
-from .retention import RetentionFactory, unbounded_retention
 
 
 @dataclass(frozen=True)
@@ -21,7 +20,8 @@ class LifecycleSpec:
 class PlacementSpec:
     edges: tuple[PlacementEdge, ...] = ()
     mirror_on_forward: bool = True
-    retention: RetentionFactory = unbounded_retention
+    retention_name: str = "unbounded"
+    retention_params: dict = field(default_factory=dict)
 
 
 def placement_edges(
@@ -45,13 +45,15 @@ def build_placement_spec(
     mirror_tiers: tuple[str, ...] = (),
     async_write_tiers: frozenset[str] = frozenset(),
     mirror_on_forward: bool = True,
-    retention: RetentionFactory | None = None,
+    retention_name: str = "unbounded",
+    retention_params: dict | None = None,
 ) -> PlacementSpec:
     tier_keys = tuple(dict.fromkeys((*mirror_tiers, *async_write_tiers)))
     return PlacementSpec(
         edges=placement_edges(tier_keys, async_write_tiers=async_write_tiers),
         mirror_on_forward=mirror_on_forward,
-        retention=retention or unbounded_retention,
+        retention_name=retention_name,
+        retention_params=dict(retention_params or {}),
     )
 
 

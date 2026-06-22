@@ -7,21 +7,7 @@ from typing import Literal
 
 from .engine import Engine
 from .engine_config import EngineConfig, LifecycleSpec, PlacementSpec, build_placement_spec
-from .eviction import (
-    EvictionFactory,
-    fifo_eviction,
-    lfu_eviction,
-    lru_eviction,
-    random_eviction,
-)
 from .read_path import ReadPathSpec
-from .retention import (
-    RetentionFactory,
-    consume_on_pull_retention,
-    global_copy_cap_retention,
-    single_copy_retention,
-    unbounded_retention,
-)
 from .memory import Memory
 from .policies import EnginePolicies
 from .request import Request
@@ -38,10 +24,11 @@ class PresetSpec:
     decode_pull: tuple[str, ...] = ("npu-0:hbm",)
     mirror_tiers: tuple[str, ...] = ()
     async_write_tiers: frozenset[str] = frozenset()
-    retention: RetentionFactory = unbounded_retention
-    eviction: EvictionFactory = lru_eviction
-    local_eviction: EvictionFactory | None = None
-    downstream_eviction: EvictionFactory | None = None
+    retention: str = "unbounded"
+    retention_params: dict = field(default_factory=dict)
+    eviction: str = "lru"
+    local_eviction: str | None = None
+    downstream_eviction: str | None = None
     hold_kv_on_complete: bool = True
     prefill_retain_prefix_cache: bool = False
     decode_retain_prefix_cache: bool = False
@@ -55,7 +42,8 @@ def _placement_spec(spec: PresetSpec) -> PlacementSpec:
         mirror_tiers=spec.mirror_tiers,
         async_write_tiers=spec.async_write_tiers,
         mirror_on_forward=spec.mirror_on_forward,
-        retention=spec.retention,
+        retention_name=spec.retention,
+        retention_params=spec.retention_params,
     )
 
 
@@ -115,13 +103,13 @@ PRESETS: dict[str, PresetSpec] = {
         name="consume_on_pull",
         description="baseline + consume source on pull",
         topology="hbm_only",
-        retention=consume_on_pull_retention,
+        retention="consume_on_pull",
     ),
     "single_copy": PresetSpec(
         name="single_copy",
         description="baseline + one copy per tier",
         topology="hbm_only",
-        retention=single_copy_retention,
+        retention="single_copy",
     ),
     "ssd_tier": PresetSpec(
         name="ssd_tier",
@@ -135,11 +123,12 @@ PRESETS: dict[str, PresetSpec] = {
         name="global_cap_2",
         description="baseline + global cap 2 across P/D HBM",
         topology="hbm_only",
-        retention=global_copy_cap_retention(
-            max_total=2,
-            tier_keys=("npu-0:hbm", "npu-1:hbm"),
-            per_tier_cap=None,
-        ),
+        retention="global_cap",
+        retention_params={
+            "max_total": 2,
+            "tier_keys": ("npu-0:hbm", "npu-1:hbm"),
+            "per_tier_cap": None,
+        },
     ),
     "evict_lru": PresetSpec(
         name="evict_lru",
@@ -154,7 +143,7 @@ PRESETS: dict[str, PresetSpec] = {
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
         decode_retain_prefix_cache=True,
-        eviction=lru_eviction,
+        eviction="lru",
     ),
     "evict_fifo": PresetSpec(
         name="evict_fifo",
@@ -169,7 +158,7 @@ PRESETS: dict[str, PresetSpec] = {
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
         decode_retain_prefix_cache=True,
-        eviction=fifo_eviction,
+        eviction="fifo",
     ),
     "evict_random": PresetSpec(
         name="evict_random",
@@ -184,7 +173,7 @@ PRESETS: dict[str, PresetSpec] = {
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
         decode_retain_prefix_cache=True,
-        eviction=random_eviction,
+        eviction="random",
     ),
     "evict_lfu": PresetSpec(
         name="evict_lfu",
@@ -199,7 +188,7 @@ PRESETS: dict[str, PresetSpec] = {
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
         decode_retain_prefix_cache=True,
-        eviction=lfu_eviction,
+        eviction="lfu",
     ),
 }
 
