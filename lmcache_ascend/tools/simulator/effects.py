@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass
 
-from .eviction import EvictionPolicy
+from .engine_config import PlacementSpec
 from .memory import KVBlock, Memory
 from .placement import HBMOnly, PlacementPolicy, TieredPlacement
 from .plan import StoreOp
@@ -17,50 +16,43 @@ from .retention import (
     SingleCopyPerTier,
     UnboundedRetention,
 )
+from .tier import TierGraph
+
+
+def _build_retention(graph: TierGraph, spec: PlacementSpec) -> RetentionPolicy:
+    if spec.retention == "single_copy":
+        return SingleCopyPerTier(graph)
+    if spec.retention == "consume_on_pull":
+        return ConsumeOnPull(graph)
+    if spec.retention == "global_cap":
+        return GlobalCopyCap(
+            spec.global_cap_max,
+            list(spec.global_cap_tiers),
+            per_tier_cap=spec.global_cap_per_tier,
+            graph=graph,
+        )
+    return UnboundedRetention(graph)
+
+
+def _build_placement(
+    graph: TierGraph,
+    spec: PlacementSpec,
+    retention: RetentionPolicy,
+) -> PlacementPolicy:
+    if not spec.edges:
+        return HBMOnly()
+    placement = TieredPlacement(
+        graph, spec.edges, mirror_on_forward=spec.mirror_on_forward
+    )
+    placement.bind_retention(retention)
+    return placement
 
 
 @dataclass(frozen=True)
 class EffectConfig:
     local_memory: str
-    mirror_tiers: tuple[str, ...] = ()
-    async_write_tiers: frozenset[str] = frozenset()
-    mirror_on_forward: bool = True
-    tier_eviction: dict[str, EvictionPolicy] = field(default_factory=dict)
-    tier_eviction: dict[str, EvictionPolicy] = field(default_factory=dict)
-    retention: Literal[
-        "unbounded", "single_copy", "consume_on_pull", "global_cap"
-    ] = "unbounded"
-    global_cap_max: int = 0
-    global_cap_tiers: tuple[str, ...] = ()
-    global_cap_per_tier: int | None = 1
-
-
-def _build_retention(config: EffectConfig) -> RetentionPolicy:
-    if config.retention == "single_copy":
-        return SingleCopyPerTier()
-    if config.retention == "consume_on_pull":
-        return ConsumeOnPull()
-    if config.retention == "global_cap":
-        return GlobalCopyCap(
-            config.global_cap_max,
-            list(config.global_cap_tiers),
-            per_tier_cap=config.global_cap_per_tier,
-        )
-    return UnboundedRetention()
-
-
-def _build_placement(config: EffectConfig, retention: RetentionPolicy) -> PlacementPolicy:
-    tier_keys = list(dict.fromkeys((*config.mirror_tiers, *config.async_write_tiers)))
-    if not tier_keys:
-        return HBMOnly()
-    placement = TieredPlacement(
-        tier_keys,
-        tier_eviction=config.tier_eviction or None,
-        paid_write_tiers=config.async_write_tiers,
-        mirror_on_forward=config.mirror_on_forward,
-    )
-    placement.bind_retention(retention)
-    return placement
+    graph: TierGraph
+    placement: PlacementSpec
 
 
 class EffectPolicy:
@@ -68,14 +60,10 @@ class EffectPolicy:
 
     def __init__(self, config: EffectConfig):
         self.config = config
-        self._retention = _build_retention(config)
-        self._placement = _build_placement(config, self._retention)
+        self._retention = _build_retention(config.graph, config.placement)
+        self._placement = _build_placement(config.graph, config.placement, self._retention)
 
-    @classmethod
-    def none(cls, local_memory: str) -> EffectPolicy:
-        return cls(EffectConfig(local_memory=local_memory))
-
-    def on_hbm_resident(
+    def on_local_resident(
         self,
         memories: dict[str, Memory],
         block: KVBlock,
@@ -113,7 +101,7 @@ class EffectPolicy:
             req=req,
         )
 
-    def on_hbm_evict(
+    def on_local_evict(
         self,
         memories: dict[str, Memory],
         victim: KVBlock,

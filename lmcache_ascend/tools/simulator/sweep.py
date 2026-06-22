@@ -103,7 +103,7 @@ class SimConfig:
         ssd_chunk_blocks: int = 4,
         **kwargs: object,
     ) -> SimConfig:
-        """Build config from legacy slot counts (tests / migration)."""
+        """Build config from explicit block slot counts (tests)."""
         fields = {f.name for f in cls.__dataclass_fields__.values()}
         extra = {k: v for k, v in kwargs.items() if k in fields}
         tiers = (
@@ -144,8 +144,11 @@ class SimConfig:
 HBM_TIER_KEYS: tuple[str, ...] = ("npu-0:hbm", "npu-1:hbm")
 
 
-def _hbm_end_state_ok(
-    preset: PresetSpec, tier_key: str, mem: Memory
+def _local_tier_end_state_ok(
+    preset: PresetSpec,
+    mem: Memory,
+    *,
+    is_prefill: bool,
 ) -> tuple[bool, str]:
     if mem.used_size() > mem.size:
         return False, f"over_capacity used={mem.used_size()} size={mem.size}"
@@ -156,11 +159,9 @@ def _hbm_end_state_ok(
     if mem.used_size() == 0:
         return True, ""
     retain = (
-        preset.prefill_retain_hbm_prefix_cache
-        if tier_key == "npu-0:hbm"
-        else preset.decode_retain_hbm_prefix_cache
-        if tier_key == "npu-1:hbm"
-        else False
+        preset.prefill_retain_prefix_cache
+        if is_prefill
+        else preset.decode_retain_prefix_cache
     )
     if retain and all(mem.can_evict_block(block) for block in blocks):
         return True, ""
@@ -474,11 +475,12 @@ def run_sweep_case(
             wall_seconds=wall_seconds,
         )
 
-    for tier_key in HBM_TIER_KEYS:
+    for eng, is_prefill in ((npu0, True), (npu1, False)):
+        tier_key = eng.local_memory
         mem = memories.get(tier_key)
         if mem is None:
             continue
-        ok, detail = _hbm_end_state_ok(preset, tier_key, mem)
+        ok, detail = _local_tier_end_state_ok(preset, mem, is_prefill=is_prefill)
         if not ok:
             return SweepRow(
                 preset=preset.name,
@@ -487,7 +489,7 @@ def run_sweep_case(
                 admittable_requests=admittable_requests,
                 rejected_requests=rejected_requests,
                 status="fail",
-                error=f"{tier_key} HBM leaked {detail}",
+                error=f"{tier_key} local tier leaked {detail}",
                 steps=steps,
                 finish_time=finish,
                 wall_seconds=wall_seconds,

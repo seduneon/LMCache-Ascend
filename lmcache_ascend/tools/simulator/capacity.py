@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .eviction import EvictionPolicy, LRUEviction
+from .memory import Memory
+
 GIB = 1024**3
 
 # Full-model K+V bytes per token (bf16), reference models for --kv-model.
@@ -93,6 +96,37 @@ def resolve_tier_slots(
         tokens_per_block=tokens_per_block,
         kv_bytes_per_token=kv_bytes_per_token,
         chunk_blocks=tier.chunk_blocks,
+    )
+
+
+def build_tier(
+    spec: TierSpec,
+    *,
+    tokens_per_block: int,
+    kv_bytes_per_token: float,
+    eviction: EvictionPolicy | None = None,
+    slots: int | None = None,
+) -> "Tier":
+    from .tier import Tier
+
+    resolved = (
+        slots
+        if slots is not None
+        else resolve_tier_slots(
+            spec,
+            tokens_per_block=tokens_per_block,
+            kv_bytes_per_token=kv_bytes_per_token,
+        )
+    )
+    memory = Memory(
+        size=resolved,
+        name=spec.tier_key,
+        chunk_blocks=spec.chunk_blocks,
+    )
+    return Tier(
+        key=spec.tier_key,
+        memory=memory,
+        eviction=eviction or LRUEviction(),
     )
 
 

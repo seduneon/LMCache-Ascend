@@ -5,13 +5,22 @@ from __future__ import annotations
 from simulator.engine import Engine
 from simulator.memory import BlockState, Memory
 from simulator.plan import EntryPlan, WorkEntry
-from simulator.lookup import ComputeOnlyLookupPolicy, OrderedPullLookupPolicy
 from simulator.request import Request, RequestPD, RequestStatus
 from simulator.resource import BandwidthResource, ComputeResource
+from simulator.scheduler import Scheduler
 from simulator.sim_log import SimLogConfig
 from simulator.simulator import Simulator
 from simulator.tasks import BatchLoadTask, TaskPool, TaskStatus
-from simulator.tests.test_helpers import SimpleTask, execute_plan, make_plan, make_resident, policies_compute, policies_pull
+from simulator.tests.test_helpers import (
+    SimpleTask,
+    execute_plan,
+    make_plan,
+    make_resident,
+    policies_compute,
+    policies_pull,
+    schedule_compute,
+    schedule_pull,
+)
 
 
 def _pd_engines(
@@ -385,4 +394,245 @@ def test_shared_block_survives_partial_free() -> None:
 
     mem.free_request("r2")
     assert mem.used_size() == 0
+
+
+def test_scheduler_limits() -> None:
+    memories = {"hbm": Memory(size=100, name="hbm")}
+    policy = schedule_compute(local_memory="hbm")
+    sched = Scheduler(
+        policy, memories, "hbm", max_num_seqs=1, max_num_batched_tokens=10, block_size=1
+    )
+    r1 = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
+    r2 = Request("r2", 0.0, ["b"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
+    r1.prefix_block_count = 1
+    r2.prefix_block_count = 1
+    sched.waiting.extend([r1, r2])
+    batch = sched.schedule()
+    assert len(batch.entries) == 1
+    assert len(sched.waiting) == 1
+    assert len(sched.running) == 1
+
+    sched2 = Scheduler(
+        policy, memories, "hbm", max_num_seqs=10, max_num_batched_tokens=2, block_size=1
+    )
+    for rid in ("r1", "r2", "r3"):
+        req = Request(
+            rid, 0.0, ["p"], RequestPD.DECODE, RequestStatus.RUNNING, max_output_blocks=2
+        )
+        req.prefix_block_count = 1
+        req.num_computed_blocks = 1
+        sched2.running.append(req)
+    batch2 = sched2.schedule()
+    assert len(batch2.entries) == 2
+    assert batch2.total_num_scheduled_tokens == 2
+
+
+def test_chunked_prefill() -> None:
+    memories = {"hbm": Memory(size=100, name="hbm")}
+    pool = TaskPool()
+    eng = Engine(
+        engine_id="e0",
+        requests=[],
+        pool=pool,
+        memories=memories,
+        policies=policies_compute("hbm"),
+        compute_res=ComputeResource(base_speed=1.0),
+        block_size=1,
+        max_num_batched_tokens=2,
+        enable_chunked_prefill=True,
+        work_per_block=1.0,
+    )
+    prefix = [f"p{i}" for i in range(5)]
+    req = Request("r1", 0.0, list(prefix), RequestPD.PREFILL, RequestStatus.PENDING)
+    eng.schedule_request(req)
+
+    sim = Simulator([eng], pool)
+    steps = 0
+    while sim.step():
+        steps += 1
+
+    assert len(eng.completed) == 1
+    assert eng.completed[0].num_computed_blocks == len(prefix)
+    assert steps >= 3
+    assert memories["hbm"].used_size() == 0
+
+
+def test_pd_read_mode_flags() -> None:
+    from simulator.pd import PDConfig
+
+    pool = TaskPool()
+    memories = {
+        "npu-0:hbm": Memory(size=100, name="npu-0:hbm"),
+        "npu-1:hbm": Memory(size=100, name="npu-1:hbm"),
+    }
+    prefill = Request(
+        "r1",
+        0.0,
+        ["a", "b", "c"],
+        RequestPD.PREFILL,
+        RequestStatus.PENDING,
+        max_output_blocks=2,
+    )
+    npu0 = Engine(
+        engine_id="npu-0",
+        requests=[prefill],
+        pool=pool,
+        memories=memories,
+        policies=policies_compute("npu-0:hbm"),
+        compute_res=ComputeResource(base_speed=1.0),
+        work_per_block=1.0,
+    )
+    npu1 = Engine(
+        engine_id="npu-1",
+        requests=[],
+        pool=pool,
+        memories=memories,
+        policies=policies_pull("npu-1:hbm", ["npu-0:hbm"]),
+        compute_res=ComputeResource(base_speed=1.0),
+        bandwidth_res=BandwidthResource(base_speed=1.0),
+        work_per_block=1.0,
+        work_per_transfer=1.0,
+    )
+    sim = Simulator([npu0, npu1], pool, pd=PDConfig(spawn_map={"npu-0": "npu-1"}))
+    sim.run()
+
+    decode = next((r for r in npu1.completed if r.req_id == "r1"), None)
+    assert decode is not None
+    assert decode.num_computed_blocks == decode.total_blocks()
+    assert not prefill.kv_held_for_transfer
+    assert memories["npu-0:hbm"].used_size() == 0
+    assert memories["npu-1:hbm"].used_size() == 0
+    assert npu1.remote_kv_wait is True
+    assert npu0.hold_kv_on_complete is True
+
+
+def test_remote_kv_admit() -> None:
+    memories = {
+        "npu-0:hbm": Memory(size=10, name="npu-0:hbm"),
+        "npu-1:hbm": Memory(size=10, name="npu-1:hbm"),
+    }
+    for block_hash in ("a", "b", "c"):
+        make_resident(memories["npu-0:hbm"], block_hash, "producer")
+
+    policy = schedule_pull(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
+    sched = Scheduler(policy, memories, "npu-1:hbm", remote_kv_wait=True)
+    req = Request(
+        "r1",
+        0.0,
+        ["a", "b", "c"],
+        RequestPD.DECODE,
+        RequestStatus.WAITING,
+        max_output_blocks=1,
+    )
+    req.prefix_block_count = 3
+    sched.waiting.append(req)
+
+    batch = sched.schedule()
+    assert len(batch.entries) == 1
+    assert batch.entries[0].remote_kv
+    assert req.status == RequestStatus.WAITING_REMOTE_KV
+
+
+def test_pd_backpressure() -> None:
+    memories = {
+        "npu-0:hbm": Memory(size=10, name="npu-0:hbm"),
+        "npu-1:hbm": Memory(size=2, name="npu-1:hbm"),
+    }
+    for block_hash in ("a", "b", "c"):
+        make_resident(memories["npu-0:hbm"], block_hash, "producer")
+
+    policy = schedule_pull(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
+    sched = Scheduler(
+        policy, memories, "npu-1:hbm", max_num_seqs=10, remote_kv_wait=True
+    )
+    req = Request(
+        "r1",
+        0.0,
+        ["a", "b", "c"],
+        RequestPD.DECODE,
+        RequestStatus.WAITING,
+        max_output_blocks=1,
+    )
+    req.prefix_block_count = 3
+    sched.waiting.append(req)
+
+    batch = sched.schedule()
+    assert len(batch.entries) == 0
+    assert req.status == RequestStatus.WAITING
+
+
+def test_remote_kv_max_seqs() -> None:
+    memories = {
+        "npu-0:hbm": Memory(size=10, name="npu-0:hbm"),
+        "npu-1:hbm": Memory(size=10, name="npu-1:hbm"),
+    }
+    for block_hash in ("a", "b"):
+        make_resident(memories["npu-0:hbm"], block_hash, "producer")
+
+    policy = schedule_pull(local_memory="npu-1:hbm", pull_sources=["npu-0:hbm"])
+    sched = Scheduler(policy, memories, "npu-1:hbm", max_num_seqs=1, remote_kv_wait=True)
+    r1 = Request("r1", 0.0, ["a", "b"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
+    r1.prefix_block_count = 2
+    r1.status = RequestStatus.WAITING_REMOTE_KV
+    r2 = Request("r2", 0.0, ["a", "b"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
+    r2.prefix_block_count = 2
+    sched.waiting.extend([r1, r2])
+
+    batch = sched.schedule()
+    assert len(batch.entries) == 0
+
+
+def test_remote_kv_queue_rotation() -> None:
+    memories = {"hbm": Memory(size=100, name="hbm")}
+    policy = schedule_compute(local_memory="hbm")
+    sched = Scheduler(policy, memories, "hbm", max_num_batched_tokens=10, remote_kv_wait=True)
+
+    blocked = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
+    blocked.prefix_block_count = 1
+    blocked.status = RequestStatus.WAITING_REMOTE_KV
+
+    ready = Request("r2", 0.0, ["b"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
+    ready.prefix_block_count = 1
+    sched.waiting.extend([blocked, ready])
+
+    batch = sched.schedule()
+    assert len(batch.entries) == 1
+    assert batch.entries[0].req.req_id == "r2"
+    assert ready in sched.running
+    assert blocked in sched.waiting
+
+
+def test_waiting_preempt() -> None:
+    memories = {"hbm": Memory(size=4, name="hbm")}
+    policy = schedule_compute(local_memory="hbm")
+    sched = Scheduler(policy, memories, "hbm", max_num_batched_tokens=10)
+
+    running = Request("r1", 0.0, ["a", "b", "c"], RequestPD.DECODE, RequestStatus.RUNNING, max_output_blocks=1)
+    running.prefix_block_count = 3
+    running.num_computed_blocks = 4
+    sched.running.append(running)
+    for block_hash in ("a", "b", "c"):
+        make_resident(memories["hbm"], block_hash, "r1")
+
+    waiting = Request("r2", 0.0, ["x", "y", "z"], RequestPD.DECODE, RequestStatus.WAITING, max_output_blocks=1)
+    waiting.prefix_block_count = 3
+    sched.waiting.append(waiting)
+
+    batch = sched.schedule()
+    assert len(batch.preempted) >= 1
+    assert waiting in sched.running
+
+
+def test_pd_config_validation() -> None:
+    from simulator.pd import PDConfig
+
+    pool = TaskPool()
+    memories = {"p": Memory(size=10, name="p"), "d": Memory(size=10, name="d")}
+    npu0 = Engine("p", [], pool, memories, policies_compute("p"), ComputeResource(base_speed=1.0))
+    npu1 = Engine("d", [], pool, memories, policies_compute("d"), ComputeResource(base_speed=1.0))
+    try:
+        Simulator([npu0, npu1], pool, pd=PDConfig(spawn_map={"p": "d"}))
+        raise AssertionError("expected ValueError for decode without pull_sources")
+    except ValueError:
+        pass
 

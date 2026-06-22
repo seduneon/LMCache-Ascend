@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
+from .eviction import EvictionPolicy, LRUEviction
 from .kv_content import ContentKey, storage_key
 from .memory import KVBlock, Memory, collect_content_copies
 from .request import Request
+
+if TYPE_CHECKING:
+    from .tier import TierGraph
 
 
 class PullDisposition(StrEnum):
@@ -17,6 +22,14 @@ class PullDisposition(StrEnum):
 
 class RetentionPolicy(ABC):
     """Caps per-tier duplicate residents and post-pull source lifecycle."""
+
+    def __init__(self, graph: TierGraph | None = None):
+        self._graph = graph
+
+    def _eviction_for(self, tier_key: str) -> EvictionPolicy:
+        if self._graph is not None:
+            return self._graph.eviction_for(tier_key)
+        return LRUEviction()
 
     def max_copies(self, memory: Memory, block_hash: str) -> int | None:
         """Max resident copies of ``block_hash`` in ``memory``; ``None`` = unbounded."""
@@ -38,7 +51,7 @@ class RetentionPolicy(ABC):
         cap = self.max_copies(memory, block.hash)
         if cap is None:
             return
-        self._trim_to_cap(memory, block.hash, cap)
+        self._trim_to_cap(memory, block.hash, cap, tier_key=tier_key)
 
     def after_pull(
         self,
@@ -59,20 +72,30 @@ class RetentionPolicy(ABC):
             return
         src.remove_block(src_block)
 
-    @staticmethod
-    def _trim_to_cap(memory: Memory, block_hash: str, cap: int) -> None:
+    def _trim_to_cap(
+        self,
+        memory: Memory,
+        block_hash: str,
+        cap: int,
+        *,
+        tier_key: str,
+    ) -> None:
         copies = memory.resident_copies(block_hash)
+        eviction = self._eviction_for(tier_key)
         while len(copies) > cap:
-            evictable = [b for b in copies if memory.can_evict_block(b)]
-            if not evictable:
+            exclude = {h for h in memory.blocks if h != block_hash}
+            victims = eviction.pick_victims(memory, 1, exclude)
+            if not victims:
                 break
-            victim = min(evictable, key=lambda block: block.last_touch)
-            memory.remove_block(victim)
+            memory.remove_block(victims[0])
             copies = memory.resident_copies(block_hash)
 
 
 class UnboundedRetention(RetentionPolicy):
     """Default: unlimited copies per hash; pull leaves source resident."""
+
+    def __init__(self, graph: TierGraph | None = None):
+        super().__init__(graph)
 
 
 class SingleCopyPerTier(RetentionPolicy):
@@ -84,6 +107,9 @@ class SingleCopyPerTier(RetentionPolicy):
 
 class ConsumeOnPull(RetentionPolicy):
     """Remove the pull source copy when it has no remaining holders."""
+
+    def __init__(self, graph: TierGraph | None = None):
+        super().__init__(graph)
 
     def pull_disposition(self) -> PullDisposition:
         return PullDisposition.CONSUME
@@ -98,7 +124,9 @@ class GlobalCopyCap(RetentionPolicy):
         tier_keys: list[str],
         *,
         per_tier_cap: int | None = 1,
+        graph: TierGraph | None = None,
     ):
+        super().__init__(graph)
         self.max_total = max_total
         self.tier_keys = list(tier_keys)
         self._per_tier_cap = per_tier_cap
@@ -134,6 +162,15 @@ class GlobalCopyCap(RetentionPolicy):
             tier_order = {t: i for i, t in enumerate(reversed(self.tier_keys))}
             victim_tier, victim = min(
                 evictable,
-                key=lambda item: (tier_order.get(item[0], 0), item[1].last_touch),
+                key=lambda item: (
+                    tier_order.get(item[0], 0),
+                    item[1].insert_seq,
+                ),
             )
-            memories[victim_tier].remove_block(victim)
+            mem = memories[victim_tier]
+            eviction = self._eviction_for(victim_tier)
+            trimmed = eviction.pick_victims(mem, 1, {victim.hash})
+            if trimmed:
+                mem.remove_block(trimmed[0])
+            else:
+                mem.remove_block(victim)

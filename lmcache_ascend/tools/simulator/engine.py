@@ -7,6 +7,15 @@ from .request import Request, RequestPD, RequestStatus, request_owning_prefix_bl
 from .resource import BandwidthResource, ComputeResource
 from .scheduler import Scheduler
 from .tasks import TaskPool
+from .tier import Tier, TierGraph
+
+
+def _merge_tier_graph(graph: TierGraph, memories: dict[str, Memory]) -> TierGraph:
+    tiers = dict(graph.tiers)
+    for key, mem in memories.items():
+        if key not in tiers:
+            tiers[key] = Tier(key, mem, graph.eviction_for(key))
+    return TierGraph(tiers=tiers)
 
 
 class Engine:
@@ -31,7 +40,7 @@ class Engine:
         enable_chunked_prefill: bool = False,
         remote_kv_wait: bool = False,
         hold_kv_on_complete: bool = False,
-        retain_hbm_prefix_cache: bool = False,
+        retain_prefix_cache: bool = False,
         store_tiers_on_complete: tuple[str, ...] = (),
         work_per_prefill_token: float | None = None,
         work_per_decode_req: float | None = None,
@@ -40,6 +49,9 @@ class Engine:
         self.engine_id = engine_id
         self.pool = pool
         self.memories = memories
+        merged_graph = _merge_tier_graph(policies.effects.config.graph, memories)
+        if set(merged_graph.tiers) != set(policies.effects.config.graph.tiers):
+            policies = EnginePolicies.with_graph(policies, merged_graph)
         self.policies = policies
         self.local_memory = policies.schedule.local_memory
         self.compute_res = compute_res
@@ -66,7 +78,7 @@ class Engine:
             work_per_decode_req if work_per_decode_req is not None else work_per_block
         )
         self.hold_kv_on_complete = hold_kv_on_complete
-        self.retain_hbm_prefix_cache = retain_hbm_prefix_cache
+        self.retain_prefix_cache = retain_prefix_cache
         self.store_tiers_on_complete = tuple(store_tiers_on_complete)
         self._peak_duplicate_count = 0
         self._next_batch_id = 0
@@ -102,7 +114,7 @@ class Engine:
             )
         retain_hashes: set[str] | None = None
         prefix_hashes = set(req.block_hashes[: req.prefix_block_count])
-        if self.retain_hbm_prefix_cache and not preempted:
+        if self.retain_prefix_cache and not preempted:
             retain_hashes = prefix_hashes
         elif (
             not preempted
@@ -154,10 +166,7 @@ class Engine:
     def _resolve_spill_req(self, block_hash: str) -> Request | None:
         return request_owning_prefix_block(block_hash, self._known_requests())
 
-    def _track_duplicates(
-        self, req: Request | None, tier_key: str, block_hash: str
-    ) -> None:
-        del tier_key
+    def _track_duplicates(self, req: Request | None, block_hash: str) -> None:
         content = ContentKey.from_slot(block_hash)
         count = len(
             collect_content_copies(
@@ -169,17 +178,16 @@ class Engine:
         )
         self._peak_duplicate_count = max(self._peak_duplicate_count, count)
 
-    def _on_hbm_resident(self, block: KVBlock, req: Request, now: float) -> None:
-        self.policies.effects.on_hbm_resident(self.memories, block, req, now)
-        self._track_duplicates(req, self.local_memory, block.hash)
-
+    def _on_local_resident(self, block: KVBlock, req: Request, now: float) -> None:
+        self.policies.effects.on_local_resident(self.memories, block, req, now)
+        self._track_duplicates(req, block.hash)
     def _on_tier_resident(
         self, tier_key: str, block: KVBlock, req: Request, now: float
     ) -> None:
         self.policies.effects.on_tier_resident(
             self.memories, tier_key, block, req, now
         )
-        self._track_duplicates(req, tier_key, block.hash)
+        self._track_duplicates(req, block.hash)
 
     def _after_pull(
         self, src_key: str, block_hash: str, req: Request, now: float
@@ -189,9 +197,8 @@ class Engine:
             self.memories, src_key, block_hash, req
         )
 
-    def _on_hbm_evict(self, victim: KVBlock, spill_req: Request, now: float) -> None:
-        self.policies.effects.on_hbm_evict(self.memories, victim, spill_req, now)
-
+    def _on_local_evict(self, victim: KVBlock, spill_req: Request, now: float) -> None:
+        self.policies.effects.on_local_evict(self.memories, victim, spill_req, now)
     def _enrich_scheduled(self, scheduled) -> None:
         known = self._known_requests()
         for entry in scheduled.entries:

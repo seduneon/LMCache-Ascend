@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from simulator.plan import EntryPlan, WorkEntry
 from simulator.eviction import FIFOEviction, LRUEviction, RandomEviction
-from simulator.lookup import (
-    ComputeOnlyLookupPolicy,
-    OrderedPullLookupPolicy,
-    local_satisfied,
-)
-from simulator.placement import HBMAndDRAM, HBMOnly, TieredPlacement
+from simulator.schedule import local_satisfied
+from simulator.engine_config import placement_edges
+from simulator.placement import HBMOnly, TieredPlacement
+from simulator.tier import graph_from_memories
 from simulator.retention import (
     ConsumeOnPull,
     GlobalCopyCap,
@@ -25,13 +23,25 @@ from simulator.kv_content import (
 )
 from simulator.memory import BlockState, KVBlock, Memory, collect_content_copies
 from simulator.tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
-from simulator.tests.test_helpers import SimpleTask, make_resident, policies_compute, policies_pull
+from simulator.tests.test_helpers import (
+    SimpleTask,
+    make_resident,
+    policies_compute,
+    policies_pull,
+    schedule_compute,
+    schedule_pull,
+)
 
 from simulator.engine import Engine
 from simulator.request import Request, RequestPD, RequestStatus
 from simulator.resource import BandwidthResource, ComputeResource
 from simulator.scheduler import Scheduler
 from simulator.simulator import Simulator
+
+
+def _dram_placement(memories: dict[str, Memory]) -> TieredPlacement:
+    graph = graph_from_memories(memories)
+    return TieredPlacement(graph, placement_edges(("dram",)))
 
 
 def test_hbm_and_dram_placement_creates_copy() -> None:
@@ -43,7 +53,7 @@ def test_hbm_and_dram_placement_creates_copy() -> None:
     block = memories["hbm"].append_reserved("a", "r1")
     block.state = BlockState.RESIDENT
 
-    HBMAndDRAM("dram").place_copy(
+    _dram_placement(memories).place_copy(
         memories, local_memory="hbm", block=block, req=req, now=1.0
     )
 
@@ -66,14 +76,14 @@ def test_dram_retains_block_after_hbm_eviction() -> None:
     req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
     block = memories["hbm"].append_reserved("a", "r1")
     block.state = BlockState.RESIDENT
-    HBMAndDRAM("dram").place_copy(
+    _dram_placement(memories).place_copy(
         memories, local_memory="hbm", block=block, req=req, now=1.0
     )
 
     memories["hbm"].remove_block(block)
     assert memories["hbm"].best_resident("a") is None
 
-    policy = OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"])
+    policy = schedule_pull(local_memory="hbm", pull_sources=["dram"])
     assert policy.resolve_actions(memories, ["a"], req=req)["a"] == ("pull", "dram")
 
 
@@ -116,7 +126,7 @@ def test_dram_lru_eviction_when_tier_full() -> None:
         "dram": Memory(size=2, name="dram"),
     }
     req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
-    policy = HBMAndDRAM("dram")
+    policy = _dram_placement(memories)
 
     for name, touch_t in (("a", 1.0), ("b", 2.0), ("c", 3.0)):
         block = KVBlock(name, BlockState.RESIDENT)
@@ -140,7 +150,7 @@ def test_spill_on_evict_without_prior_mirror() -> None:
     block = KVBlock("a", BlockState.RESIDENT)
     memories["hbm"].append(block)
 
-    HBMAndDRAM("dram").spill_on_evict(
+    _dram_placement(memories).spill_on_evict(
         memories, local_memory="hbm", block=block, now=5.0, req=req
     )
     memories["hbm"].remove_block(block)
@@ -172,14 +182,14 @@ def test_chunked_dram_mirror_and_pull() -> None:
     block = KVBlock("b", BlockState.RESIDENT)
     memories["hbm"].append(block)
 
-    HBMAndDRAM("dram").place_copy(
+    _dram_placement(memories).place_copy(
         memories, local_memory="hbm", block=block, req=req, now=1.0
     )
     chunk_key = "chunk:a|b|c|d"
     assert memories["dram"].best_resident(chunk_key) is not None
     assert memories["dram"].best_resident("b") is None
 
-    policy = OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["dram"])
+    policy = schedule_pull(local_memory="hbm", pull_sources=["dram"])
     assert policy.resolve_actions(memories, ["c"], req=req)["c"] == ("pull", "dram")
     assert tier_has_block(memories["dram"], req, "c")
     assert transfer_block_count(memories["dram"], req, "c") == 4
@@ -399,7 +409,7 @@ def test_random_eviction_is_seeded() -> None:
 
 def test_fifo_eviction_under_allocate_pressure() -> None:
     memories = {"hbm": Memory(size=2, name="hbm")}
-    policy = ComputeOnlyLookupPolicy(
+    policy = schedule_compute(
         local_memory="hbm",
         eviction_policy=FIFOEviction(),
     )
@@ -421,7 +431,7 @@ def test_fifo_eviction_under_allocate_pressure() -> None:
 
 def test_lru_eviction_under_allocate_pressure() -> None:
     memories = {"hbm": Memory(size=2, name="hbm")}
-    policy = ComputeOnlyLookupPolicy(local_memory="hbm")
+    policy = schedule_compute(local_memory="hbm")
     assert isinstance(policy.eviction_policy, LRUEviction)
     sched = Scheduler(policy, memories, "hbm")
 
@@ -442,7 +452,7 @@ def test_lru_eviction_under_allocate_pressure() -> None:
 
 def test_lookup_compute() -> None:
     memories = {"hbm": Memory(size=10, name="hbm")}
-    policy = ComputeOnlyLookupPolicy(local_memory="hbm")
+    policy = schedule_compute(local_memory="hbm")
     result = policy.lookup(memories, ["a"])
     assert result is not None
     assert result.blocks == {"a": "compute"}
@@ -456,7 +466,7 @@ def test_pull_only_rejects_compute_fallback() -> None:
     }
     make_resident(memories["src"], "a")
     make_resident(memories["src"], "b")
-    policy = OrderedPullLookupPolicy(local_memory="dst", pull_sources=["src"])
+    policy = schedule_pull(local_memory="dst", pull_sources=["src"])
 
     assert policy.resolve_actions(memories, ["a", "b", "c"])["c"] == "compute"
     assert policy.resolve_actions(memories, ["a", "b", "c"], allow_compute=False) is None
@@ -483,7 +493,7 @@ def test_task_prereq_ordering() -> None:
 
 def test_prefix_block_count_on_arrival() -> None:
     memories = {"hbm": Memory(size=10, name="hbm")}
-    sched = Scheduler(ComputeOnlyLookupPolicy("hbm"), memories, "hbm")
+    sched = Scheduler(schedule_compute("hbm"), memories, "hbm")
     req = Request("r1", 1.0, ["a", "b", "c"], RequestPD.PREFILL, RequestStatus.PENDING)
     sched.add_request(req)
     sched.release_arrivals(1.0)
@@ -493,7 +503,7 @@ def test_prefix_block_count_on_arrival() -> None:
 
 def test_finish_frees_kv() -> None:
     memories = {"hbm": Memory(size=10, name="hbm")}
-    sched = Scheduler(ComputeOnlyLookupPolicy("hbm"), memories, "hbm")
+    sched = Scheduler(schedule_compute("hbm"), memories, "hbm")
     req = Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.RUNNING)
     req.prefix_block_count = 1
     make_resident(memories["hbm"], "a", "r1")
@@ -510,7 +520,7 @@ def test_local_satisfied_inflight() -> None:
     block = local.append_reserved("a", "r1")
     block.task = object()  # type: ignore[assignment]
     assert local_satisfied(local, "a")
-    policy = ComputeOnlyLookupPolicy("hbm")
+    policy = schedule_compute("hbm")
     assert policy.resolve_actions(memories, ["a"]) == {}
 
 
@@ -699,7 +709,7 @@ def test_inflight_remote_source_waits_not_preempts() -> None:
 
     req = Request("r1", 0.0, ["a", "b", "c", "d"], RequestPD.PREFILL, RequestStatus.RUNNING)
     req.prefix_block_count = 4
-    policy = OrderedPullLookupPolicy(local_memory="hbm", pull_sources=["src"])
+    policy = schedule_pull(local_memory="hbm", pull_sources=["src"])
     actions = policy.resolve_actions(memories, ["c"], req=req)
     assert actions == {"c": "wait"}
 

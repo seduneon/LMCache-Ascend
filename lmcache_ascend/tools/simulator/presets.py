@@ -6,13 +6,14 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from .engine import Engine
+from .engine_config import EngineConfig, LifecycleSpec, PlacementSpec, build_placement_spec
+from .eviction import EvictionKind
 from .memory import Memory
-from .eviction import EvictionPolicy, HbmEvictionKind, make_hbm_eviction
 from .policies import EnginePolicies
 from .request import Request
 from .resource import BandwidthResource, ComputeResource
 from .tasks import TaskPool
-from .topology import SimResources, Topology, build_topology
+from .topology import SimResources, Topology, TOPOLOGY_TIERS, build_eviction_map, build_topology
 
 
 @dataclass(frozen=True)
@@ -29,35 +30,21 @@ class PresetSpec:
     global_cap_max: int = 2
     global_cap_tiers: tuple[str, ...] = ("npu-0:hbm", "npu-1:hbm")
     global_cap_per_tier: int | None = None
-    hbm_eviction: HbmEvictionKind = "lru"
-    tier_eviction: HbmEvictionKind = "lru"
+    eviction: EvictionKind = "lru"
+    local_eviction: EvictionKind | None = None
+    downstream_eviction: EvictionKind | None = None
     hold_kv_on_complete: bool = True
-    prefill_retain_hbm_prefix_cache: bool = False
-    decode_retain_hbm_prefix_cache: bool = False
+    prefill_retain_prefix_cache: bool = False
+    decode_retain_prefix_cache: bool = False
     store_on_complete: tuple[str, ...] = ()
     mirror_on_forward: bool = True
 
 
-def _hbm_eviction(spec: PresetSpec, *, rng_seed: int) -> EvictionPolicy:
-    return make_hbm_eviction(spec.hbm_eviction, seed=rng_seed)
-
-
-def _tier_eviction_policies(
-    spec: PresetSpec, *, rng_seed: int
-) -> dict[str, EvictionPolicy]:
-    tier_keys = set(spec.mirror_tiers) | set(spec.store_on_complete)
-    if not tier_keys:
-        return {}
-    policy = make_hbm_eviction(spec.tier_eviction, seed=rng_seed)
-    return {tier_key: policy for tier_key in tier_keys}
-
-
-def _effect_kwargs(spec: PresetSpec, *, rng_seed: int) -> dict:
-    return dict(
+def _placement_spec(spec: PresetSpec) -> PlacementSpec:
+    return build_placement_spec(
         mirror_tiers=spec.mirror_tiers,
         async_write_tiers=spec.async_write_tiers,
         mirror_on_forward=spec.mirror_on_forward,
-        tier_eviction=_tier_eviction_policies(spec, rng_seed=rng_seed),
         retention=spec.retention,
         global_cap_max=spec.global_cap_max,
         global_cap_tiers=spec.global_cap_tiers,
@@ -65,39 +52,30 @@ def _effect_kwargs(spec: PresetSpec, *, rng_seed: int) -> dict:
     )
 
 
-def _prefill_memory_kwargs(spec: PresetSpec) -> dict:
-    return dict(
-        retain_hbm_prefix_cache=spec.prefill_retain_hbm_prefix_cache,
-        store_tiers_on_complete=spec.store_on_complete,
+def prefill_config(spec: PresetSpec, topo: Topology) -> EngineConfig:
+    return EngineConfig(
+        engine_id=topo.prefill_engine_id,
+        local_tier=topo.prefill_local_tier,
+        pull_mode="compute_only",
+        placement=_placement_spec(spec),
+        lifecycle=LifecycleSpec(
+            hold_kv_on_complete=spec.hold_kv_on_complete,
+            retain_prefix_cache=spec.prefill_retain_prefix_cache,
+            store_on_complete=spec.store_on_complete,
+        ),
     )
 
 
-def _decode_memory_kwargs(spec: PresetSpec) -> dict:
-    return dict(
-        retain_hbm_prefix_cache=spec.decode_retain_hbm_prefix_cache,
-        store_tiers_on_complete=(),
-    )
-
-
-def _prefill_policies(
-    spec: PresetSpec, topo: Topology, *, rng_seed: int = 0
-) -> EnginePolicies:
-    return EnginePolicies.compute_only(
-        topo.prefill_hbm,
-        hbm_eviction=_hbm_eviction(spec, rng_seed=rng_seed),
-        **_effect_kwargs(spec, rng_seed=rng_seed),
-    )
-
-
-def _decode_policies(
-    spec: PresetSpec, topo: Topology, *, rng_seed: int = 0
-) -> EnginePolicies:
-    sources = topo.decode_pull_sources(spec.decode_pull)
-    return EnginePolicies.ordered_pull(
-        topo.decode_hbm,
-        sources,
-        hbm_eviction=_hbm_eviction(spec, rng_seed=rng_seed),
-        **_effect_kwargs(spec, rng_seed=rng_seed),
+def decode_config(spec: PresetSpec, topo: Topology) -> EngineConfig:
+    return EngineConfig(
+        engine_id=topo.decode_engine_id,
+        local_tier=topo.decode_local_tier,
+        pull_sources=topo.decode_pull_sources(spec.decode_pull),
+        pull_mode="ordered_pull",
+        placement=_placement_spec(spec),
+        lifecycle=LifecycleSpec(
+            retain_prefix_cache=spec.decode_retain_prefix_cache,
+        ),
     )
 
 
@@ -152,7 +130,7 @@ PRESETS: dict[str, PresetSpec] = {
         name="evict_lru",
         description=(
             "LMCache PD: P offloads prefix to DRAM on complete and frees P HBM; "
-            "D pulls prefix from DRAM only; D keeps APC on D HBM; LRU on HBM and DRAM"
+            "D pulls prefix from DRAM only; D keeps APC on D HBM; LRU on all tiers"
         ),
         topology="hbm_dram",
         decode_pull=("npu-0:dram",),
@@ -160,15 +138,14 @@ PRESETS: dict[str, PresetSpec] = {
         mirror_on_forward=False,
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
-        decode_retain_hbm_prefix_cache=True,
-        hbm_eviction="lru",
-        tier_eviction="lru",
+        decode_retain_prefix_cache=True,
+        eviction="lru",
     ),
     "evict_fifo": PresetSpec(
         name="evict_fifo",
         description=(
             "LMCache PD: P offloads prefix to DRAM on complete and frees P HBM; "
-            "D pulls prefix from DRAM only; D keeps APC on D HBM; FIFO on HBM and DRAM"
+            "D pulls prefix from DRAM only; D keeps APC on D HBM; FIFO on all tiers"
         ),
         topology="hbm_dram",
         decode_pull=("npu-0:dram",),
@@ -176,15 +153,14 @@ PRESETS: dict[str, PresetSpec] = {
         mirror_on_forward=False,
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
-        decode_retain_hbm_prefix_cache=True,
-        hbm_eviction="fifo",
-        tier_eviction="fifo",
+        decode_retain_prefix_cache=True,
+        eviction="fifo",
     ),
     "evict_random": PresetSpec(
         name="evict_random",
         description=(
             "LMCache PD: P offloads prefix to DRAM on complete and frees P HBM; "
-            "D pulls prefix from DRAM only; D keeps APC on D HBM; random on HBM and DRAM"
+            "D pulls prefix from DRAM only; D keeps APC on D HBM; random on all tiers"
         ),
         topology="hbm_dram",
         decode_pull=("npu-0:dram",),
@@ -192,9 +168,8 @@ PRESETS: dict[str, PresetSpec] = {
         mirror_on_forward=False,
         store_on_complete=("npu-0:dram",),
         hold_kv_on_complete=False,
-        decode_retain_hbm_prefix_cache=True,
-        hbm_eviction="random",
-        tier_eviction="random",
+        decode_retain_prefix_cache=True,
+        eviction="random",
     ),
 }
 
@@ -249,8 +224,21 @@ def _write_links(
 def build_topology_for_preset(
     spec: PresetSpec,
     resources: SimResources | None = None,
+    *,
+    rng_seed: int = 0,
 ) -> Topology:
-    return build_topology(spec.topology, resources=resources or SimResources.default())
+    tier_keys = TOPOLOGY_TIERS[spec.topology]
+    eviction_map = build_eviction_map(
+        tier_keys,
+        local_kind=spec.local_eviction or spec.eviction,
+        downstream_kind=spec.downstream_eviction or spec.eviction,
+        rng_seed=rng_seed,
+    )
+    return build_topology(
+        spec.topology,
+        resources=resources or SimResources.default(),
+        eviction_map=eviction_map,
+    )
 
 
 def build_pd_engines(
@@ -265,16 +253,19 @@ def build_pd_engines(
     spec = PRESETS[preset] if isinstance(preset, str) else preset
     build = cfg or EngineBuildConfig()
     res = resources or build.resources
-    topo = build_topology_for_preset(spec, res)
+    topo = build_topology_for_preset(spec, res, rng_seed=rng_seed)
     compute = ComputeResource(base_speed=build.compute_speed)
     link = BandwidthResource(base_speed=build.link_speed, latency=build.link_latency)
-    decode_schedule = _decode_policies(spec, topo, rng_seed=rng_seed).schedule
+    prefill_cfg = prefill_config(spec, topo)
+    decode_cfg = decode_config(spec, topo)
+    prefill_policies = EnginePolicies.from_config(prefill_cfg, topo.graph)
+    decode_policies = EnginePolicies.from_config(decode_cfg, topo.graph)
     prefill = Engine(
         engine_id=topo.prefill_engine_id,
         requests=requests,
         pool=pool,
         memories=topo.memories,
-        policies=_prefill_policies(spec, topo, rng_seed=rng_seed),
+        policies=prefill_policies,
         compute_res=compute,
         work_per_block=build.work_per_block,
         max_num_seqs=build.max_num_seqs,
@@ -282,18 +273,20 @@ def build_pd_engines(
         enable_chunked_prefill=True,
         write_links=_write_links(topo.memories, build),
         work_per_store=build.work_per_transfer,
-        **_prefill_memory_kwargs(spec),
+        hold_kv_on_complete=prefill_cfg.lifecycle.hold_kv_on_complete,
+        retain_prefix_cache=prefill_cfg.lifecycle.retain_prefix_cache,
+        store_tiers_on_complete=prefill_cfg.lifecycle.store_on_complete,
     )
     decode = Engine(
         engine_id=topo.decode_engine_id,
         requests=[],
         pool=pool,
         memories=topo.memories,
-        policies=_decode_policies(spec, topo, rng_seed=rng_seed),
+        policies=decode_policies,
         compute_res=compute,
         bandwidth_res=link,
         transfer_links=_transfer_links(
-            topo.memories, decode_schedule.pull_sources, link
+            topo.memories, list(decode_policies.schedule.config.pull_sources), link
         ),
         work_per_block=build.work_per_block,
         work_per_transfer=build.work_per_transfer,
@@ -301,6 +294,6 @@ def build_pd_engines(
         max_num_batched_tokens=build.max_num_batched_tokens,
         enable_chunked_prefill=True,
         remote_kv_wait=True,
-        **_decode_memory_kwargs(spec),
+        retain_prefix_cache=decode_cfg.lifecycle.retain_prefix_cache,
     )
     return prefill, decode, topo

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .eviction import EvictionPolicy, LRUEviction
 from .effects import EffectConfig, EffectPolicy
+from .engine_config import EngineConfig, build_placement_spec
+from .eviction import LRUEviction
 from .plan import EntryPlan, WorkEntry
 from .request import Request, request_owning_prefix_block
 from .schedule import ScheduleConfig, SchedulePolicy
+from .tier import Tier, TierGraph
 
 
 @dataclass
@@ -17,40 +19,88 @@ class EnginePolicies:
     effects: EffectPolicy
 
     @classmethod
+    def from_config(cls, config: EngineConfig, graph: TierGraph) -> EnginePolicies:
+        local_eviction = graph.eviction_for(config.local_tier)
+        return cls(
+            SchedulePolicy(
+                ScheduleConfig(
+                    local_memory=config.local_tier,
+                    pull_sources=config.pull_sources,
+                    pull_mode=config.pull_mode,
+                    local_eviction=local_eviction,
+                )
+            ),
+            EffectPolicy(
+                EffectConfig(
+                    local_memory=config.local_tier,
+                    graph=graph,
+                    placement=config.placement,
+                )
+            ),
+        )
+
+    @classmethod
+    def with_graph(cls, policies: EnginePolicies, graph: TierGraph) -> EnginePolicies:
+        schedule_cfg = policies.schedule.config
+        placement = policies.effects.config.placement
+        return cls.from_config(
+            EngineConfig(
+                engine_id="e0",
+                local_tier=schedule_cfg.local_memory,
+                pull_sources=schedule_cfg.pull_sources,
+                pull_mode=schedule_cfg.pull_mode,
+                placement=placement,
+            ),
+            graph,
+        )
+
+    @classmethod
     def compute_only(
         cls,
         local_memory: str,
         *,
-        hbm_eviction: EvictionPolicy | None = None,
+        graph: TierGraph | None = None,
+        local_eviction=None,
         mirror_tiers: tuple[str, ...] = (),
         async_write_tiers: frozenset[str] | None = None,
         mirror_on_forward: bool = True,
-        tier_eviction: dict[str, EvictionPolicy] | None = None,
         retention: str = "unbounded",
         global_cap_max: int = 0,
         global_cap_tiers: tuple[str, ...] = (),
         global_cap_per_tier: int | None = 1,
     ) -> EnginePolicies:
-        return cls(
-            SchedulePolicy(
-                ScheduleConfig(
-                    local_memory=local_memory,
-                    hbm_eviction=hbm_eviction or LRUEviction(),
-                )
+        g = graph or TierGraph(tiers={})
+        if local_memory not in g.tiers and local_eviction is not None:
+            from .memory import Memory
+            from .tier import Tier
+
+            g = TierGraph(
+                tiers={
+                    **g.tiers,
+                    local_memory: Tier(
+                        local_memory,
+                        Memory(size=1, name=local_memory),
+                        local_eviction,
+                    ),
+                }
+            )
+        placement = build_placement_spec(
+            mirror_tiers=mirror_tiers,
+            async_write_tiers=async_write_tiers or frozenset(),
+            mirror_on_forward=mirror_on_forward,
+            retention=retention,  # type: ignore[arg-type]
+            global_cap_max=global_cap_max,
+            global_cap_tiers=global_cap_tiers,
+            global_cap_per_tier=global_cap_per_tier,
+        )
+        return cls.from_config(
+            EngineConfig(
+                engine_id="e0",
+                local_tier=local_memory,
+                pull_mode="compute_only",
+                placement=placement,
             ),
-            EffectPolicy(
-                EffectConfig(
-                    local_memory=local_memory,
-                    mirror_tiers=mirror_tiers,
-                    async_write_tiers=async_write_tiers or frozenset(),
-                    mirror_on_forward=mirror_on_forward,
-                    tier_eviction=tier_eviction or {},
-                    retention=retention,  # type: ignore[arg-type]
-                    global_cap_max=global_cap_max,
-                    global_cap_tiers=global_cap_tiers,
-                    global_cap_per_tier=global_cap_per_tier,
-                )
-            ),
+            g,
         )
 
     @classmethod
@@ -59,38 +109,35 @@ class EnginePolicies:
         local_memory: str,
         pull_sources: tuple[str, ...] | list[str],
         *,
-        hbm_eviction: EvictionPolicy | None = None,
+        graph: TierGraph | None = None,
+        local_eviction=None,
         mirror_tiers: tuple[str, ...] = (),
         async_write_tiers: frozenset[str] | None = None,
         mirror_on_forward: bool = True,
-        tier_eviction: dict[str, EvictionPolicy] | None = None,
         retention: str = "unbounded",
         global_cap_max: int = 0,
         global_cap_tiers: tuple[str, ...] = (),
         global_cap_per_tier: int | None = 1,
     ) -> EnginePolicies:
-        return cls(
-            SchedulePolicy(
-                ScheduleConfig(
-                    local_memory=local_memory,
-                    pull_sources=tuple(pull_sources),
-                    pull_mode="ordered_pull",
-                    hbm_eviction=hbm_eviction or LRUEviction(),
-                )
+        g = graph or TierGraph(tiers={})
+        placement = build_placement_spec(
+            mirror_tiers=mirror_tiers,
+            async_write_tiers=async_write_tiers or frozenset(),
+            mirror_on_forward=mirror_on_forward,
+            retention=retention,  # type: ignore[arg-type]
+            global_cap_max=global_cap_max,
+            global_cap_tiers=global_cap_tiers,
+            global_cap_per_tier=global_cap_per_tier,
+        )
+        return cls.from_config(
+            EngineConfig(
+                engine_id="e0",
+                local_tier=local_memory,
+                pull_sources=tuple(pull_sources),
+                pull_mode="ordered_pull",
+                placement=placement,
             ),
-            EffectPolicy(
-                EffectConfig(
-                    local_memory=local_memory,
-                    mirror_tiers=mirror_tiers,
-                    async_write_tiers=async_write_tiers or frozenset(),
-                    mirror_on_forward=mirror_on_forward,
-                    tier_eviction=tier_eviction or {},
-                    retention=retention,  # type: ignore[arg-type]
-                    global_cap_max=global_cap_max,
-                    global_cap_tiers=global_cap_tiers,
-                    global_cap_per_tier=global_cap_per_tier,
-                )
-            ),
+            g,
         )
 
 
@@ -103,6 +150,8 @@ def enrich_entry_plan(
     known_requests: list[Request],
 ) -> None:
     """Plan-time expansion of async store and spill ops."""
+    from .memory import Memory
+
     for block_hash in entry.block_hashes:
         action = plan.blocks.get(block_hash)
         needs_store = action == "compute" or (

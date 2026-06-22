@@ -11,7 +11,7 @@ Run policy comparisons: `python3.12 simulator.py sweep` (see `sweep.py` and `pre
 | Policy area | Readiness | Honest assessment |
 |-------------|-----------|-------------------|
 | Pull vs recompute (read path) | **~85%** | Bandwidth queues; chunk batch pulls; `"wait"` on remote in-flight; batch-local pull dedupe. |
-| Placement / eviction / duplicates | **~75%** | HBM+DRAM sync + SSD paid writes; `GlobalCopyCap`; sync eviction at allocate. |
+| Placement / eviction / duplicates | **~75%** | Tier-centric eviction; sync/async `PlacementEdge` copies; `GlobalCopyCap`; sync eviction at allocate. |
 | vLLM scheduler shape | **~80%** | Batching, preempt, chunked prefill, PD read mode. Block-grain, one in-flight batch per engine. |
 | Sweep infrastructure | **~80%** | CLI + CSV; data-driven presets; Mooncake trace replay via `--trace`. |
 
@@ -35,28 +35,30 @@ Simulator.step()
 
 | Module | Role |
 |--------|------|
-| `policies.py` | `EnginePolicies` bundle: schedule + effects |
-| `schedule.py` | `SchedulePolicy`: block resolution + HBM eviction |
+| `tier.py` | `Tier` (memory + eviction), `TierGraph` |
+| `engine_config.py` | `EngineConfig`, `LifecycleSpec`, `PlacementSpec` per engine |
+| `policies.py` | `EnginePolicies.from_config()` — schedule + effects bundle |
+| `schedule.py` | `SchedulePolicy`: block resolution + local-tier eviction at admit |
 | `effects.py` | `EffectPolicy`: placement, retention, store/spill planning |
-| `presets.py` | `PresetSpec`, `PRESETS`, `build_pd_engines()` |
-| `topology.py` | Tier memory layout (`hbm_only`, `hbm_dram`, `hbm_dram_ssd`) |
+| `presets.py` | `PresetSpec`, `PRESETS`, `prefill_config` / `decode_config`, `build_pd_engines()` |
+| `topology.py` | `TierGraph` build, `prefill_local_tier` / `decode_local_tier` |
 | `plan.py` | `ScheduleResult`, `BatchPlan`, `EntryPlan`, `StoreOp` |
-| `execute.py` | `BatchRunner`: reservations, tasks, effect callbacks |
-| `placement.py` / `retention.py` | Effect implementations (mirrors, caps, consume-on-pull) |
-| `eviction.py` | `LRUEviction`, `FIFOEviction`, `RandomEviction`, `make_hbm_eviction` |
-| `tier_allocator.py` | Shared downstream tier slot acquire + eviction |
+| `execute.py` | `BatchRunner`: reservations, tasks, `on_local_*` effect callbacks |
+| `placement.py` | `PlacementEdge`, `ensure_downstream_copy`, `TieredPlacement` |
+| `retention.py` | Duplicate caps, consume-on-pull, global copy limits |
+| `eviction.py` | `LRUEviction`, `FIFOEviction`, `RandomEviction`, `make_eviction` |
+| `tier_allocator.py` | Downstream tier slot acquire via `tier.eviction` |
 | `kv_content.py` | `ContentKey`, tier slot mapping |
-| `lookup.py` | Compatibility shims (`ComputeOnlyLookupPolicy`, etc.) |
 | `events.py` | Cross-engine messages (`DecodeSpawn`, `KvRelease`) |
 
 ### Policy model
 
-Each engine holds an `EnginePolicies` bundle:
+Each engine is configured by `EngineConfig` and holds an `EnginePolicies` bundle:
 
-- **Schedule** (`SchedulePolicy`): resolve per-block actions (`compute`, `pull`, `wait`, local hit) and HBM evictions at admit time.
-- **Effects** (`EffectPolicy`): execute-time mirrors/spills/retention; expands async store and spill ops into `EntryPlan` before execute.
+- **Schedule** (`SchedulePolicy`): resolve per-block actions (`compute`, `pull`, `wait`, local hit) and local-tier evictions at admit time.
+- **Effects** (`EffectPolicy`): execute-time placement edges (forward / complete / evict triggers), retention, async store/spill expansion into `EntryPlan`.
 
-Sweep presets are data rows in `presets.PRESETS` interpreted by `build_pd_engines()` — no per-preset Python wiring.
+Each **tier** in `TierGraph` owns its `Memory` and `EvictionPolicy`. Presets declare topology + two `EngineConfig`s (`prefill_config`, `decode_config`) — no per-preset Python wiring.
 
 ### Structural limits (read before interpreting sweeps)
 

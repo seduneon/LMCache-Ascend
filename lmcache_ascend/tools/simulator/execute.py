@@ -57,7 +57,7 @@ class BatchRunner:
                     )
                 else:
                     on_evict = (
-                        self._hbm_evict_cb(spill_req)
+                        self._local_evict_cb(spill_req)
                         if spill_req is not None
                         else None
                     )
@@ -97,7 +97,7 @@ class BatchRunner:
                         f"request {entry.req.req_id!r}"
                     )
                 forward_blocks.append(dst)
-                forward_callbacks[id(dst)] = self._hbm_resident_cb(entry.req)
+                forward_callbacks[id(dst)] = self._local_resident_cb(entry.req)
 
         if not forward_blocks:
             return
@@ -135,21 +135,21 @@ class BatchRunner:
     def _add_task(self, task: Task, prereqs: list[Task], batch_id: int) -> None:
         self._engine.pool.add(task, prereqs, batch_id=batch_id)
 
-    def _hbm_resident_cb(self, req: Request) -> BlockCallback:
+    def _local_resident_cb(self, req: Request) -> BlockCallback:
         def cb(block: KVBlock, now: float) -> None:
-            self._engine._on_hbm_resident(block, req, now)
+            self._engine._on_local_resident(block, req, now)
 
         return cb
 
-    def _hbm_evict_cb(self, req: Request) -> BlockCallback:
+    def _local_evict_cb(self, req: Request) -> BlockCallback:
         def cb(block: KVBlock, now: float) -> None:
-            self._engine._on_hbm_evict(block, req, now)
+            self._engine._on_local_evict(block, req, now)
 
         return cb
 
     def _pull_complete_cb(self, req: Request, src_key: str) -> BlockCallback:
         def cb(block: KVBlock, now: float) -> None:
-            self._engine._on_hbm_resident(block, req, now)
+            self._engine._on_local_resident(block, req, now)
             self._engine._after_pull(src_key, block.hash, req, now)
 
         return cb
@@ -216,7 +216,7 @@ class BatchRunner:
         batch_id: int,
     ) -> None:
         if spill_req is not None:
-            self._engine._on_hbm_evict(victim, spill_req, self._at)
+            self._engine._on_local_evict(victim, spill_req, self._at)
         spill_ops = entry.plan.spill_store_ops.get(id(victim), [])
         if spill_req is not None and spill_ops:
             for op in spill_ops:

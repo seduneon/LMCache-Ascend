@@ -1,4 +1,4 @@
-"""Schedule-time policy: block resolution + HBM eviction."""
+"""Schedule-time policy: block resolution + local-tier eviction."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ class ScheduleConfig:
     local_memory: str
     pull_sources: tuple[str, ...] = ()
     pull_mode: Literal["compute_only", "ordered_pull"] = "compute_only"
-    hbm_eviction: EvictionPolicy = field(default_factory=LRUEviction)
+    local_eviction: EvictionPolicy = field(default_factory=LRUEviction)
 
 
 class SchedulePolicy:
@@ -88,7 +88,7 @@ class SchedulePolicy:
 
     @property
     def eviction_policy(self) -> EvictionPolicy:
-        return self.config.hbm_eviction
+        return self.config.local_eviction
 
     def lookup(
         self,
@@ -108,7 +108,7 @@ class SchedulePolicy:
         )
         if actions is None:
             return None
-        evicts = self.config.hbm_eviction.plan(
+        evicts = self.config.local_eviction.plan(
             memories[self.local_memory], slots_needed(actions), set(block_hashes)
         )
         if evicts is None:

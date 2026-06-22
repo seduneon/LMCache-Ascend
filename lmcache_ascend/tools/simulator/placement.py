@@ -1,20 +1,94 @@
-"""Placement policies: where KV copies live when blocks become HBM-resident."""
+"""Placement policies: where KV copies live when blocks become local-tier resident."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Literal
 
 from .kv_content import ContentKey, storage_key
-from .eviction import EvictionPolicy, LRUEviction
 from .memory import BlockState, KVBlock, Memory
 from .plan import StoreOp
 from .request import Request
 from .retention import RetentionPolicy, UnboundedRetention
+from .tier import TierGraph
 from .tier_allocator import TierAllocator
 
 
+@dataclass(frozen=True)
+class PlacementEdge:
+    """Directed copy from local tier to a downstream tier."""
+
+    dst_tier: str
+    trigger: Literal["forward", "complete", "evict"]
+    delivery: Literal["sync", "async"]
+
+
+def ensure_downstream_copy(
+    graph: TierGraph,
+    allocator: TierAllocator,
+    *,
+    dst: str,
+    block_hash: str,
+    req: Request,
+    now: float,
+    delivery: Literal["sync", "async"],
+    exclude: set[str],
+    retention: RetentionPolicy,
+) -> tuple[bool, list[StoreOp]]:
+    """Ensure ``block_hash`` has a downstream copy; async returns ``StoreOp`` list."""
+    tier = graph.get(dst)
+    memory = tier.memory
+    chunk_key = storage_key(req, block_hash, memory.chunk_blocks)
+    if allocator.tier_covers(memory, chunk_key):
+        if delivery == "sync":
+            resident = memory.best_resident(chunk_key)
+            return resident is not None, []
+        if memory.best_resident(chunk_key) is not None:
+            return True, []
+        if memory.inflight_incoming(chunk_key) is not None:
+            return True, []
+
+    if delivery == "sync":
+        copy = allocator.ensure_slot(
+            tier,
+            chunk_key,
+            state=BlockState.RESIDENT,
+            exclude=exclude | {chunk_key},
+        )
+        if copy is None:
+            return False, []
+        memory.touch(copy, now)
+        retention.on_block_resident(
+            graph.memories, tier_key=dst, block=copy, now=now
+        )
+        return True, []
+
+    if memory.best_resident(chunk_key) is not None:
+        return True, []
+    if memory.inflight_incoming(chunk_key) is not None:
+        return True, []
+    copy = allocator.ensure_slot(
+        tier,
+        chunk_key,
+        state=BlockState.RESERVED,
+        exclude=exclude | {chunk_key},
+    )
+    if copy is None:
+        return False, []
+    ops = [
+        StoreOp(
+            tier_key=dst,
+            content=ContentKey.from_block(block_hash),
+            storage_key=chunk_key,
+            hbm_block_hash=block_hash,
+        )
+    ]
+    return True, ops
+
+
 class PlacementPolicy(ABC):
-    """Where to retain KV copies when a block becomes resident on local HBM."""
+    """Where to retain KV copies when a block becomes resident on the local tier."""
 
     @abstractmethod
     def place_copy(
@@ -37,10 +111,10 @@ class PlacementPolicy(ABC):
         now: float,
         req: Request | None = None,
     ) -> None:
-        """Called before an HBM victim is removed. Default: drop (no spill)."""
+        """Called before a local-tier victim is removed. Default: drop (no spill)."""
 
     def bind_retention(self, retention: RetentionPolicy) -> None:
-        """Optional hook for tier mirrors to enforce copy caps (``HBMAndDRAM``)."""
+        """Optional hook for tier mirrors to enforce copy caps."""
 
     def plan_async_stores(
         self,
@@ -50,7 +124,6 @@ class PlacementPolicy(ABC):
         block_hash: str,
         req: Request,
     ) -> list[StoreOp]:
-        """Return paid async mirror ops after compute/pull (empty for sync-only placement)."""
         return []
 
     def plan_spill_stores(
@@ -61,12 +134,7 @@ class PlacementPolicy(ABC):
         block_hash: str,
         req: Request,
     ) -> list[StoreOp]:
-        """Return paid async spill ops before HBM victim is removed."""
         return []
-
-    def mirror_tier_keys(self) -> tuple[str, ...]:
-        """Downstream tiers that receive sync mirrors when HBM blocks become resident."""
-        return ()
 
     def store_prefix_on_complete(
         self,
@@ -77,7 +145,6 @@ class PlacementPolicy(ABC):
         now: float,
         tier_keys: tuple[str, ...],
     ) -> bool:
-        """Mirror prefix blocks to downstream tiers at request completion."""
         del local_memory
         del memories
         del req
@@ -87,7 +154,7 @@ class PlacementPolicy(ABC):
 
 
 class HBMOnly(PlacementPolicy):
-    """Keep computed KV on local HBM only (default)."""
+    """Keep computed KV on local tier only (default)."""
 
     def place_copy(
         self,
@@ -101,121 +168,18 @@ class HBMOnly(PlacementPolicy):
         pass
 
 
-class HBMAndDRAM(PlacementPolicy):
-    """Mirror HBM residents to DRAM; spill on HBM evict; LRU-evict DRAM when full."""
-
-    def __init__(
-        self,
-        dram_memory: str,
-        *,
-        dram_eviction_policy: EvictionPolicy | None = None,
-        mirror_on_forward: bool = True,
-    ):
-        self.dram_memory = dram_memory
-        self._dram_eviction = dram_eviction_policy or LRUEviction()
-        self._allocator = TierAllocator(self._dram_eviction)
-        self._retention: RetentionPolicy = UnboundedRetention()
-        self.mirror_on_forward = mirror_on_forward
-
-    def bind_retention(self, retention: RetentionPolicy) -> None:
-        self._retention = retention
-
-    def _ensure_dram_resident(
-        self,
-        memories: dict[str, Memory],
-        *,
-        req: Request,
-        block_hash: str,
-        now: float,
-    ) -> bool:
-        dram = memories[self.dram_memory]
-        chunk_key = storage_key(req, block_hash, dram.chunk_blocks)
-        if self._allocator.tier_covers(dram, chunk_key):
-            return dram.best_resident(chunk_key) is not None
-
-        copy = self._allocator.ensure_slot(
-            dram,
-            chunk_key,
-            state=BlockState.RESIDENT,
-            exclude={chunk_key},
-            eviction=self._dram_eviction,
-        )
-        if copy is None:
-            return False
-        dram.touch(copy, now)
-        self._retention.on_block_resident(
-            memories, tier_key=self.dram_memory, block=copy, now=now
-        )
-        return True
-
-    def place_copy(
-        self,
-        memories: dict[str, Memory],
-        *,
-        local_memory: str,
-        block: KVBlock,
-        req: Request,
-        now: float,
-    ) -> None:
-        if not self.mirror_on_forward:
-            return
-        self._ensure_dram_resident(
-            memories, req=req, block_hash=block.hash, now=now
-        )
-
-    def store_prefix_on_complete(
-        self,
-        memories: dict[str, Memory],
-        *,
-        local_memory: str,
-        req: Request,
-        now: float,
-        tier_keys: tuple[str, ...],
-    ) -> bool:
-        del local_memory
-        if self.dram_memory not in tier_keys:
-            return True
-        ok = True
-        for block_hash in req.block_hashes[: req.prefix_block_count]:
-            if block_hash.startswith("blk:"):
-                continue
-            if not self._ensure_dram_resident(
-                memories, req=req, block_hash=block_hash, now=now
-            ):
-                ok = False
-        return ok
-
-    def spill_on_evict(
-        self,
-        memories: dict[str, Memory],
-        *,
-        local_memory: str,
-        block: KVBlock,
-        now: float,
-        req: Request | None = None,
-    ) -> None:
-        self._ensure_dram_resident(
-            memories, req=req, block_hash=block.hash, now=now
-        )
-
-    def mirror_tier_keys(self) -> tuple[str, ...]:
-        return (self.dram_memory,)
-
-
 class TieredPlacement(PlacementPolicy):
-    """Mirror/spill HBM to one or more downstream tiers; optional paid writes per tier."""
+    """Mirror/spill local tier to downstream tiers via ``PlacementEdge`` rules."""
 
     def __init__(
         self,
-        tier_keys: list[str],
+        graph: TierGraph,
+        edges: tuple[PlacementEdge, ...],
         *,
-        tier_eviction: dict[str, EvictionPolicy] | None = None,
-        paid_write_tiers: frozenset[str] | None = None,
         mirror_on_forward: bool = True,
     ):
-        self.tier_keys = list(tier_keys)
-        self._tier_eviction = tier_eviction or {}
-        self._paid_write_tiers = paid_write_tiers or frozenset()
+        self._graph = graph
+        self._edges = edges
         self._allocator = TierAllocator()
         self._retention: RetentionPolicy = UnboundedRetention()
         self.mirror_on_forward = mirror_on_forward
@@ -223,55 +187,61 @@ class TieredPlacement(PlacementPolicy):
     def bind_retention(self, retention: RetentionPolicy) -> None:
         self._retention = retention
 
-    def _eviction_for(self, tier_key: str) -> EvictionPolicy:
-        return self._allocator.eviction_for(tier_key, self._tier_eviction)
+    def _edges_for(self, trigger: str) -> list[PlacementEdge]:
+        return [edge for edge in self._edges if edge.trigger == trigger]
 
-    def _ensure_tier_resident_sync(
+    def _run_sync_edges(
         self,
         memories: dict[str, Memory],
         *,
-        tier_key: str,
-        req: Request,
+        trigger: str,
         block_hash: str,
+        req: Request,
         now: float,
     ) -> bool:
-        tier = memories[tier_key]
-        chunk_key = storage_key(req, block_hash, tier.chunk_blocks)
-        if self._allocator.tier_covers(tier, chunk_key):
-            return True
+        ok = True
+        for edge in self._edges_for(trigger):
+            if edge.delivery != "sync":
+                continue
+            success, _ = ensure_downstream_copy(
+                self._graph,
+                self._allocator,
+                dst=edge.dst_tier,
+                block_hash=block_hash,
+                req=req,
+                now=now,
+                delivery="sync",
+                exclude={block_hash},
+                retention=self._retention,
+            )
+            ok = ok and success
+        return ok
 
-        copy = self._allocator.ensure_slot(
-            tier,
-            chunk_key,
-            state=BlockState.RESIDENT,
-            exclude={chunk_key},
-            eviction=self._eviction_for(tier_key),
-        )
-        if copy is None:
-            return False
-        tier.touch(copy, now)
-        self._retention.on_block_resident(
-            memories, tier_key=tier_key, block=copy, now=now
-        )
-        return True
-
-    def _reserve_tier_loading(
+    def _plan_async_edges(
         self,
         memories: dict[str, Memory],
         *,
-        tier_key: str,
-        req: Request,
+        trigger: str,
         block_hash: str,
-    ) -> KVBlock | None:
-        tier = memories[tier_key]
-        chunk_key = storage_key(req, block_hash, tier.chunk_blocks)
-        return self._allocator.ensure_slot(
-            tier,
-            chunk_key,
-            state=BlockState.RESERVED,
-            exclude={chunk_key},
-            eviction=self._eviction_for(tier_key),
-        )
+        req: Request,
+    ) -> list[StoreOp]:
+        ops: list[StoreOp] = []
+        for edge in self._edges_for(trigger):
+            if edge.delivery != "async":
+                continue
+            _, edge_ops = ensure_downstream_copy(
+                self._graph,
+                self._allocator,
+                dst=edge.dst_tier,
+                block_hash=block_hash,
+                req=req,
+                now=0.0,
+                delivery="async",
+                exclude={block_hash},
+                retention=self._retention,
+            )
+            ops.extend(edge_ops)
+        return ops
 
     def place_copy(
         self,
@@ -284,12 +254,9 @@ class TieredPlacement(PlacementPolicy):
     ) -> None:
         if not self.mirror_on_forward:
             return
-        for tier_key in self.tier_keys:
-            if tier_key in self._paid_write_tiers:
-                continue
-            self._ensure_tier_resident_sync(
-                memories, tier_key=tier_key, req=req, block_hash=block.hash, now=now
-            )
+        self._run_sync_edges(
+            memories, trigger="forward", block_hash=block.hash, req=req, now=now
+        )
 
     def store_prefix_on_complete(
         self,
@@ -302,20 +269,26 @@ class TieredPlacement(PlacementPolicy):
     ) -> bool:
         del local_memory
         ok = True
-        for tier_key in tier_keys:
-            if tier_key not in self.tier_keys or tier_key in self._paid_write_tiers:
+        for block_hash in req.block_hashes[: req.prefix_block_count]:
+            if block_hash.startswith("blk:"):
                 continue
-            for block_hash in req.block_hashes[: req.prefix_block_count]:
-                if block_hash.startswith("blk:"):
+            for edge in self._edges_for("complete"):
+                if edge.dst_tier not in tier_keys:
                     continue
-                if not self._ensure_tier_resident_sync(
-                    memories,
-                    tier_key=tier_key,
-                    req=req,
+                if edge.delivery != "sync":
+                    continue
+                success, _ = ensure_downstream_copy(
+                    self._graph,
+                    self._allocator,
+                    dst=edge.dst_tier,
                     block_hash=block_hash,
+                    req=req,
                     now=now,
-                ):
-                    ok = False
+                    delivery="sync",
+                    exclude={block_hash},
+                    retention=self._retention,
+                )
+                ok = ok and success
         return ok
 
     def spill_on_evict(
@@ -332,12 +305,9 @@ class TieredPlacement(PlacementPolicy):
                 "decode-generated blocks (blk:req:N) do not spill to downstream tiers"
             )
             return
-        for tier_key in self.tier_keys:
-            if tier_key in self._paid_write_tiers:
-                continue
-            self._ensure_tier_resident_sync(
-                memories, tier_key=tier_key, req=req, block_hash=block.hash, now=now
-            )
+        self._run_sync_edges(
+            memories, trigger="evict", block_hash=block.hash, req=req, now=now
+        )
 
     def plan_async_stores(
         self,
@@ -347,8 +317,8 @@ class TieredPlacement(PlacementPolicy):
         block_hash: str,
         req: Request,
     ) -> list[StoreOp]:
-        return self._paid_stores(
-            memories, req=req, block_hash=block_hash, paid_only=True
+        return self._plan_async_edges(
+            memories, trigger="forward", block_hash=block_hash, req=req
         )
 
     def plan_spill_stores(
@@ -359,45 +329,6 @@ class TieredPlacement(PlacementPolicy):
         block_hash: str,
         req: Request,
     ) -> list[StoreOp]:
-        return self._paid_stores(
-            memories, req=req, block_hash=block_hash, paid_only=True
-        )
-
-    def _paid_stores(
-        self,
-        memories: dict[str, Memory],
-        *,
-        req: Request,
-        block_hash: str,
-        paid_only: bool,
-    ) -> list[StoreOp]:
-        ops: list[StoreOp] = []
-        for tier_key in self.tier_keys:
-            if tier_key not in self._paid_write_tiers:
-                continue
-            tier = memories[tier_key]
-            chunk_key = storage_key(req, block_hash, tier.chunk_blocks)
-            if tier.best_resident(chunk_key) is not None:
-                continue
-            if tier.inflight_incoming(chunk_key) is not None:
-                continue
-            if self._reserve_tier_loading(
-                memories, tier_key=tier_key, req=req, block_hash=block_hash
-            ) is None:
-                continue
-            ops.append(
-                StoreOp(
-                    tier_key=tier_key,
-                    content=ContentKey.from_block(block_hash),
-                    storage_key=chunk_key,
-                    hbm_block_hash=block_hash,
-                )
-            )
-        return ops
-
-    def mirror_tier_keys(self) -> tuple[str, ...]:
-        return tuple(
-            tier_key
-            for tier_key in self.tier_keys
-            if tier_key not in self._paid_write_tiers
+        return self._plan_async_edges(
+            memories, trigger="evict", block_hash=block_hash, req=req
         )
