@@ -222,7 +222,7 @@ class EngineBuildConfig:
     work_per_transfer: float = 1.0
     max_num_seqs: int = 12
     max_num_batched_tokens: int = 24
-    resources: SimResources = field(default_factory=SimResources)
+    resources: SimResources = field(default_factory=SimResources.default)
 
 
 def _transfer_links(
@@ -250,7 +250,7 @@ def build_topology_for_preset(
     spec: PresetSpec,
     resources: SimResources | None = None,
 ) -> Topology:
-    return build_topology(spec.topology, resources=resources or SimResources())
+    return build_topology(spec.topology, resources=resources or SimResources.default())
 
 
 def build_pd_engines(

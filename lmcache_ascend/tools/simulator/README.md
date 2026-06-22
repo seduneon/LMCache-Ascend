@@ -88,7 +88,7 @@ Sweep presets are data rows in `presets.PRESETS` interpreted by `build_pd_engine
 | `global_cap_2` | `GlobalCopyCap(2)` across P and D HBM |
 | `evict_lru`, `evict_fifo`, `evict_random` | LMCache PD: P stores prefix to DRAM on complete then frees P HBM; D pulls **DRAM only**; vLLM APC on **D HBM** only; compare LRU/FIFO/random on HBM and DRAM |
 
-Use `--presets evict_lru,evict_fifo,evict_random` with tight `--hbm` / `--dram` (and `--drop-oversized` on traces) to stress tier eviction. Compare `tier_evictions`, `lifecycle_hbm_frees`, and hit ratios in CSV output — distinct from `prefill_evictions` / policy evictions at admit time.
+Use `--presets evict_lru,evict_fifo,evict_random` with tight `--hbm-gib` / `--dram-gib` (and `--drop-oversized` on traces) to stress tier eviction. Compare `tier_evictions`, `lifecycle_hbm_frees`, and hit ratios in CSV output — distinct from `prefill_evictions` / policy evictions at admit time.
 
 Use `python3.12 -m simulator.sweep --list-presets` for the catalog.
 
@@ -112,7 +112,27 @@ python3.12 -m simulator.sweep --trace /path/to/synthetic_trace.jsonl --requests 
 
 Mapping: each `hash_id` is one 512-token prefix block; `timestamp` × `--trace-time-scale` (default 0.001, ms→s); `output_length` ÷ `--tokens-per-block` (default **512**) → decode blocks. The same trace slice is replayed for every seed; seed only affects randomized eviction.
 
-Set **`--hbm`** explicitly (default 40). Use **`--drop-oversized`** with trace workloads so requests with `prefix + decode blocks > hbm` are skipped instead of deadlocking the run.
+### Tier capacity (GiB → block slots)
+
+Each tier is a `TierSpec(tier_key, capacity_gib, chunk_blocks)`. The sweep CLI sets these via `--hbm-gib`, `--dram-gib`, `--ssd-gib`, and `--dram-chunk-blocks`; tests can pass an explicit `tiers=` tuple on `SimConfig`.
+
+```text
+slots = floor(gib × 1024³ / (tokens_per_block × kv_bytes_per_token × chunk_blocks))
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--hbm-gib` | 32 | HBM per engine (`npu-0:hbm`, `npu-1:hbm`; chunk_blocks=1) |
+| `--dram-gib` | 64 | DRAM tier (`npu-0:dram`) |
+| `--ssd-gib` | 256 | SSD tier (`npu-0:ssd`) |
+| `--kv-model` | llama3-8b | Reference K+V bytes/token (`toy`, `llama3-8b`, `llama3-70b`) |
+| `--kv-bytes-per-token` | (from model) | Override bytes/token for conversion |
+| `--tokens-per-block` | 512 | Tokens per KV block (trace + capacity) |
+| `--dram-chunk-blocks` | 4 | HBM blocks per DRAM slot |
+
+At sweep start, resolved slot counts are printed per tier (`tier capacity: npu-0:hbm=…; …`).
+
+Set **`--hbm-gib`** explicitly. Use **`--drop-oversized`** with trace workloads so requests with `prefix + decode blocks > hbm slots` are skipped instead of deadlocking the run.
 
 ---
 

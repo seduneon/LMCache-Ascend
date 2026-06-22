@@ -7,7 +7,7 @@ import csv
 import statistics
 import sys
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 from .engine import Engine
 from .memory import Memory
@@ -25,6 +25,13 @@ from .sim_progress import SimProgress, SimProgressConfig
 from .simulator import Simulator
 from .tasks import TaskPool
 from .topology import SimResources
+from .capacity import (
+    TierSpec,
+    default_tiers,
+    format_tier_capacity,
+    gib_for_blocks,
+    kv_bytes_per_token,
+)
 from .trace import (
     DEFAULT_TRACE_PATH,
     MOONCAKE_TOKENS_PER_BLOCK,
@@ -37,9 +44,13 @@ from .workload import WorkloadConfig, build_workload
 class SimConfig:
     """Resource and scheduler knobs shared across policy presets."""
 
-    hbm_size: int = 40
-    dram_size: int = 80
-    ssd_size: int = 160
+    hbm_gib: float = 32.0
+    dram_gib: float = 64.0
+    ssd_gib: float = 256.0
+    kv_model: str = "llama3-8b"
+    kv_bytes_per_token: float | None = None
+    tokens_per_block: int = MOONCAKE_TOKENS_PER_BLOCK
+    tiers: tuple[TierSpec, ...] | None = None
     dram_chunk_blocks: int = 4
     ssd_chunk_blocks: int = 4
     ssd_write_speed: float = 8.0
@@ -55,16 +66,68 @@ class SimConfig:
     wall_timeout_s: float | None = None
     show_progress: bool = False
 
-    def resources(self) -> SimResources:
-        return SimResources(
-            hbm_size=self.hbm_size,
-            dram_size=self.dram_size,
-            ssd_size=self.ssd_size,
+    def resolved_kv_bytes_per_token(self) -> float:
+        if self.kv_bytes_per_token is not None:
+            return self.kv_bytes_per_token
+        return kv_bytes_per_token(self.kv_model)
+
+    def resolved_tiers(self) -> tuple[TierSpec, ...]:
+        if self.tiers is not None:
+            return self.tiers
+        return default_tiers(
+            hbm_gib=self.hbm_gib,
+            dram_gib=self.dram_gib,
+            ssd_gib=self.ssd_gib,
             dram_chunk_blocks=self.dram_chunk_blocks,
             ssd_chunk_blocks=self.ssd_chunk_blocks,
         )
 
-    def engine_build(self) -> EngineBuildConfig:
+    def resources(self, *, tokens_per_block: int | None = None) -> SimResources:
+        tpb = tokens_per_block if tokens_per_block is not None else self.tokens_per_block
+        return SimResources.from_tiers(
+            self.resolved_tiers(),
+            tokens_per_block=tpb,
+            kv_bytes_per_token=self.resolved_kv_bytes_per_token(),
+        )
+
+    @classmethod
+    def with_block_slots(
+        cls,
+        *,
+        hbm: int,
+        dram: int = 80,
+        ssd: int = 160,
+        tokens_per_block: int = MOONCAKE_TOKENS_PER_BLOCK,
+        kv_bytes_per_token: float = 256.0,
+        dram_chunk_blocks: int = 4,
+        ssd_chunk_blocks: int = 4,
+        **kwargs: object,
+    ) -> SimConfig:
+        """Build config from legacy slot counts (tests / migration)."""
+        fields = {f.name for f in cls.__dataclass_fields__.values()}
+        extra = {k: v for k, v in kwargs.items() if k in fields}
+        tiers = (
+            TierSpec("npu-0:hbm", gib_for_blocks(hbm, tokens_per_block=tokens_per_block, kv_bytes_per_token=kv_bytes_per_token), 1),
+            TierSpec("npu-1:hbm", gib_for_blocks(hbm, tokens_per_block=tokens_per_block, kv_bytes_per_token=kv_bytes_per_token), 1),
+            TierSpec(
+                "npu-0:dram",
+                gib_for_blocks(dram, tokens_per_block=tokens_per_block, kv_bytes_per_token=kv_bytes_per_token, chunk_blocks=dram_chunk_blocks),
+                dram_chunk_blocks,
+            ),
+            TierSpec(
+                "npu-0:ssd",
+                gib_for_blocks(ssd, tokens_per_block=tokens_per_block, kv_bytes_per_token=kv_bytes_per_token, chunk_blocks=ssd_chunk_blocks),
+                ssd_chunk_blocks,
+            ),
+        )
+        return cls(
+            tiers=tiers,
+            kv_bytes_per_token=kv_bytes_per_token,
+            tokens_per_block=tokens_per_block,
+            **extra,
+        )
+
+    def engine_build(self, *, tokens_per_block: int | None = None) -> EngineBuildConfig:
         return EngineBuildConfig(
             compute_speed=self.compute_speed,
             link_speed=self.link_speed,
@@ -74,7 +137,7 @@ class SimConfig:
             work_per_transfer=self.work_per_transfer,
             max_num_seqs=self.max_num_seqs,
             max_num_batched_tokens=self.max_num_batched_tokens,
-            resources=self.resources(),
+            resources=self.resources(tokens_per_block=tokens_per_block),
         )
 
 
@@ -177,13 +240,14 @@ def build_engines(
     sim_cfg: SimConfig,
     *,
     rng_seed: int = 0,
+    tokens_per_block: int = MOONCAKE_TOKENS_PER_BLOCK,
 ) -> tuple[Engine, Engine, dict]:
     npu0, npu1, topo = build_pd_engines(
         requests,
         pool,
         preset,
-        cfg=sim_cfg.engine_build(),
-        resources=sim_cfg.resources(),
+        cfg=sim_cfg.engine_build(tokens_per_block=tokens_per_block),
+        resources=sim_cfg.resources(tokens_per_block=tokens_per_block),
         rng_seed=rng_seed,
     )
     return npu0, npu1, topo.memories
@@ -313,9 +377,11 @@ def run_sweep_case(
     drop_oversized: bool = False,
 ) -> SweepRow:
     requests, _ = build_workload(workload)
+    resources = sim_cfg.resources(tokens_per_block=workload.tokens_per_block)
+    hbm_slots = resources.hbm_size
     rejected_requests = 0
     if drop_oversized:
-        requests, rejected = partition_by_hbm(requests, sim_cfg.hbm_size)
+        requests, rejected = partition_by_hbm(requests, hbm_slots)
         rejected_requests = len(rejected)
         if not requests:
             return SweepRow(
@@ -327,14 +393,19 @@ def run_sweep_case(
                 status="fail",
                 error=(
                     f"no admittable requests after drop-oversized "
-                    f"(hbm={sim_cfg.hbm_size})"
+                    f"(hbm={hbm_slots} slots, {sim_cfg.hbm_gib:g} GiB)"
                 ),
             )
     admittable_requests = len(requests)
 
     pool = TaskPool()
     npu0, npu1, memories = build_engines(
-        requests, pool, preset, sim_cfg, rng_seed=workload.seed
+        requests,
+        pool,
+        preset,
+        sim_cfg,
+        rng_seed=workload.seed,
+        tokens_per_block=workload.tokens_per_block,
     )
 
     progress = (
@@ -465,7 +536,6 @@ class SweepConfig:
     trace_offset: int = 0
     trace_time_scale: float = 0.001
     tokens_per_block: int = MOONCAKE_TOKENS_PER_BLOCK
-    hbm: int = 40
     drop_oversized: bool = False
 
 
@@ -529,23 +599,40 @@ def _format_compare_cell(value: object) -> str:
     return str(value)
 
 
+def _print_tier_capacity(sim_cfg: SimConfig, *, tokens_per_block: int) -> None:
+    resources = sim_cfg.resources(tokens_per_block=tokens_per_block)
+    kv_bpt = sim_cfg.resolved_kv_bytes_per_token()
+    parts = [
+        format_tier_capacity(
+            tier,
+            blocks=resources.size(tier.tier_key),
+            kv_bytes_per_token=kv_bpt,
+            tokens_per_block=tokens_per_block,
+        )
+        for tier in sim_cfg.resolved_tiers()
+    ]
+    print(f"tier capacity: {'; '.join(parts)}", flush=True)
+
+
 def run_sweep(cfg: SweepConfig) -> list[SweepRow]:
     rows: list[SweepRow] = []
     unknown = [name for name in cfg.presets if name not in PRESETS]
     if unknown:
         raise ValueError(f"unknown presets: {unknown} (choose from {sorted(PRESETS)})")
 
-    probe_workload = _workload_config(cfg, cfg.base_seed)
-    hbm_size = cfg.hbm
-    sim_cfg = replace(cfg.sim, hbm_size=hbm_size)
+    sim_cfg = cfg.sim
+    resources = sim_cfg.resources(tokens_per_block=cfg.tokens_per_block)
+    _print_tier_capacity(sim_cfg, tokens_per_block=cfg.tokens_per_block)
 
     if cfg.drop_oversized:
+        probe_workload = _workload_config(cfg, cfg.base_seed)
         probe_requests, _ = build_workload(probe_workload)
-        _, rejected = partition_by_hbm(probe_requests, hbm_size)
+        _, rejected = partition_by_hbm(probe_requests, resources.hbm_size)
         if rejected:
             print(
                 f"drop-oversized: skipping {len(rejected)} requests with "
-                f"footprint > hbm={hbm_size} "
+                f"footprint > hbm={resources.hbm_size} slots "
+                f"({sim_cfg.hbm_gib:g} GiB/engine) "
                 f"({len(probe_requests) - len(rejected)} admittable)",
                 flush=True,
             )
@@ -657,16 +744,53 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--requests", type=int, default=64, help="Requests per run")
     parser.add_argument("--seeds", type=int, default=3, help="Seeds per preset")
     parser.add_argument("--base-seed", type=int, default=1000, help="First seed value")
-    parser.add_argument("--hbm", type=int, default=40, help="HBM slots per engine")
+    parser.add_argument(
+        "--hbm-gib",
+        type=float,
+        default=32.0,
+        dest="hbm_gib",
+        help="HBM capacity per engine in GiB (converted to block slots)",
+    )
+    parser.add_argument(
+        "--dram-gib",
+        type=float,
+        default=64.0,
+        dest="dram_gib",
+        help="DRAM tier capacity in GiB",
+    )
+    parser.add_argument(
+        "--ssd-gib",
+        type=float,
+        default=256.0,
+        dest="ssd_gib",
+        help="SSD tier capacity in GiB",
+    )
+    parser.add_argument(
+        "--kv-model",
+        default="llama3-8b",
+        choices=["toy", "llama3-8b", "llama3-70b"],
+        help="Reference model for K+V bytes per token (unless --kv-bytes-per-token set)",
+    )
+    parser.add_argument(
+        "--kv-bytes-per-token",
+        type=float,
+        default=None,
+        help="Override K+V bytes per token for GiB→slot conversion",
+    )
     parser.add_argument(
         "--drop-oversized",
         action="store_true",
         help=(
-            "Skip requests whose peak footprint exceeds --hbm "
-            "(prefix + decode blocks); continue with the rest"
+            "Skip requests whose peak footprint exceeds per-engine HBM slot count "
+            "(derived from --hbm-gib); continue with the rest"
         ),
     )
-    parser.add_argument("--dram", type=int, default=80, help="DRAM slots (dram_tier preset)")
+    parser.add_argument(
+        "--dram-chunk-blocks",
+        type=int,
+        default=4,
+        help="HBM blocks per DRAM slot (LMCache chunk alignment)",
+    )
     parser.add_argument(
         "--csv",
         metavar="PATH",
@@ -721,7 +845,13 @@ def main(argv: list[str] | None = None) -> None:
     preset_names = tuple(p.strip() for p in args.presets.split(",") if p.strip())
 
     sim_cfg = SimConfig(
-        dram_size=args.dram,
+        hbm_gib=args.hbm_gib,
+        dram_gib=args.dram_gib,
+        ssd_gib=args.ssd_gib,
+        kv_model=args.kv_model,
+        kv_bytes_per_token=args.kv_bytes_per_token,
+        tokens_per_block=args.tokens_per_block,
+        dram_chunk_blocks=args.dram_chunk_blocks,
         show_progress=args.progress,
     )
     cfg = SweepConfig(
@@ -736,7 +866,6 @@ def main(argv: list[str] | None = None) -> None:
         trace_offset=args.trace_offset,
         trace_time_scale=args.trace_time_scale,
         tokens_per_block=args.tokens_per_block,
-        hbm=args.hbm,
         drop_oversized=args.drop_oversized,
     )
 

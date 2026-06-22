@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .capacity import TierSpec, default_tiers, resolve_tier_slots
 from .memory import Memory
+
+TOPOLOGY_TIERS: dict[str, tuple[str, ...]] = {
+    "hbm_only": ("npu-0:hbm", "npu-1:hbm"),
+    "hbm_dram": ("npu-0:hbm", "npu-1:hbm", "npu-0:dram"),
+    "hbm_dram_ssd": ("npu-0:hbm", "npu-1:hbm", "npu-0:dram", "npu-0:ssd"),
+}
 
 
 @dataclass(frozen=True)
@@ -29,13 +36,60 @@ class Topology:
 
 @dataclass(frozen=True)
 class SimResources:
-    """Sizing knobs shared across presets."""
+    """Resolved tier slot counts."""
 
-    hbm_size: int = 40
-    dram_size: int = 80
-    ssd_size: int = 160
-    dram_chunk_blocks: int = 4
-    ssd_chunk_blocks: int = 4
+    slots: dict[str, int] = field(default_factory=dict)
+    chunk_blocks: dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def from_tiers(
+        cls,
+        tiers: tuple[TierSpec, ...],
+        *,
+        tokens_per_block: int,
+        kv_bytes_per_token: float,
+    ) -> SimResources:
+        slots: dict[str, int] = {}
+        chunks: dict[str, int] = {}
+        for tier in tiers:
+            slots[tier.tier_key] = resolve_tier_slots(
+                tier,
+                tokens_per_block=tokens_per_block,
+                kv_bytes_per_token=kv_bytes_per_token,
+            )
+            chunks[tier.tier_key] = tier.chunk_blocks
+        return cls(slots=slots, chunk_blocks=chunks)
+
+    @classmethod
+    def default(
+        cls,
+        *,
+        tokens_per_block: int = 512,
+        kv_bytes_per_token: float | None = None,
+    ) -> SimResources:
+        from .capacity import kv_bytes_per_token as resolve_kv_model
+
+        kv_bpt = kv_bytes_per_token if kv_bytes_per_token is not None else resolve_kv_model("llama3-8b")
+        return cls.from_tiers(
+            default_tiers(),
+            tokens_per_block=tokens_per_block,
+            kv_bytes_per_token=kv_bpt,
+        )
+
+    def size(self, tier_key: str) -> int:
+        return self.slots[tier_key]
+
+    @property
+    def hbm_size(self) -> int:
+        return self.slots["npu-0:hbm"]
+
+    @property
+    def dram_size(self) -> int:
+        return self.slots.get("npu-0:dram", 0)
+
+    @property
+    def ssd_size(self) -> int:
+        return self.slots.get("npu-0:ssd", 0)
 
 
 def build_topology(
@@ -43,26 +97,16 @@ def build_topology(
     *,
     resources: SimResources | None = None,
 ) -> Topology:
-    cfg = resources or SimResources()
-    if kind == "hbm_only":
-        memories = {
-            "npu-0:hbm": Memory(size=cfg.hbm_size, name="npu-0:hbm"),
-            "npu-1:hbm": Memory(size=cfg.hbm_size, name="npu-1:hbm"),
-        }
-    elif kind == "hbm_dram":
-        memories = build_topology("hbm_only", resources=cfg).memories
-        memories["npu-0:dram"] = Memory(
-            size=cfg.dram_size,
-            name="npu-0:dram",
-            chunk_blocks=cfg.dram_chunk_blocks,
-        )
-    elif kind == "hbm_dram_ssd":
-        memories = build_topology("hbm_dram", resources=cfg).memories
-        memories["npu-0:ssd"] = Memory(
-            size=cfg.ssd_size,
-            name="npu-0:ssd",
-            chunk_blocks=cfg.ssd_chunk_blocks,
-        )
-    else:
+    tier_keys = TOPOLOGY_TIERS.get(kind)
+    if tier_keys is None:
         raise ValueError(f"unknown topology {kind!r}")
+
+    cfg = resources or SimResources.default()
+    memories: dict[str, Memory] = {}
+    for tier_key in tier_keys:
+        memories[tier_key] = Memory(
+            size=cfg.size(tier_key),
+            name=tier_key,
+            chunk_blocks=cfg.chunk_blocks.get(tier_key, 1),
+        )
     return Topology(memories=memories)

@@ -60,8 +60,9 @@ class StressConfig:
         )
 
     def to_sim(self) -> SimConfig:
-        return SimConfig(
-            hbm_size=self.hbm_size,
+        return SimConfig.with_block_slots(
+            hbm=self.hbm_size,
+            kv_bytes_per_token=256.0,
             max_num_seqs=self.max_num_seqs,
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_steps=self.max_steps,

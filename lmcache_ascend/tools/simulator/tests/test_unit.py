@@ -945,6 +945,19 @@ def test_sweep_smoke() -> None:
         assert "decode_p99_latency" in metrics
 
 
+def test_blocks_from_gib() -> None:
+    from simulator.capacity import blocks_from_gib, gib_for_blocks
+
+    gib = 32.0
+    blocks = blocks_from_gib(
+        gib,
+        tokens_per_block=512,
+        kv_bytes_per_token=256.0,
+    )
+    assert blocks >= 1
+    assert abs(gib_for_blocks(blocks, tokens_per_block=512, kv_bytes_per_token=256.0) - gib) < 0.01
+
+
 def test_eviction_preset_sweep_smoke() -> None:
     from simulator.presets import EVICTION_PRESET_NAMES
     from simulator.sweep import SimConfig, SweepConfig, run_sweep
@@ -955,7 +968,7 @@ def test_eviction_preset_sweep_smoke() -> None:
             num_requests=12,
             seeds=1,
             base_seed=42,
-            sim=SimConfig(hbm_size=24, dram_size=32),
+            sim=SimConfig.with_block_slots(hbm=24, dram=32),
         )
     )
     assert len(rows) == 3
@@ -1031,9 +1044,13 @@ def test_drop_oversized_sweep_smoke() -> None:
             seeds=1,
             base_seed=42,
             trace_path=str(DEFAULT_TRACE_PATH),
-            hbm=128,
             drop_oversized=True,
-            sim=SimConfig(max_num_seqs=32, max_num_batched_tokens=128),
+            sim=SimConfig.with_block_slots(
+                hbm=128,
+                kv_bytes_per_token=256.0,
+                max_num_seqs=32,
+                max_num_batched_tokens=128,
+            ),
         )
     )
     assert len(rows) == 1
@@ -1054,8 +1071,13 @@ def test_trace_sweep_smoke() -> None:
             seeds=1,
             base_seed=42,
             trace_path=str(DEFAULT_TRACE_PATH),
-            hbm=128,
-            sim=SimConfig(max_num_seqs=32, max_num_batched_tokens=128),
+            drop_oversized=True,
+            sim=SimConfig.with_block_slots(
+                hbm=128,
+                kv_bytes_per_token=256.0,
+                max_num_seqs=32,
+                max_num_batched_tokens=128,
+            ),
         )
     )
     assert len(rows) == 1
