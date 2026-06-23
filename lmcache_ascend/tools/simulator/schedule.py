@@ -5,19 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from .block_resolve import (
-    BlockResolution,
-    first_resident_pull_source,
-    local_satisfied,
-    remote_wait_source,
-)
+from .block_resolve import BlockResolution
 from .eviction import EvictionPolicy, LRUEviction
 from .memory import Memory
-from .plan import BlockAction, BlockActions, EntryPlan
-from .read_path import ReadPathPolicy, ReadPathSpec, read_path_from_pull_mode
+from .plan import BlockActions, EntryPlan, EvictPlan
+from .read_path import READ_PATH, ReadPathPolicy, ReadPathStrategy, read_path_from_pull_mode
+from .block_resolve import local_satisfied
+from .policy_registry import PolicyContext
 from .request import Request
-
-_LOCAL = Literal["local"]
 
 
 def slots_needed(actions: BlockActions) -> int:
@@ -34,13 +29,15 @@ class ScheduleConfig:
     local_memory: str
     pull_sources: tuple[str, ...] = ()
     pull_mode: Literal["compute_only", "ordered_pull"] = "compute_only"
-    read_path: ReadPathSpec | None = None
+    read_path: ReadPathStrategy | None = None
+    # Default used only when ScheduleConfig is built directly in tests;
+    # EnginePolicies.from_config always sets eviction from the graph.
     local_eviction: EvictionPolicy = field(default_factory=LRUEviction)
 
-    def resolved_read_path(self) -> ReadPathSpec:
+    def resolved_read_path(self) -> ReadPathStrategy:
         if self.read_path is not None:
             return self.read_path
-        return read_path_from_pull_mode(self.pull_mode)
+        return READ_PATH.create(read_path_from_pull_mode(self.pull_mode))
 
 
 class SchedulePolicy:
@@ -95,7 +92,10 @@ class SchedulePolicy:
         )
         if evicts is None:
             return None
-        return EntryPlan(evicts=list(evicts), blocks=dict(actions))
+        return EntryPlan(
+            evicts=[EvictPlan(block=block) for block in evicts],
+            blocks=dict(actions),
+        )
 
     def resolve_actions(
         self,

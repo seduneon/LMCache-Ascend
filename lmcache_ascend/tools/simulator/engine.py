@@ -1,5 +1,5 @@
 from .connector import TierCacheConnector
-from .engine_config import LifecycleSpec
+from .eviction import LRUEviction
 from .execute import BatchRunner
 from .memory import KVBlock, Memory
 from .plan import BatchPlan, dedupe_batch_evicts
@@ -15,7 +15,11 @@ def _merge_tier_graph(graph: TierGraph, memories: dict[str, Memory]) -> TierGrap
     tiers = dict(graph.tiers)
     for key, mem in memories.items():
         if key not in tiers:
-            tiers[key] = Tier(key, mem, graph.eviction_for(key))
+            try:
+                eviction = graph.eviction_for(key)
+            except KeyError:
+                eviction = LRUEviction()
+            tiers[key] = Tier(key, mem, eviction)
     return TierGraph(tiers=tiers)
 
 
@@ -40,9 +44,6 @@ class Engine:
         max_num_batched_tokens: int = 10_000,
         enable_chunked_prefill: bool = False,
         remote_kv_wait: bool = False,
-        hold_kv_on_complete: bool = False,
-        retain_prefix_cache: bool = False,
-        store_tiers_on_complete: tuple[str, ...] = (),
         work_per_prefill_token: float | None = None,
         work_per_decode_req: float | None = None,
         sync_evict: bool = True,
@@ -80,9 +81,6 @@ class Engine:
         self.work_per_decode_req = (
             work_per_decode_req if work_per_decode_req is not None else work_per_block
         )
-        self.hold_kv_on_complete = hold_kv_on_complete
-        self.retain_prefix_cache = retain_prefix_cache
-        self.store_tiers_on_complete = tuple(store_tiers_on_complete)
         self.interconnect = interconnect
         self.event_trace = event_trace
         self._next_batch_id = 0
@@ -103,17 +101,12 @@ class Engine:
 
                 tier.on_tier_evict = _tier_evict_cb
 
-        lifecycle = LifecycleSpec(
-            hold_kv_on_complete=hold_kv_on_complete,
-            retain_prefix_cache=retain_prefix_cache,
-            store_on_complete=tuple(store_tiers_on_complete),
-        )
         self.cache = TierCacheConnector(
             engine_id=engine_id,
             policies=policies,
             memories=memories,
             graph=merged_graph,
-            lifecycle=lifecycle,
+            lifecycle=policies.config.lifecycle,
             local_tier=self.local_memory,
             compute_res=compute_res,
             transfer_links=self.transfer_links,
@@ -150,6 +143,30 @@ class Engine:
     @property
     def completed(self):
         return self.scheduler.completed
+
+    @property
+    def hold_kv_on_complete(self) -> bool:
+        return self.policies.config.lifecycle.hold_kv_on_complete
+
+    @hold_kv_on_complete.setter
+    def hold_kv_on_complete(self, value: bool) -> None:
+        from dataclasses import replace
+
+        lifecycle = replace(
+            self.policies.config.lifecycle, hold_kv_on_complete=value
+        )
+        config = replace(self.policies.config, lifecycle=lifecycle)
+        graph = self.policies.effects.config.graph
+        self.policies = EnginePolicies.from_config(config, graph)
+        self.cache.lifecycle = lifecycle
+
+    @property
+    def retain_prefix_cache(self) -> bool:
+        return self.policies.config.lifecycle.retain_prefix_cache
+
+    @property
+    def store_tiers_on_complete(self) -> tuple[str, ...]:
+        return self.policies.config.lifecycle.store_on_complete
 
     @property
     def remote_kv_wait(self) -> bool:

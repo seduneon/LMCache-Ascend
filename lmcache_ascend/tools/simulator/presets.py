@@ -7,7 +7,6 @@ from typing import Literal
 
 from .engine import Engine
 from .engine_config import EngineConfig, LifecycleSpec, PlacementSpec, build_placement_spec
-from .read_path import ReadPathSpec
 from .memory import Memory
 from .policies import EnginePolicies
 from .request import Request
@@ -34,7 +33,8 @@ class PresetSpec:
     decode_retain_prefix_cache: bool = False
     store_on_complete: tuple[str, ...] = ()
     mirror_on_forward: bool = True
-    decode_read_path: ReadPathSpec | None = None
+    decode_read_path: str | None = None
+    decode_read_path_params: dict = field(default_factory=dict)
 
 
 def _placement_spec(spec: PresetSpec) -> PlacementSpec:
@@ -67,7 +67,8 @@ def decode_config(spec: PresetSpec, topo: Topology) -> EngineConfig:
         local_tier=topo.decode_local_tier,
         pull_sources=topo.decode_pull_sources(spec.decode_pull),
         pull_mode="ordered_pull",
-        read_path=spec.decode_read_path,
+        read_path_name=spec.decode_read_path,
+        read_path_params=spec.decode_read_path_params,
         placement=_placement_spec(spec),
         lifecycle=LifecycleSpec(
             retain_prefix_cache=spec.decode_retain_prefix_cache,
@@ -90,7 +91,7 @@ PRESETS: dict[str, PresetSpec] = {
         name="min_cost_pull",
         description="baseline topology; decode uses min-cost pull vs recompute",
         topology="hbm_only",
-        decode_read_path=ReadPathSpec(kind="min_cost"),
+        decode_read_path="min_cost",
     ),
     "dram_tier": PresetSpec(
         name="dram_tier",
@@ -293,9 +294,6 @@ def build_pd_engines(
         enable_chunked_prefill=True,
         write_links=_write_links(topo.memories, build),
         work_per_store=build.work_per_transfer,
-        hold_kv_on_complete=prefill_cfg.lifecycle.hold_kv_on_complete,
-        retain_prefix_cache=prefill_cfg.lifecycle.retain_prefix_cache,
-        store_tiers_on_complete=prefill_cfg.lifecycle.store_on_complete,
     )
     decode = Engine(
         engine_id=topo.decode_engine_id,
@@ -314,6 +312,5 @@ def build_pd_engines(
         max_num_batched_tokens=build.max_num_batched_tokens,
         enable_chunked_prefill=True,
         remote_kv_wait=True,
-        retain_prefix_cache=decode_cfg.lifecycle.retain_prefix_cache,
     )
     return prefill, decode, topo

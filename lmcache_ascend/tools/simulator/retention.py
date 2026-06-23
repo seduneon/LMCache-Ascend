@@ -29,6 +29,7 @@ class RetentionPolicy(ABC):
     def _eviction_for(self, tier_key: str) -> EvictionPolicy:
         if self._graph is not None:
             return self._graph.eviction_for(tier_key)
+        # Standalone unit tests construct retention without a TierGraph.
         return LRUEviction()
 
     def max_copies(self, memory: Memory, block_hash: str) -> int | None:

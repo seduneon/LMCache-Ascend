@@ -22,8 +22,6 @@ from .presets import (
     build_pd_engines,
 )
 from .request import RequestPD, RequestStatus
-from .read_path import READ_PATH
-from .policy_registry import PolicyContext
 from .resource import BandwidthResource
 from .event_trace import EventTraceWriter, trace_config_from_env
 from .sim_log import SimLogConfig, SimLogger
@@ -148,9 +146,6 @@ class SimConfig:
         )
 
 
-HBM_TIER_KEYS: tuple[str, ...] = ("npu-0:hbm", "npu-1:hbm")
-
-
 def _local_tier_end_state_ok(
     preset: PresetSpec,
     mem: Memory,
@@ -250,7 +245,7 @@ def build_engines(
     *,
     rng_seed: int = 0,
     tokens_per_block: int = MOONCAKE_TOKENS_PER_BLOCK,
-) -> tuple[Engine, Engine, dict]:
+) -> tuple[Engine, Engine, Topology]:
     npu0, npu1, topo = build_pd_engines(
         requests,
         pool,
@@ -259,7 +254,7 @@ def build_engines(
         resources=sim_cfg.resources(tokens_per_block=tokens_per_block),
         rng_seed=rng_seed,
     )
-    return npu0, npu1, topo.memories
+    return npu0, npu1, topo
 
 
 def _aggregate_metrics(
@@ -273,6 +268,7 @@ def _aggregate_metrics(
     finish_time: float,
     wall_seconds: float,
     memories: dict,
+    tier_roles: dict[str, str],
     admittable_requests: int,
     rejected_requests: int,
     read_path: str = "",
@@ -326,10 +322,14 @@ def _aggregate_metrics(
     )
 
     lifecycle_hbm_frees = sum(
-        mem.lifecycle_frees for name, mem in memories.items() if name in HBM_TIER_KEYS
+        mem.lifecycle_frees
+        for name, mem in memories.items()
+        if tier_roles.get(name) == "local"
     )
     tier_evictions = sum(
-        mem.tier_evictions for name, mem in memories.items() if name not in HBM_TIER_KEYS
+        mem.tier_evictions
+        for name, mem in memories.items()
+        if tier_roles.get(name) == "downstream"
     )
 
     tier_used_at_end = ";".join(
@@ -387,10 +387,8 @@ def _effective_preset(preset: PresetSpec, sweep_cfg: SweepConfig) -> PresetSpec:
         return preset
     return replace(
         preset,
-        decode_read_path=READ_PATH.create(
-            sweep_cfg.read_path,
-            PolicyContext(params={"threshold_ratio": sweep_cfg.pull_threshold}),
-        ),
+        decode_read_path=sweep_cfg.read_path,
+        decode_read_path_params={"threshold_ratio": sweep_cfg.pull_threshold},
     )
 
 
@@ -405,7 +403,7 @@ def run_sweep_case(
     preset = _effective_preset(preset, sweep_cfg) if sweep_cfg else preset
     read_path_label = ""
     if preset.decode_read_path is not None:
-        read_path_label = preset.decode_read_path.kind
+        read_path_label = preset.decode_read_path
     requests, _ = build_workload(workload)
     resources = sim_cfg.resources(tokens_per_block=workload.tokens_per_block)
     hbm_slots = resources.hbm_size
@@ -429,7 +427,7 @@ def run_sweep_case(
     admittable_requests = len(requests)
 
     pool = TaskPool()
-    npu0, npu1, memories = build_engines(
+    npu0, npu1, topo = build_engines(
         requests,
         pool,
         preset,
@@ -437,6 +435,8 @@ def run_sweep_case(
         rng_seed=workload.seed,
         tokens_per_block=workload.tokens_per_block,
     )
+    memories = topo.memories
+    tier_roles = topo.graph.tier_roles()
     if sim_cfg.interconnect_speed is not None:
         interconnect = BandwidthResource(
             base_speed=sim_cfg.interconnect_speed,
@@ -562,6 +562,7 @@ def run_sweep_case(
         finish_time=finish,
         wall_seconds=wall_seconds,
         memories=memories,
+        tier_roles=tier_roles,
         admittable_requests=admittable_requests,
         rejected_requests=rejected_requests,
         read_path=read_path_label,

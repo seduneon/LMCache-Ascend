@@ -14,7 +14,7 @@ from .capacity import (
 from .eviction import EVICTION, EvictionPolicy, LRUEviction
 from .policy_registry import PolicyContext
 from .memory import Memory
-from .tier import Tier, TierGraph
+from .tier import Tier, TierGraph, TierRole
 
 TOPOLOGY_TIERS: dict[str, tuple[str, ...]] = {
     "hbm_only": ("npu-0:hbm", "npu-1:hbm"),
@@ -103,12 +103,16 @@ class SimResources:
 def build_eviction_map(
     tier_keys: tuple[str, ...],
     *,
+    local_tiers: frozenset[str] | None = None,
     local: str = "lru",
     downstream: str = "lru",
     rng_seed: int = 0,
     overrides: dict[str, EvictionPolicy] | None = None,
 ) -> dict[str, EvictionPolicy]:
     """Assign eviction policy per tier key (local vs downstream names)."""
+    local_set = local_tiers or frozenset(
+        key for key in tier_keys if key.endswith(":hbm")
+    )
     ctx = PolicyContext(seed=rng_seed)
     local_policy = EVICTION.create(local, ctx)
     downstream_policy = EVICTION.create(downstream, ctx)
@@ -116,7 +120,7 @@ def build_eviction_map(
     for key in tier_keys:
         if overrides and key in overrides:
             result[key] = overrides[key]
-        elif key.endswith(":hbm"):
+        elif key in local_set:
             result[key] = local_policy
         else:
             result[key] = downstream_policy
@@ -151,12 +155,14 @@ def build_tier_graph(
         if spec is None:
             raise ValueError(f"no TierSpec for topology tier {tier_key!r}")
         resolved_slots = cfg.slots.get(tier_key)
+        role: TierRole = "local" if tier_key.endswith(":hbm") else "downstream"
         tiers[tier_key] = build_tier(
             spec,
             tokens_per_block=tokens_per_block,
             kv_bytes_per_token=kv_bpt,
             eviction=evictions.get(tier_key, LRUEviction()),
             slots=resolved_slots,
+            role=role,
         )
     return TierGraph(tiers=tiers)
 

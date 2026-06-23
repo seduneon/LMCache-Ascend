@@ -16,7 +16,7 @@ from .kv_content import (
 from .estimate import batch_forward_work, record_entry_metrics
 from .block_resolve import first_resident_pull_source
 from .memory import BlockState, KVBlock, Memory
-from .plan import BatchPlan, StoreOp, WorkEntry
+from .plan import BatchPlan, EvictPlan, StoreOp, WorkEntry
 from .request import Request
 from .tasks import BatchLoadTask, EvictTask, ForwardTask, StoreTask, Task
 
@@ -46,13 +46,14 @@ class BatchRunner:
             record_entry_metrics(entry)
             self._reserve(entry)
 
-            for victim in entry.plan.evicts:
+            for evict_plan in entry.plan.evicts:
+                victim = evict_plan.block
                 spill_req = self._engine.cache.resolve_spill_req(
                     victim.hash, self._engine.known_requests()
                 )
                 if self._engine.sync_evict:
                     self._sync_evict(
-                        victim,
+                        evict_plan,
                         entry,
                         spill_req=spill_req,
                         batch_id=plan.batch_id,
@@ -118,13 +119,13 @@ class BatchRunner:
 
         seen_store: set[tuple[str, ContentKey]] = set()
         for entry in plan.entries:
-            for block_hash in entry.block_hashes:
-                if entry.plan.blocks.get(block_hash) != "compute":
+            for block_hash, ops in entry.plan.store_ops.items():
+                if not ops:
                     continue
                 if local.find_reserved_for(block_hash, entry.req.req_id) is None:
                     continue
                 self._schedule_stores(
-                    entry.plan.store_ops.get(block_hash, []),
+                    ops,
                     req=entry.req,
                     prereqs=[forward],
                     batch_id=plan.batch_id,
@@ -226,15 +227,16 @@ class BatchRunner:
 
     def _sync_evict(
         self,
-        victim: KVBlock,
+        evict_plan: EvictPlan,
         entry: WorkEntry,
         *,
         spill_req: Request | None,
         batch_id: int,
     ) -> None:
+        victim = evict_plan.block
         if spill_req is not None:
             self._engine.cache.on_local_evict(victim, spill_req, self._at)
-        spill_ops = entry.plan.spill_store_ops.get(id(victim), [])
+        spill_ops = evict_plan.store_ops
         if spill_req is not None and spill_ops:
             for op in spill_ops:
                 tier_block = self._tier_block_for_store(op)

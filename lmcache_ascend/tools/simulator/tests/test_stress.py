@@ -122,9 +122,10 @@ def run_stress_test(cfg: StressConfig | None = None) -> StressResult:
     requests, shared_pool = generate_prefill_workload(workload)
 
     pool = TaskPool()
-    npu0, npu1, memories = build_engines(
+    npu0, npu1, topo = build_engines(
         requests, pool, PRESETS["baseline"], cfg.to_sim()
     )
+    memories = topo.memories
 
     sim_log = SimLogger(
         cfg.log

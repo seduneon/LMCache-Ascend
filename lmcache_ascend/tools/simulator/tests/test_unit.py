@@ -41,7 +41,11 @@ from simulator.simulator import Simulator
 
 def _dram_placement(memories: dict[str, Memory]) -> TieredPlacement:
     graph = graph_from_memories(memories)
-    return TieredPlacement(graph, placement_edges(("dram",)))
+    return TieredPlacement(
+        graph,
+        placement_edges(("dram",)),
+        retention=UnboundedRetention(),
+    )
 
 
 def test_hbm_and_dram_placement_creates_copy() -> None:
@@ -338,11 +342,15 @@ def test_consume_on_pull_e2e() -> None:
         [Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)],
         pool,
         memories,
-        policies_pull("hbm", ["dram"], retention="consume_on_pull"),
+        policies_pull(
+            "hbm",
+            ["dram"],
+            retention="consume_on_pull",
+            hold_kv_on_complete=True,
+        ),
         ComputeResource(base_speed=8.0),
         BandwidthResource(base_speed=8.0),
         work_per_block=1.0,
-        hold_kv_on_complete=True,
     )
 
     Simulator([eng], pool).run()
@@ -426,7 +434,7 @@ def test_fifo_eviction_under_allocate_pressure() -> None:
     result = sched._allocate_blocks(req, ["new"], set(), [])
     assert result is not None
     assert len(result.evicts) == 1
-    assert result.evicts[0].hash == "old"
+    assert result.evicts[0].block.hash == "old"
 
 
 def test_lru_eviction_under_allocate_pressure() -> None:
@@ -447,7 +455,7 @@ def test_lru_eviction_under_allocate_pressure() -> None:
     result = sched._allocate_blocks(req, ["new"], set(), [])
     assert result is not None
     assert len(result.evicts) == 1
-    assert result.evicts[0].hash == "old"
+    assert result.evicts[0].block.hash == "old"
 
 
 def test_lookup_compute() -> None:
@@ -461,7 +469,8 @@ def test_lookup_compute() -> None:
 
 def test_min_cost_pull_prefers_dram_when_compute_expensive() -> None:
     from simulator.estimate import CostContext
-    from simulator.read_path import ReadPathSpec
+    from simulator.policy_registry import PolicyContext
+    from simulator.read_path import READ_PATH
     from simulator.resource import BandwidthResource, ComputeResource
     from simulator.schedule import ScheduleConfig, SchedulePolicy
 
@@ -474,7 +483,7 @@ def test_min_cost_pull_prefers_dram_when_compute_expensive() -> None:
         ScheduleConfig(
             local_memory="hbm",
             pull_sources=("dram",),
-            read_path=ReadPathSpec(kind="min_cost"),
+            read_path=READ_PATH.create("min_cost"),
         )
     )
     req = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.RUNNING)
@@ -495,7 +504,8 @@ def test_min_cost_pull_prefers_dram_when_compute_expensive() -> None:
 
 def test_threshold_pull_when_cheaper() -> None:
     from simulator.estimate import CostContext
-    from simulator.read_path import ReadPathSpec
+    from simulator.policy_registry import PolicyContext
+    from simulator.read_path import READ_PATH
     from simulator.resource import BandwidthResource, ComputeResource
     from simulator.schedule import ScheduleConfig, SchedulePolicy
 
@@ -508,7 +518,10 @@ def test_threshold_pull_when_cheaper() -> None:
         ScheduleConfig(
             local_memory="hbm",
             pull_sources=("dram",),
-            read_path=ReadPathSpec(kind="threshold", threshold_ratio=0.5),
+            read_path=READ_PATH.create(
+                "threshold",
+                PolicyContext(params={"threshold_ratio": 0.5}),
+            ),
         )
     )
     req = Request("r1", 0.0, ["a"], RequestPD.DECODE, RequestStatus.RUNNING)

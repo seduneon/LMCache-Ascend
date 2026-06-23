@@ -30,13 +30,20 @@ class StoreOp:
 
 
 @dataclass
+class EvictPlan:
+    """One local-tier victim and optional spill store ops."""
+
+    block: KVBlock
+    store_ops: list[StoreOp] = field(default_factory=list)
+
+
+@dataclass
 class EntryPlan:
     """Per-request KV intent: all executor-visible memory actions."""
 
-    evicts: list[KVBlock] = field(default_factory=list)
+    evicts: list[EvictPlan] = field(default_factory=list)
     blocks: BlockActions = field(default_factory=dict)
     store_ops: dict[str, list[StoreOp]] = field(default_factory=dict)
-    spill_store_ops: dict[int, list[StoreOp]] = field(default_factory=dict)
 
 
 @dataclass
@@ -75,11 +82,11 @@ def dedupe_batch_evicts(plan: BatchPlan) -> None:
     """Drop duplicate HBM victims scheduled across entries in one batch."""
     seen: set[int] = set()
     for entry in plan.entries:
-        unique = []
-        for victim in entry.plan.evicts:
-            token = id(victim)
+        unique: list[EvictPlan] = []
+        for evict_plan in entry.plan.evicts:
+            token = id(evict_plan.block)
             if token in seen:
                 continue
             seen.add(token)
-            unique.append(victim)
+            unique.append(evict_plan)
         entry.plan.evicts = unique

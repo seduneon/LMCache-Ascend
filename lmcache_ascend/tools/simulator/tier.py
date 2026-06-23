@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from .eviction import EvictionPolicy, LRUEviction
 from .memory import BlockState, KVBlock, Memory
+
+TierRole = Literal["local", "downstream"]
 
 
 TierEvictObserver = Callable[[float, KVBlock], None]
@@ -19,6 +22,7 @@ class Tier:
     key: str
     memory: Memory
     eviction: EvictionPolicy
+    role: TierRole = "downstream"
     on_tier_evict: TierEvictObserver | None = None
 
 
@@ -38,8 +42,14 @@ class TierGraph:
     def eviction_for(self, key: str) -> EvictionPolicy:
         tier = self.tiers.get(key)
         if tier is None:
-            return LRUEviction()
+            raise KeyError(f"no tier {key!r} in graph")
         return tier.eviction
+
+    def tier_roles(self) -> dict[str, TierRole]:
+        return {key: tier.role for key, tier in self.tiers.items()}
+
+    def local_tier_keys(self) -> frozenset[str]:
+        return frozenset(key for key, tier in self.tiers.items() if tier.role == "local")
 
 
 def graph_from_memories(

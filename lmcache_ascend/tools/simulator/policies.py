@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .effects import EffectConfig, EffectPolicy
-from .engine_config import EngineConfig, build_placement_spec
-from .read_path import ReadPathSpec
+from .engine_config import EngineConfig, LifecycleSpec, build_placement_spec
+from .read_path import ReadPathPolicy, ReadPathStrategy
 from .eviction import LRUEviction
 from .plan import EntryPlan, WorkEntry
 from .request import Request, request_owning_prefix_block
@@ -18,17 +18,19 @@ from .tier import Tier, TierGraph
 class EnginePolicies:
     schedule: SchedulePolicy
     effects: EffectPolicy
+    config: EngineConfig
 
     @classmethod
     def from_config(cls, config: EngineConfig, graph: TierGraph) -> EnginePolicies:
         local_eviction = graph.eviction_for(config.local_tier)
+        read_path = config.build_read_path_strategy()
         return cls(
             SchedulePolicy(
                 ScheduleConfig(
                     local_memory=config.local_tier,
                     pull_sources=config.pull_sources,
                     pull_mode=config.pull_mode,
-                    read_path=config.read_path,
+                    read_path=read_path,
                     local_eviction=local_eviction,
                 )
             ),
@@ -39,23 +41,12 @@ class EnginePolicies:
                     placement=config.placement,
                 )
             ),
+            config,
         )
 
     @classmethod
     def with_graph(cls, policies: EnginePolicies, graph: TierGraph) -> EnginePolicies:
-        schedule_cfg = policies.schedule.config
-        placement = policies.effects.config.placement
-        return cls.from_config(
-            EngineConfig(
-                engine_id="e0",
-                local_tier=schedule_cfg.local_memory,
-                pull_sources=schedule_cfg.pull_sources,
-                pull_mode=schedule_cfg.pull_mode,
-                read_path=schedule_cfg.read_path,
-                placement=placement,
-            ),
-            graph,
-        )
+        return cls.from_config(policies.config, graph)
 
     @classmethod
     def compute_only(
@@ -69,6 +60,9 @@ class EnginePolicies:
         mirror_on_forward: bool = True,
         retention: str = "unbounded",
         retention_params: dict | None = None,
+        hold_kv_on_complete: bool = False,
+        retain_prefix_cache: bool = False,
+        store_on_complete: tuple[str, ...] = (),
     ) -> EnginePolicies:
         g = graph or TierGraph(tiers={})
         if local_memory not in g.tiers and local_eviction is not None:
@@ -98,6 +92,11 @@ class EnginePolicies:
                 local_tier=local_memory,
                 pull_mode="compute_only",
                 placement=placement,
+                lifecycle=LifecycleSpec(
+                    hold_kv_on_complete=hold_kv_on_complete,
+                    retain_prefix_cache=retain_prefix_cache,
+                    store_on_complete=store_on_complete,
+                ),
             ),
             g,
         )
@@ -115,6 +114,9 @@ class EnginePolicies:
         mirror_on_forward: bool = True,
         retention: str = "unbounded",
         retention_params: dict | None = None,
+        hold_kv_on_complete: bool = False,
+        retain_prefix_cache: bool = False,
+        store_on_complete: tuple[str, ...] = (),
     ) -> EnginePolicies:
         g = graph or TierGraph(tiers={})
         placement = build_placement_spec(
@@ -131,6 +133,11 @@ class EnginePolicies:
                 pull_sources=tuple(pull_sources),
                 pull_mode="ordered_pull",
                 placement=placement,
+                lifecycle=LifecycleSpec(
+                    hold_kv_on_complete=hold_kv_on_complete,
+                    retain_prefix_cache=retain_prefix_cache,
+                    store_on_complete=store_on_complete,
+                ),
             ),
             g,
         )
@@ -158,10 +165,10 @@ def enrich_entry_plan(
         if ops:
             plan.store_ops[block_hash] = ops
 
-    for victim in plan.evicts:
-        spill_req = request_owning_prefix_block(victim.hash, known_requests)
+    for evict_plan in plan.evicts:
+        spill_req = request_owning_prefix_block(evict_plan.block.hash, known_requests)
         if spill_req is None:
             continue
-        ops = effects.plan_spill_stores(memories, victim.hash, spill_req)
+        ops = effects.plan_spill_stores(memories, evict_plan.block.hash, spill_req)
         if ops:
-            plan.spill_store_ops[id(victim)] = ops
+            evict_plan.store_ops.extend(ops)

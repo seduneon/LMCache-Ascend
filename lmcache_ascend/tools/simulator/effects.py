@@ -6,26 +6,12 @@ from dataclasses import dataclass
 
 from .engine_config import PlacementSpec
 from .memory import KVBlock, Memory
-from .placement import HBMOnly, PlacementPolicy, TieredPlacement
+from .placement import PLACEMENT, PlacementPolicy
 from .plan import StoreOp
 from .policy_registry import PolicyContext
 from .request import Request
 from .retention import RETENTION, RetentionPolicy
 from .tier import TierGraph
-
-
-def _build_placement(
-    graph: TierGraph,
-    spec: PlacementSpec,
-    retention: RetentionPolicy,
-) -> PlacementPolicy:
-    if not spec.edges:
-        return HBMOnly()
-    placement = TieredPlacement(
-        graph, spec.edges, mirror_on_forward=spec.mirror_on_forward
-    )
-    placement.bind_retention(retention)
-    return placement
 
 
 @dataclass(frozen=True)
@@ -40,15 +26,25 @@ class EffectPolicy:
 
     def __init__(self, config: EffectConfig):
         self.config = config
-        placement = config.placement
+        placement_spec = config.placement
         self._retention = RETENTION.create(
-            placement.retention_name,
+            placement_spec.retention_name,
             PolicyContext(
                 graph=config.graph,
-                params=placement.retention_params,
+                params=placement_spec.retention_params,
             ),
         )
-        self._placement = _build_placement(config.graph, config.placement, self._retention)
+        self._placement = PLACEMENT.create(
+            placement_spec.placement_name,
+            PolicyContext(
+                graph=config.graph,
+                params={
+                    "edges": placement_spec.edges,
+                    "mirror_on_forward": placement_spec.mirror_on_forward,
+                    "retention": self._retention,
+                },
+            ),
+        )
 
     def on_local_resident(
         self,

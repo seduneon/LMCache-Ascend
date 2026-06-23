@@ -106,6 +106,7 @@ def build_tier(
     kv_bytes_per_token: float,
     eviction: EvictionPolicy | None = None,
     slots: int | None = None,
+    role: "TierRole" = "downstream",
 ) -> "Tier":
     from .tier import Tier
 
@@ -127,6 +128,7 @@ def build_tier(
         key=spec.tier_key,
         memory=memory,
         eviction=eviction or LRUEviction(),
+        role=role,
     )
 
 

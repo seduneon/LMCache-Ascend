@@ -10,8 +10,11 @@ from .kv_content import ContentKey, storage_key
 from .memory import BlockState, KVBlock, Memory
 from .plan import StoreOp
 from .request import Request
-from .retention import RetentionPolicy, UnboundedRetention
+from .policy_registry import PolicyContext, Registry
+from .retention import RetentionPolicy
 from .tier import TierAllocator, TierGraph
+
+PLACEMENT = Registry["PlacementPolicy"]("placement")
 
 
 @dataclass(frozen=True)
@@ -114,9 +117,6 @@ class PlacementPolicy(ABC):
     ) -> None:
         """Called before a local-tier victim is removed. Default: drop (no spill)."""
 
-    def bind_retention(self, retention: RetentionPolicy) -> None:
-        """Optional hook for tier mirrors to enforce copy caps."""
-
     def plan_async_stores(
         self,
         memories: dict[str, Memory],
@@ -192,15 +192,13 @@ class TieredPlacement(PlacementPolicy):
         edges: tuple[PlacementEdge, ...],
         *,
         mirror_on_forward: bool = True,
+        retention: RetentionPolicy,
     ):
         self._graph = graph
         self._edges = edges
         self._allocator = TierAllocator()
-        self._retention: RetentionPolicy = UnboundedRetention()
-        self.mirror_on_forward = mirror_on_forward
-
-    def bind_retention(self, retention: RetentionPolicy) -> None:
         self._retention = retention
+        self.mirror_on_forward = mirror_on_forward
 
     def _edges_for(self, trigger: str) -> list[PlacementEdge]:
         return [edge for edge in self._edges if edge.trigger == trigger]
@@ -407,3 +405,19 @@ class TieredPlacement(PlacementPolicy):
         return self._plan_async_edges(
             memories, trigger="evict", block_hash=block_hash, req=req
         )
+
+
+@PLACEMENT.register("hbm_only")
+def _hbm_only(_ctx: PolicyContext) -> PlacementPolicy:
+    return HBMOnly()
+
+
+@PLACEMENT.register("tiered")
+def _tiered(ctx: PolicyContext) -> PlacementPolicy:
+    params = ctx.params
+    return TieredPlacement(
+        ctx.graph,
+        params["edges"],
+        mirror_on_forward=params["mirror_on_forward"],
+        retention=params["retention"],
+    )
