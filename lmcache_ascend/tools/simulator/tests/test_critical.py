@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from simulator.runtime.engine import Engine
 from simulator.core.memory import BlockState, Memory
 from simulator.runtime.plan import EntryPlan, WorkEntry
 from simulator.core.request import Request, RequestPD, RequestStatus
@@ -15,6 +14,7 @@ from simulator.runtime.pd import PDConfig
 from simulator.tests.test_helpers import (
     SimpleTask,
     execute_plan,
+    make_engine,
     make_plan,
     make_resident,
     policies_compute,
@@ -38,7 +38,7 @@ def _pd_engines(
     }
     compute = ComputeResource(base_speed=4.0)
     link = BandwidthResource(base_speed=4.0, latency=0.01)
-    npu0 = Engine(
+    npu0 = make_engine(
         engine_id="npu-0",
         requests=prefill_requests,
         pool=pool,
@@ -49,7 +49,7 @@ def _pd_engines(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=32,
     )
-    npu1 = Engine(
+    npu1 = make_engine(
         engine_id="npu-1",
         requests=[],
         pool=pool,
@@ -75,7 +75,7 @@ def test_micro_step_waits_for_arrival() -> None:
     """With no runnable work, one step() advances now to the next arrival."""
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [Request("r1", 2.5, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)],
         pool,
@@ -96,7 +96,7 @@ def test_micro_step_waits_for_arrival() -> None:
 def test_event_steps_matches_completed_steps() -> None:
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)],
         pool,
@@ -115,7 +115,7 @@ def test_in_flight_blocks_reschedule() -> None:
     """An engine with an in-flight batch must not execute another batch."""
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [
             Request("r1", 0.0, ["a", "b"], RequestPD.PREFILL, RequestStatus.PENDING),
@@ -322,7 +322,7 @@ def test_parallel_pull_tasks_start_together() -> None:
     for block_hash in ("a", "b"):
         make_resident(memories["src"], block_hash)
 
-    eng = Engine(
+    eng = make_engine(
         "d",
         [],
         pool,
@@ -422,7 +422,7 @@ def test_scheduler_limits() -> None:
 def test_chunked_prefill() -> None:
     memories = {"hbm": Memory(size=100, name="hbm")}
     pool = TaskPool()
-    eng = Engine(
+    eng = make_engine(
         engine_id="e0",
         requests=[],
         pool=pool,
@@ -463,7 +463,7 @@ def test_pd_read_mode_flags() -> None:
         RequestStatus.PENDING,
         max_output_blocks=2,
     )
-    npu0 = Engine(
+    npu0 = make_engine(
         engine_id="npu-0",
         requests=[prefill],
         pool=pool,
@@ -472,7 +472,7 @@ def test_pd_read_mode_flags() -> None:
         compute_res=ComputeResource(base_speed=1.0),
         work_per_block=1.0,
     )
-    npu1 = Engine(
+    npu1 = make_engine(
         engine_id="npu-1",
         requests=[],
         pool=pool,
@@ -616,8 +616,8 @@ def test_waiting_preempt() -> None:
 def test_pd_config_validation() -> None:
     pool = TaskPool()
     memories = {"p": Memory(size=10, name="p"), "d": Memory(size=10, name="d")}
-    npu0 = Engine("p", [], pool, memories, policies_compute("p"), ComputeResource(base_speed=1.0))
-    npu1 = Engine("d", [], pool, memories, policies_compute("d"), ComputeResource(base_speed=1.0))
+    npu0 = make_engine("p", [], pool, memories, policies_compute("p"), ComputeResource(base_speed=1.0))
+    npu1 = make_engine("d", [], pool, memories, policies_compute("d"), ComputeResource(base_speed=1.0))
     try:
         Simulator([npu0, npu1], pool, pd=PDConfig(spawn_map={"p": "d"}))
         raise AssertionError("expected ValueError for decode without pull_sources")

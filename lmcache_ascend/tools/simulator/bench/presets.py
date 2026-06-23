@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from simulator.runtime.engine import Engine
-from simulator.runtime.engine_config import EngineLinks, WorkModel
+from simulator.runtime.engine_config import EngineLinks, EngineRuntime, WorkModel
 from simulator.policy.config import EngineConfig, LifecycleSpec, PlacementSpec, build_placement_spec
 from simulator.core.memory import Memory
 from simulator.policy.policies import EnginePolicies
@@ -396,13 +396,14 @@ def _make_engine(
         pool=pool,
         memories=topo.memories,
         policies=policies,
-        compute_res=compute,
-        work=work,
         links=links,
-        max_num_seqs=build.max_num_seqs,
-        max_num_batched_tokens=build.max_num_batched_tokens,
-        enable_chunked_prefill=True,
-        remote_kv_wait=remote_kv_wait,
+        work=work,
+        runtime=EngineRuntime(
+            max_num_seqs=build.max_num_seqs,
+            max_num_batched_tokens=build.max_num_batched_tokens,
+            enable_chunked_prefill=True,
+            remote_kv_wait=remote_kv_wait,
+        ),
     )
 
 

@@ -30,6 +30,7 @@ from simulator.core.memory import BlockState, KVBlock, Memory, collect_content_c
 from simulator.runtime.tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
 from simulator.tests.test_helpers import (
     SimpleTask,
+    make_engine,
     make_resident,
     policies_compute,
     policies_pull,
@@ -37,7 +38,6 @@ from simulator.tests.test_helpers import (
     schedule_pull,
 )
 
-from simulator.runtime.engine import Engine
 from simulator.core.request import Request, RequestPD, RequestStatus
 from simulator.core.resource import BandwidthResource, ComputeResource
 from simulator.runtime.scheduler import Scheduler
@@ -102,7 +102,7 @@ def test_placement_e2e_pull_from_dram() -> None:
         "hbm": Memory(size=2, name="hbm"),
         "dram": Memory(size=10, name="dram"),
     }
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [],
         pool,
@@ -213,7 +213,7 @@ def test_chunked_dram_pull_transfer_cost_e2e() -> None:
     chunk_key = "chunk:a|b|c|d"
     memories["dram"].append(KVBlock(chunk_key, BlockState.RESIDENT))
 
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [],
         pool,
@@ -240,7 +240,7 @@ def test_spill_e2e_after_hbm_pressure() -> None:
         "hbm": Memory(size=1, name="hbm"),
         "dram": Memory(size=10, name="dram"),
     }
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [],
         pool,
@@ -342,7 +342,7 @@ def test_consume_on_pull_e2e() -> None:
     }
     memories["dram"].append(KVBlock("a", BlockState.RESIDENT))
 
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [Request("r1", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.PENDING)],
         pool,
@@ -614,7 +614,7 @@ def test_request_metrics_phases() -> None:
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
     req = Request("r1", 1.0, ["a", "b"], RequestPD.PREFILL, RequestStatus.PENDING)
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [req],
         pool,
@@ -653,7 +653,7 @@ def test_request_metrics_pd_decode() -> None:
         RequestStatus.PENDING,
         max_output_blocks=1,
     )
-    npu0 = Engine(
+    npu0 = make_engine(
         "npu-0",
         [prefill],
         pool,
@@ -662,7 +662,7 @@ def test_request_metrics_pd_decode() -> None:
         ComputeResource(base_speed=4.0),
         work_per_block=1.0,
     )
-    npu1 = Engine(
+    npu1 = make_engine(
         "npu-1",
         [],
         pool,
@@ -762,7 +762,7 @@ def test_tiered_placement_async_store_e2e() -> None:
         "ssd": Memory(size=10, name="ssd", chunk_blocks=4),
     }
     write_link = BandwidthResource(base_speed=4.0, latency=0.0)
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [],
         pool,
@@ -810,7 +810,7 @@ def test_batch_load_task_amortizes_work() -> None:
     memories["dram"].append(KVBlock(chunk_key, BlockState.RESIDENT))
 
     link = BandwidthResource(base_speed=1.0, latency=1.0)
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [],
         pool,
@@ -844,7 +844,7 @@ def test_pull_dedupe_across_requests_in_batch() -> None:
     memories["dram"].append(KVBlock(chunk_key, BlockState.RESIDENT))
 
     link = BandwidthResource(base_speed=1.0, latency=1.0)
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [],
         pool,
@@ -883,7 +883,7 @@ def test_sync_evict_frees_before_pull() -> None:
     pool = TaskPool()
     memories = {"hbm": Memory(size=1, name="hbm")}
     memories["hbm"].append(KVBlock("old", BlockState.RESIDENT))
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [],
         pool,
@@ -954,7 +954,7 @@ def test_execute_plan_tags_pool_tasks() -> None:
         "ssd": Memory(size=10, name="ssd", chunk_blocks=4),
     }
     write_link = BandwidthResource(base_speed=4.0, latency=0.0)
-    eng = Engine(
+    eng = make_engine(
         "e0",
         [],
         pool,

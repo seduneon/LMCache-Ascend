@@ -62,3 +62,15 @@ class EngineLinks:
             write_links=dict(write_links or {}),
             interconnect=interconnect,
         )
+
+
+@dataclass(frozen=True)
+class EngineRuntime:
+    """Scheduler and execution knobs for one engine."""
+
+    block_size: int = 1
+    max_num_seqs: int = 10_000
+    max_num_batched_tokens: int = 10_000
+    enable_chunked_prefill: bool = False
+    remote_kv_wait: bool = False
+    sync_evict: bool = True

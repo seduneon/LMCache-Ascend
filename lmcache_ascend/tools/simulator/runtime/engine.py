@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .connector import TierCacheConnector
-from .engine_config import EngineLinks, WorkModel
+from .engine_config import EngineLinks, EngineRuntime, WorkModel
 from simulator.policy.eviction import LRUEviction
 from .execute import BatchRunner
 from simulator.core.memory import KVBlock, Memory
@@ -31,6 +31,29 @@ def _merge_tier_graph(graph: TierGraph, memories: dict[str, Memory]) -> TierGrap
     return TierGraph(tiers=tiers)
 
 
+def _install_tier_evict_trace(
+    graph: TierGraph,
+    *,
+    engine_id: str,
+    event_trace: EventTraceWriter,
+) -> None:
+    for tier in graph.tiers.values():
+        tier_key = tier.key
+
+        def _tier_evict_cb(
+            now: float, block: KVBlock, *, key: str = tier_key
+        ) -> None:
+            event_trace.on_evict(
+                now=now,
+                engine_id=engine_id,
+                tier=key,
+                block_hash=block.hash,
+                policy="tier",
+            )
+
+        tier.on_tier_evict = _tier_evict_cb
+
+
 class Engine:
     def __init__(
         self,
@@ -39,26 +62,10 @@ class Engine:
         pool: TaskPool,
         memories: dict[str, Memory],
         policies: EnginePolicies,
-        compute_res: ComputeResource,
-        bandwidth_res: BandwidthResource | None = None,
+        links: EngineLinks,
         *,
-        work: WorkModel | None = None,
-        links: EngineLinks | None = None,
-        transfer_links: dict[str, BandwidthResource] | None = None,
-        write_links: dict[str, BandwidthResource] | None = None,
-        work_per_block: float = 1.0,
-        work_per_transfer: float | None = None,
-        work_per_store: float | None = None,
-        work_per_evict: float | None = None,
-        block_size: int = 1,
-        max_num_seqs: int = 10_000,
-        max_num_batched_tokens: int = 10_000,
-        enable_chunked_prefill: bool = False,
-        remote_kv_wait: bool = False,
-        work_per_prefill_token: float | None = None,
-        work_per_decode_req: float | None = None,
-        sync_evict: bool = True,
-        interconnect: BandwidthResource | None = None,
+        work: WorkModel = WorkModel(),
+        runtime: EngineRuntime = EngineRuntime(),
         event_trace: EventTraceWriter | None = None,
     ):
         self.engine_id = engine_id
@@ -71,62 +78,16 @@ class Engine:
         self.local_memory = policies.schedule.local_memory
         schedule = policies.schedule
 
-        if work is None:
-            work = WorkModel(
-                per_block=work_per_block,
-                per_transfer=work_per_transfer,
-                per_store=work_per_store,
-                per_evict=0.0 if work_per_evict is None else work_per_evict,
-                per_prefill_token=work_per_prefill_token,
-                per_decode_req=work_per_decode_req,
-            )
         self._work = work
-        self.work_per_block = work.per_block
-        self.work_per_transfer = work.resolved_transfer()
-        self.work_per_store = work.resolved_store()
-        self.work_per_evict = work.per_evict
-        self.work_per_prefill_token = work.resolved_prefill_token()
-        self.work_per_decode_req = work.resolved_decode_req()
-
-        if links is None:
-            resolved_transfer = transfer_links
-            if resolved_transfer is None and bandwidth_res is not None and schedule.pull_sources:
-                resolved_transfer = {
-                    src: bandwidth_res for src in schedule.pull_sources
-                }
-            links = EngineLinks(
-                compute_res=compute_res,
-                bandwidth_res=bandwidth_res,
-                transfer_links=dict(resolved_transfer or {}),
-                write_links=dict(write_links or {}),
-                interconnect=interconnect,
-            )
         self._links = links
-        self.compute_res = links.compute_res
-        self.bandwidth_res = links.bandwidth_res
-        self.transfer_links = links.transfer_links
-        self.write_links = links.write_links
-        self.interconnect = links.interconnect
-        self.sync_evict = sync_evict
-        self.block_size = block_size
+        self._runtime = runtime
         self.event_trace = event_trace
         self._next_batch_id = 0
+
         if event_trace is not None:
-            for tier in merged_graph.tiers.values():
-                tier_key = tier.key
-
-                def _tier_evict_cb(
-                    now: float, block: KVBlock, *, key: str = tier_key
-                ) -> None:
-                    event_trace.on_evict(
-                        now=now,
-                        engine_id=engine_id,
-                        tier=key,
-                        block_hash=block.hash,
-                        policy="tier",
-                    )
-
-                tier.on_tier_evict = _tier_evict_cb
+            _install_tier_evict_trace(
+                merged_graph, engine_id=engine_id, event_trace=event_trace
+            )
 
         self.cache = TierCacheConnector(
             engine_id=engine_id,
@@ -138,9 +99,9 @@ class Engine:
             compute_res=links.compute_res,
             transfer_links=links.transfer_links,
             write_links=links.write_links,
-            work_per_transfer=self.work_per_transfer,
-            work_per_prefill_token=self.work_per_prefill_token,
-            work_per_decode_req=self.work_per_decode_req,
+            work_per_transfer=work.resolved_transfer(),
+            work_per_prefill_token=work.resolved_prefill_token(),
+            work_per_decode_req=work.resolved_decode_req(),
             interconnect=links.interconnect,
             event_trace=event_trace,
         )
@@ -149,15 +110,79 @@ class Engine:
             schedule,
             memories,
             self.local_memory,
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
-            block_size=block_size,
-            enable_chunked_prefill=enable_chunked_prefill,
-            remote_kv_wait=remote_kv_wait,
+            max_num_seqs=runtime.max_num_seqs,
+            max_num_batched_tokens=runtime.max_num_batched_tokens,
+            block_size=runtime.block_size,
+            enable_chunked_prefill=runtime.enable_chunked_prefill,
+            remote_kv_wait=runtime.remote_kv_wait,
         )
         for req in requests:
             self.scheduler.add_request(req)
         self.scheduler.set_release_handler(self.cache.release_request_kv)
+
+    @property
+    def work(self) -> WorkModel:
+        return self._work
+
+    @property
+    def links(self) -> EngineLinks:
+        return self._links
+
+    @property
+    def runtime(self) -> EngineRuntime:
+        return self._runtime
+
+    @property
+    def compute_res(self) -> ComputeResource:
+        return self._links.compute_res
+
+    @property
+    def bandwidth_res(self) -> BandwidthResource | None:
+        return self._links.bandwidth_res
+
+    @property
+    def transfer_links(self) -> dict[str, BandwidthResource]:
+        return self._links.transfer_links
+
+    @property
+    def write_links(self) -> dict[str, BandwidthResource]:
+        return self._links.write_links
+
+    @property
+    def interconnect(self) -> BandwidthResource | None:
+        return self._links.interconnect
+
+    @property
+    def work_per_block(self) -> float:
+        return self._work.per_block
+
+    @property
+    def work_per_transfer(self) -> float:
+        return self._work.resolved_transfer()
+
+    @property
+    def work_per_store(self) -> float:
+        return self._work.resolved_store()
+
+    @property
+    def work_per_evict(self) -> float:
+        return self._work.per_evict
+
+    @property
+    def work_per_prefill_token(self) -> float:
+        return self._work.resolved_prefill_token()
+
+    @property
+    def work_per_decode_req(self) -> float:
+        return self._work.resolved_decode_req()
+
+    @property
+    def sync_evict(self) -> bool:
+        return self._runtime.sync_evict
+
+    @property
+    def block_size(self) -> int:
+        return self._runtime.block_size
 
     @property
     def waiting(self):
