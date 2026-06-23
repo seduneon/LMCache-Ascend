@@ -14,7 +14,11 @@ from simulator.core.kv_content import (
     transfer_work,
 )
 from simulator.observability.estimate import batch_forward_work, record_entry_metrics
-from simulator.policy.block_resolve import first_resident_pull_source
+from simulator.policy.block_resolve import (
+    first_resident_pull_source,
+    pull_sources_for_request,
+    skip_foreign_prefill_wait,
+)
 from simulator.core.memory import BlockState, KVBlock, Memory
 from .plan import BatchPlan, EvictPlan, StoreOp, WorkEntry
 from simulator.core.request import Request
@@ -215,7 +219,12 @@ class BatchRunner:
                 self._attach_remote_wait(entry.req, block_hash)
 
     def _attach_remote_wait(self, req: Request, block_hash: str) -> None:
-        for src_key in self._engine.policies.schedule.pull_sources:
+        sources = pull_sources_for_request(
+            self._engine.policies.schedule.pull_sources, req
+        )
+        for src_key in sources:
+            if skip_foreign_prefill_wait(req, src_key):
+                continue
             src = self._engine.memories[src_key]
             if tier_has_block(src, req, block_hash):
                 continue
@@ -223,6 +232,8 @@ class BatchRunner:
                 slot = storage_key(req, block_hash, src.chunk_blocks)
                 inflight = src.inflight_incoming(slot)
                 if inflight is not None:
+                    if inflight.holders and req.req_id not in inflight.holders:
+                        continue
                     inflight.holders.add(req.req_id)
 
     def _sync_evict(

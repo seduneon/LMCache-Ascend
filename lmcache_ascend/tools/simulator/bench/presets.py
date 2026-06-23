@@ -12,7 +12,19 @@ from simulator.policy.policies import EnginePolicies
 from simulator.core.request import Request
 from simulator.core.resource import BandwidthResource, ComputeResource
 from simulator.runtime.tasks import TaskPool
-from simulator.model.layout import SimResources, Topology, TOPOLOGY_TIERS, build_eviction_map, build_topology
+from simulator.model.layout import (
+    DEFAULT_DECODE_IDS,
+    DEFAULT_PREFILL_IDS,
+    SimResources,
+    Topology,
+    TOPOLOGY_TIERS,
+    build_eviction_map,
+    build_topology,
+    engine_ids_for_pd,
+    tier_keys_for,
+)
+from simulator.policy.registry import PolicyContext
+from simulator.policy.routing import ROUTING, RoutingPolicy
 
 
 @dataclass(frozen=True)
@@ -246,9 +258,11 @@ def build_topology_for_preset(
     spec: PresetSpec,
     resources: SimResources | None = None,
     *,
+    prefill_ids: tuple[str, ...] = DEFAULT_PREFILL_IDS,
+    decode_ids: tuple[str, ...] = DEFAULT_DECODE_IDS,
     rng_seed: int = 0,
 ) -> Topology:
-    tier_keys = TOPOLOGY_TIERS[spec.topology]
+    tier_keys = tier_keys_for(prefill_ids, decode_ids, spec.topology)
     eviction_map = build_eviction_map(
         tier_keys,
         local=spec.local_eviction or spec.eviction,
@@ -257,9 +271,139 @@ def build_topology_for_preset(
     )
     return build_topology(
         spec.topology,
-        resources=resources or SimResources.default(),
+        prefill_ids=prefill_ids,
+        decode_ids=decode_ids,
+        resources=resources or SimResources.default(
+            prefill_ids=prefill_ids, decode_ids=decode_ids
+        ),
         eviction_map=eviction_map,
     )
+
+
+def _make_engine(
+    *,
+    engine_id: str,
+    requests: list[Request],
+    pool: TaskPool,
+    topo: Topology,
+    policies: EnginePolicies,
+    build: EngineBuildConfig,
+    compute: ComputeResource,
+    link: BandwidthResource,
+    remote_kv_wait: bool = False,
+) -> Engine:
+    pull_sources = list(policies.schedule.config.pull_sources)
+    kwargs: dict = {
+        "engine_id": engine_id,
+        "requests": requests,
+        "pool": pool,
+        "memories": topo.memories,
+        "policies": policies,
+        "compute_res": compute,
+        "work_per_block": build.work_per_block,
+        "max_num_seqs": build.max_num_seqs,
+        "max_num_batched_tokens": build.max_num_batched_tokens,
+        "enable_chunked_prefill": True,
+    }
+    if remote_kv_wait:
+        kwargs["bandwidth_res"] = link
+        kwargs["transfer_links"] = _transfer_links(topo.memories, pull_sources, link)
+        kwargs["work_per_transfer"] = build.work_per_transfer
+        kwargs["remote_kv_wait"] = True
+    else:
+        kwargs["write_links"] = _write_links(topo.memories, build)
+        kwargs["work_per_store"] = build.work_per_transfer
+    return Engine(**kwargs)
+
+
+def build_engines(
+    requests: list[Request],
+    pool: TaskPool,
+    preset: PresetSpec | str,
+    *,
+    prefill_ids: tuple[str, ...] = DEFAULT_PREFILL_IDS,
+    decode_ids: tuple[str, ...] = DEFAULT_DECODE_IDS,
+    routing_name: str = "bijection",
+    routing_params: dict | None = None,
+    cfg: EngineBuildConfig | None = None,
+    resources: SimResources | None = None,
+    rng_seed: int = 0,
+) -> tuple[dict[str, Engine], Topology, RoutingPolicy]:
+    spec = PRESETS[preset] if isinstance(preset, str) else preset
+    build = cfg or EngineBuildConfig()
+    res = resources or build.resources
+    topo = build_topology_for_preset(
+        spec, res, prefill_ids=prefill_ids, decode_ids=decode_ids, rng_seed=rng_seed
+    )
+    compute = ComputeResource(base_speed=build.compute_speed)
+    link = BandwidthResource(base_speed=build.link_speed, latency=build.link_latency)
+
+    engines: dict[str, Engine] = {}
+    prefill_buckets: dict[str, list[Request]] = {
+        pid: [] for pid in topo.prefill_ids
+    }
+    for index, req in enumerate(requests):
+        prefill_buckets[topo.prefill_ids[index % len(topo.prefill_ids)]].append(req)
+
+    for prefill_id in topo.prefill_ids:
+        prefill_cfg = EngineConfig(
+            engine_id=prefill_id,
+            local_tier=topo.local_tier[prefill_id],
+            pull_mode="compute_only",
+            placement=_placement_spec(spec),
+            lifecycle=LifecycleSpec(
+                hold_kv_on_complete=spec.hold_kv_on_complete,
+                retain_prefix_cache=spec.prefill_retain_prefix_cache,
+                store_on_complete=spec.store_on_complete,
+            ),
+        )
+        engines[prefill_id] = _make_engine(
+            engine_id=prefill_id,
+            requests=prefill_buckets[prefill_id],
+            pool=pool,
+            topo=topo,
+            policies=EnginePolicies.from_config(prefill_cfg, topo.graph),
+            build=build,
+            compute=compute,
+            link=link,
+        )
+
+    for decode_id in topo.decode_ids:
+        decode_cfg = EngineConfig(
+            engine_id=decode_id,
+            local_tier=topo.local_tier[decode_id],
+            pull_sources=topo.decode_pull_sources(spec.decode_pull),
+            pull_mode="ordered_pull",
+            read_path_name=spec.decode_read_path,
+            read_path_params=spec.decode_read_path_params,
+            placement=_placement_spec(spec),
+            lifecycle=LifecycleSpec(
+                retain_prefix_cache=spec.decode_retain_prefix_cache,
+            ),
+        )
+        engines[decode_id] = _make_engine(
+            engine_id=decode_id,
+            requests=[],
+            pool=pool,
+            topo=topo,
+            policies=EnginePolicies.from_config(decode_cfg, topo.graph),
+            build=build,
+            compute=compute,
+            link=link,
+            remote_kv_wait=True,
+        )
+
+    params = dict(routing_params or {})
+    if routing_name == "bijection" and "map" not in params and "spawn_map" not in params:
+        if len(topo.prefill_ids) == 1 and len(topo.decode_ids) == 1:
+            params["map"] = {topo.prefill_ids[0]: topo.decode_ids[0]}
+        else:
+            params["decode_ids"] = topo.decode_ids
+            routing_name = "round_robin"
+    if routing_name in ("round_robin", "hash") and "decode_ids" not in params:
+        params["decode_ids"] = topo.decode_ids
+    routing = ROUTING.create(routing_name, PolicyContext(params=params))
+    return engines, topo, routing
 
 
 def build_pd_engines(
@@ -271,46 +415,16 @@ def build_pd_engines(
     resources: SimResources | None = None,
     rng_seed: int = 0,
 ) -> tuple[Engine, Engine, Topology]:
-    spec = PRESETS[preset] if isinstance(preset, str) else preset
-    build = cfg or EngineBuildConfig()
-    res = resources or build.resources
-    topo = build_topology_for_preset(spec, res, rng_seed=rng_seed)
-    compute = ComputeResource(base_speed=build.compute_speed)
-    link = BandwidthResource(base_speed=build.link_speed, latency=build.link_latency)
-    prefill_cfg = prefill_config(spec, topo)
-    decode_cfg = decode_config(spec, topo)
-    prefill_policies = EnginePolicies.from_config(prefill_cfg, topo.graph)
-    decode_policies = EnginePolicies.from_config(decode_cfg, topo.graph)
-    prefill = Engine(
-        engine_id=topo.prefill_engine_id,
-        requests=requests,
-        pool=pool,
-        memories=topo.memories,
-        policies=prefill_policies,
-        compute_res=compute,
-        work_per_block=build.work_per_block,
-        max_num_seqs=build.max_num_seqs,
-        max_num_batched_tokens=build.max_num_batched_tokens,
-        enable_chunked_prefill=True,
-        write_links=_write_links(topo.memories, build),
-        work_per_store=build.work_per_transfer,
+    engines, topo, _routing = build_engines(
+        requests,
+        pool,
+        preset,
+        cfg=cfg,
+        resources=resources,
+        rng_seed=rng_seed,
     )
-    decode = Engine(
-        engine_id=topo.decode_engine_id,
-        requests=[],
-        pool=pool,
-        memories=topo.memories,
-        policies=decode_policies,
-        compute_res=compute,
-        bandwidth_res=link,
-        transfer_links=_transfer_links(
-            topo.memories, list(decode_policies.schedule.config.pull_sources), link
-        ),
-        work_per_block=build.work_per_block,
-        work_per_transfer=build.work_per_transfer,
-        max_num_seqs=build.max_num_seqs,
-        max_num_batched_tokens=build.max_num_batched_tokens,
-        enable_chunked_prefill=True,
-        remote_kv_wait=True,
+    return (
+        engines[topo.prefill_engine_id],
+        engines[topo.decode_engine_id],
+        topo,
     )
-    return prefill, decode, topo

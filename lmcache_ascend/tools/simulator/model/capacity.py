@@ -41,13 +41,38 @@ def default_tiers(
     ssd_gib: float = 256.0,
     dram_chunk_blocks: int = 4,
     ssd_chunk_blocks: int = 4,
+    prefill_ids: tuple[str, ...] = ("npu-0",),
+    decode_ids: tuple[str, ...] = ("npu-1",),
 ) -> tuple[TierSpec, ...]:
-    return (
-        TierSpec("npu-0:hbm", hbm_gib, 1),
-        TierSpec("npu-1:hbm", hbm_gib, 1),
-        TierSpec("npu-0:dram", dram_gib, dram_chunk_blocks),
-        TierSpec("npu-0:ssd", ssd_gib, ssd_chunk_blocks),
+    return default_tiers_for(
+        prefill_ids,
+        decode_ids,
+        hbm_gib=hbm_gib,
+        dram_gib=dram_gib,
+        ssd_gib=ssd_gib,
+        dram_chunk_blocks=dram_chunk_blocks,
+        ssd_chunk_blocks=ssd_chunk_blocks,
     )
+
+
+def default_tiers_for(
+    prefill_ids: tuple[str, ...],
+    decode_ids: tuple[str, ...],
+    *,
+    hbm_gib: float = 32.0,
+    dram_gib: float = 64.0,
+    ssd_gib: float = 256.0,
+    dram_chunk_blocks: int = 4,
+    ssd_chunk_blocks: int = 4,
+) -> tuple[TierSpec, ...]:
+    """Tier specs for each engine HBM plus downstream tiers on the primary prefill."""
+    specs: list[TierSpec] = []
+    for eid in prefill_ids + decode_ids:
+        specs.append(TierSpec(f"{eid}:hbm", hbm_gib, 1))
+    primary = prefill_ids[0]
+    specs.append(TierSpec(f"{primary}:dram", dram_gib, dram_chunk_blocks))
+    specs.append(TierSpec(f"{primary}:ssd", ssd_gib, ssd_chunk_blocks))
+    return tuple(specs)
 
 
 def bytes_per_kv_block(*, tokens_per_block: int, kv_bytes_per_token: float) -> int:

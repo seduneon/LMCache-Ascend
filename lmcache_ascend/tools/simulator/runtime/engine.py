@@ -275,6 +275,5 @@ class Engine:
     def release_held_kv(self, req_id: str) -> None:
         req = next((r for r in self.completed if r.req_id == req_id), None)
         if req is None:
-            self.memories[self.local_memory].free_request(req_id)
             return
         self.cache.release_request_kv(req, preempted=False, now=0.0)

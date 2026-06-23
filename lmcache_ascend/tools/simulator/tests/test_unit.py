@@ -1224,3 +1224,73 @@ def test_policy_matrix_sweep_smoke() -> None:
     assert all(r.status == "ok" for r in rows)
     assert rows[0].read_path == "min_cost"
 
+
+def test_routing_registry() -> None:
+    from simulator.core.request import Request, RequestPD, RequestStatus
+    from simulator.policy.registry import PolicyContext
+    from simulator.policy.routing import ROUTING
+
+    req = Request("r0", 0.0, ["a"], RequestPD.PREFILL, RequestStatus.COMPLETE)
+    bij = ROUTING.create("bijection", PolicyContext(params={"map": {"p0": "d0"}}))
+    assert bij.route(req, "p0") == "d0"
+
+    rr = ROUTING.create(
+        "round_robin", PolicyContext(params={"decode_ids": ("d0", "d1")})
+    )
+    assert rr.route(req, "p0") == "d0"
+    assert rr.route(req, "p0") == "d1"
+    assert rr.route(req, "p0") == "d0"
+
+    h = ROUTING.create("hash", PolicyContext(params={"decode_ids": ("d0", "d1")}))
+    assert h.route(req, "p0") in ("d0", "d1")
+
+
+def test_xpyd_2p2d_smoke() -> None:
+    from simulator.bench.presets import PRESETS, build_engines
+    from simulator.bench.sweep import SimConfig
+    from simulator.bench.workload import WorkloadConfig, generate_prefill_workload
+    from simulator.model.layout import engine_ids_for_pd
+    from simulator.runtime.pd import PDConfig
+    from simulator.runtime.tasks import TaskPool
+    from simulator.runtime.simulator import Simulator
+
+    workload = WorkloadConfig(num_requests=8, seed=99)
+    requests, _ = generate_prefill_workload(workload)
+    prefill_ids, decode_ids = engine_ids_for_pd(num_prefill=2, num_decode=2)
+    pool = TaskPool()
+    sim_cfg = SimConfig.with_block_slots(hbm=32, dram=40, num_prefill=2, num_decode=2)
+    engines, topo, routing = build_engines(
+        requests,
+        pool,
+        PRESETS["baseline"],
+        prefill_ids=prefill_ids,
+        decode_ids=decode_ids,
+        routing_name="round_robin",
+        cfg=sim_cfg.engine_build(),
+        resources=sim_cfg.resources(prefill_ids=prefill_ids, decode_ids=decode_ids),
+    )
+    sim = Simulator(
+        list(engines.values()),
+        pool,
+        pd=PDConfig(routing=routing, engine_role=topo.engine_role),
+    )
+    sim.run(max_steps=50_000, wall_timeout_s=30.0)
+
+    expected = {r.req_id for r in requests}
+    decode_done = {
+        r.req_id
+        for eid in topo.decode_ids
+        for r in engines[eid].completed
+        if r.pd == RequestPD.DECODE and r.status == RequestStatus.COMPLETE
+    }
+    assert decode_done == expected
+    for eid in topo.prefill_ids:
+        for r in engines[eid].completed:
+            if r.pd == RequestPD.PREFILL and r.kv_held_for_transfer:
+                assert False, "prefill KV should be released after decode completes"
+    for eid in topo.prefill_ids + topo.decode_ids:
+        eng = engines[eid]
+        mem = eng.memories[eng.local_memory]
+        held = sum(1 for block in mem.list() if block.holders)
+        assert held == 0, f"{eng.local_memory} leaked held_blocks={held}"
+

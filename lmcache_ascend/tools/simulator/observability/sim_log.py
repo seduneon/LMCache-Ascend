@@ -109,7 +109,7 @@ class SimLogger:
         if not self.config.enabled:
             return
         self._write(
-            f"[sim] start engines={len(sim.engines)} pd_spawn={sim.spawn_map or '{}'}"
+            f"[sim] start engines={len(sim.engines)} pd_routing={type(sim.routing).__name__ if sim.routing else 'none'}"
         )
 
     def on_run_end(self, sim: Simulator, *, steps: int, hit_max_steps: bool) -> None:

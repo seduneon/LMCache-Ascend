@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from simulator.observability.sim_log import SimLogConfig, SimLogger
 from simulator.observability.sim_progress import SimProgress, SimProgressConfig
 from simulator.runtime.simulator import Simulator
+from simulator.model.layout import engine_ids_for_pd
 from simulator.bench.sweep import PRESETS, SimConfig, build_engines
 from simulator.runtime.tasks import TaskPool
 from simulator.bench.workload import WorkloadConfig, generate_prefill_workload
@@ -122,9 +123,17 @@ def run_stress_test(cfg: StressConfig | None = None) -> StressResult:
     requests, shared_pool = generate_prefill_workload(workload)
 
     pool = TaskPool()
-    npu0, npu1, topo = build_engines(
-        requests, pool, PRESETS["baseline"], cfg.to_sim()
+    prefill_ids, decode_ids = engine_ids_for_pd(num_prefill=1, num_decode=1)
+    engines, topo, routing = build_engines(
+        requests,
+        pool,
+        PRESETS["baseline"],
+        cfg.to_sim(),
+        prefill_ids=prefill_ids,
+        decode_ids=decode_ids,
     )
+    npu0 = engines[prefill_ids[0]]
+    npu1 = engines[decode_ids[0]]
     memories = topo.memories
 
     sim_log = SimLogger(
@@ -147,9 +156,9 @@ def run_stress_test(cfg: StressConfig | None = None) -> StressResult:
         else None
     )
     sim = Simulator(
-        [npu0, npu1],
+        list(engines.values()),
         pool,
-        pd=PDConfig(spawn_map={"npu-0": "npu-1"}),
+        pd=PDConfig(routing=routing, engine_role=topo.engine_role),
         log=sim_log,
         progress=progress,
     )

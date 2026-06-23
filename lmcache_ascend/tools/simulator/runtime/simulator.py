@@ -27,7 +27,7 @@ class Simulator:
         self.engines = {eng.engine_id: eng for eng in engines}
         self.pool = pool
         self.pd = pd
-        self.spawn_map: dict[str, str] = pd.spawn_map if pd else {}
+        self.routing = pd.resolved_routing() if pd is not None else None
         if pd is not None:
             pd.validate_and_apply(self.engines)
         self.now = 0.0
@@ -218,9 +218,9 @@ class Simulator:
                 events.append(
                     KvRelease(req_id=req.req_id, prefill_engine_id=req.prefill_engine_id)
                 )
-            decode_id = self.spawn_map.get(eng_id)
-            if decode_id is None or req.pd != RequestPD.PREFILL:
+            if self.routing is None or req.pd != RequestPD.PREFILL:
                 continue
+            decode_id = self.routing.route(req, eng_id)
             events.append(
                 DecodeSpawn(
                     req_id=req.req_id,

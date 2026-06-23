@@ -19,8 +19,12 @@ from .presets import (
     PRESETS,
     EngineBuildConfig,
     PresetSpec,
+    build_engines as build_sim_engines,
     build_pd_engines,
 )
+from simulator.model.layout import engine_ids_for_pd
+from simulator.policy.routing import ROUTING
+from simulator.policy.registry import PolicyContext
 from simulator.core.request import RequestPD, RequestStatus
 from simulator.core.resource import BandwidthResource
 from simulator.observability.event_trace import EventTraceWriter, trace_config_from_env
@@ -76,23 +80,46 @@ class SimConfig:
             return self.kv_bytes_per_token
         return kv_bytes_per_token(self.kv_model)
 
-    def resolved_tiers(self) -> tuple[TierSpec, ...]:
+    def resources(
+        self,
+        *,
+        tokens_per_block: int | None = None,
+        prefill_ids: tuple[str, ...] | None = None,
+        decode_ids: tuple[str, ...] | None = None,
+    ) -> SimResources:
+        tpb = tokens_per_block if tokens_per_block is not None else self.tokens_per_block
+        pids, dids = engine_ids_for_pd(num_prefill=1, num_decode=1)
+        if prefill_ids is not None:
+            pids = prefill_ids
+        if decode_ids is not None:
+            dids = decode_ids
+        return SimResources.from_tiers(
+            self.resolved_tiers(prefill_ids=pids, decode_ids=dids),
+            tokens_per_block=tpb,
+            kv_bytes_per_token=self.resolved_kv_bytes_per_token(),
+        )
+
+    def resolved_tiers(
+        self,
+        *,
+        prefill_ids: tuple[str, ...] | None = None,
+        decode_ids: tuple[str, ...] | None = None,
+    ) -> tuple[TierSpec, ...]:
         if self.tiers is not None:
             return self.tiers
+        pids, dids = engine_ids_for_pd(num_prefill=1, num_decode=1)
+        if prefill_ids is not None:
+            pids = prefill_ids
+        if decode_ids is not None:
+            dids = decode_ids
         return default_tiers(
             hbm_gib=self.hbm_gib,
             dram_gib=self.dram_gib,
             ssd_gib=self.ssd_gib,
             dram_chunk_blocks=self.dram_chunk_blocks,
             ssd_chunk_blocks=self.ssd_chunk_blocks,
-        )
-
-    def resources(self, *, tokens_per_block: int | None = None) -> SimResources:
-        tpb = tokens_per_block if tokens_per_block is not None else self.tokens_per_block
-        return SimResources.from_tiers(
-            self.resolved_tiers(),
-            tokens_per_block=tpb,
-            kv_bytes_per_token=self.resolved_kv_bytes_per_token(),
+            prefill_ids=pids,
+            decode_ids=dids,
         )
 
     @classmethod
@@ -106,25 +133,55 @@ class SimConfig:
         kv_bytes_per_token: float = 256.0,
         dram_chunk_blocks: int = 4,
         ssd_chunk_blocks: int = 4,
+        num_prefill: int = 1,
+        num_decode: int = 1,
         **kwargs: object,
     ) -> SimConfig:
         """Build config from explicit block slot counts (tests)."""
         fields = {f.name for f in cls.__dataclass_fields__.values()}
         extra = {k: v for k, v in kwargs.items() if k in fields}
-        tiers = (
-            TierSpec("npu-0:hbm", gib_for_blocks(hbm, tokens_per_block=tokens_per_block, kv_bytes_per_token=kv_bytes_per_token), 1),
-            TierSpec("npu-1:hbm", gib_for_blocks(hbm, tokens_per_block=tokens_per_block, kv_bytes_per_token=kv_bytes_per_token), 1),
-            TierSpec(
-                "npu-0:dram",
-                gib_for_blocks(dram, tokens_per_block=tokens_per_block, kv_bytes_per_token=kv_bytes_per_token, chunk_blocks=dram_chunk_blocks),
-                dram_chunk_blocks,
-            ),
-            TierSpec(
-                "npu-0:ssd",
-                gib_for_blocks(ssd, tokens_per_block=tokens_per_block, kv_bytes_per_token=kv_bytes_per_token, chunk_blocks=ssd_chunk_blocks),
-                ssd_chunk_blocks,
-            ),
+        prefill_ids, decode_ids = engine_ids_for_pd(
+            num_prefill=num_prefill, num_decode=num_decode
         )
+        tiers_list: list[TierSpec] = []
+        for eid in prefill_ids + decode_ids:
+            tiers_list.append(
+                TierSpec(
+                    f"{eid}:hbm",
+                    gib_for_blocks(
+                        hbm,
+                        tokens_per_block=tokens_per_block,
+                        kv_bytes_per_token=kv_bytes_per_token,
+                    ),
+                    1,
+                )
+            )
+        primary = prefill_ids[0]
+        tiers_list.extend(
+            [
+                TierSpec(
+                    f"{primary}:dram",
+                    gib_for_blocks(
+                        dram,
+                        tokens_per_block=tokens_per_block,
+                        kv_bytes_per_token=kv_bytes_per_token,
+                        chunk_blocks=dram_chunk_blocks,
+                    ),
+                    dram_chunk_blocks,
+                ),
+                TierSpec(
+                    f"{primary}:ssd",
+                    gib_for_blocks(
+                        ssd,
+                        tokens_per_block=tokens_per_block,
+                        kv_bytes_per_token=kv_bytes_per_token,
+                        chunk_blocks=ssd_chunk_blocks,
+                    ),
+                    ssd_chunk_blocks,
+                ),
+            ]
+        )
+        tiers = tuple(tiers_list)
         return cls(
             tiers=tiers,
             kv_bytes_per_token=kv_bytes_per_token,
@@ -243,26 +300,37 @@ def build_engines(
     preset: PresetSpec,
     sim_cfg: SimConfig,
     *,
+    prefill_ids: tuple[str, ...],
+    decode_ids: tuple[str, ...],
+    routing_name: str = "bijection",
+    routing_params: dict | None = None,
     rng_seed: int = 0,
     tokens_per_block: int = MOONCAKE_TOKENS_PER_BLOCK,
-) -> tuple[Engine, Engine, Topology]:
-    npu0, npu1, topo = build_pd_engines(
+):
+    return build_sim_engines(
         requests,
         pool,
         preset,
+        prefill_ids=prefill_ids,
+        decode_ids=decode_ids,
+        routing_name=routing_name,
+        routing_params=routing_params,
         cfg=sim_cfg.engine_build(tokens_per_block=tokens_per_block),
-        resources=sim_cfg.resources(tokens_per_block=tokens_per_block),
+        resources=sim_cfg.resources(
+            tokens_per_block=tokens_per_block,
+            prefill_ids=prefill_ids,
+            decode_ids=decode_ids,
+        ),
         rng_seed=rng_seed,
     )
-    return npu0, npu1, topo
 
 
 def _aggregate_metrics(
     preset: str,
     seed: int,
     workload: WorkloadConfig,
-    npu0: Engine,
-    npu1: Engine,
+    engines: dict[str, Engine],
+    topo,
     *,
     steps: int,
     finish_time: float,
@@ -273,20 +341,30 @@ def _aggregate_metrics(
     rejected_requests: int,
     read_path: str = "",
 ) -> SweepRow:
+    prefill_engs = [engines[eid] for eid in topo.prefill_ids]
+    decode_engs = [engines[eid] for eid in topo.decode_ids]
+    decode_completed = [
+        r
+        for eng in decode_engs
+        for r in eng.completed
+        if r.pd == RequestPD.DECODE
+    ]
+    prefill_completed = [r for eng in prefill_engs for r in eng.completed]
+
     decode_latencies = [
-        r.metrics.latency
-        for r in npu1.completed
-        if r.pd == RequestPD.DECODE and r.metrics.latency is not None
+        r.metrics.latency for r in decode_completed if r.metrics.latency is not None
     ]
 
-    decode_pulls = sum(r.metrics.pulls for r in npu1.completed)
-    decode_computes = sum(r.metrics.computes for r in npu1.completed)
-    decode_local = sum(r.metrics.local_hits for r in npu1.completed)
-    decode_prefix_pulls = sum(r.metrics.prefix_pulls for r in npu1.completed)
-    decode_prefix_computes = sum(r.metrics.prefix_computes for r in npu1.completed)
-    decode_prefix_local = sum(r.metrics.prefix_local_hits for r in npu1.completed)
-    decode_prefix_dram_pulls = sum(r.metrics.prefix_dram_pulls for r in npu1.completed)
-    decode_evictions = sum(r.metrics.evictions for r in npu1.completed)
+    decode_pulls = sum(r.metrics.pulls for r in decode_completed)
+    decode_computes = sum(r.metrics.computes for r in decode_completed)
+    decode_local = sum(r.metrics.local_hits for r in decode_completed)
+    decode_prefix_pulls = sum(r.metrics.prefix_pulls for r in decode_completed)
+    decode_prefix_computes = sum(r.metrics.prefix_computes for r in decode_completed)
+    decode_prefix_local = sum(r.metrics.prefix_local_hits for r in decode_completed)
+    decode_prefix_dram_pulls = sum(
+        r.metrics.prefix_dram_pulls for r in decode_completed
+    )
+    decode_evictions = sum(r.metrics.evictions for r in decode_completed)
 
     decode_actions = decode_pulls + decode_computes
     pull_ratio = decode_pulls / decode_actions if decode_actions else 0.0
@@ -301,13 +379,19 @@ def _aggregate_metrics(
         else 0.0
     )
 
-    preemptions = sum(r.metrics.preemptions for r in npu0.completed + npu1.completed)
-    prefill_computes = sum(r.metrics.computes for r in npu0.completed)
-    prefill_evictions = sum(r.metrics.evictions for r in npu0.completed)
-    prefill_local = sum(r.metrics.local_hits for r in npu0.completed)
-    prefill_prefix_local = sum(r.metrics.prefix_local_hits for r in npu0.completed)
+    preemptions = sum(
+        r.metrics.preemptions
+        for eng in prefill_engs + decode_engs
+        for r in eng.completed
+    )
+    prefill_computes = sum(r.metrics.computes for r in prefill_completed)
+    prefill_evictions = sum(r.metrics.evictions for r in prefill_completed)
+    prefill_local = sum(r.metrics.local_hits for r in prefill_completed)
+    prefill_prefix_local = sum(
+        r.metrics.prefix_local_hits for r in prefill_completed
+    )
     prefill_actions = (
-        sum(r.metrics.prefix_computes for r in npu0.completed) + prefill_prefix_local
+        sum(r.metrics.prefix_computes for r in prefill_completed) + prefill_prefix_local
     )
     prefill_hit_ratio = (
         prefill_prefix_local / prefill_actions if prefill_actions else 0.0
@@ -339,7 +423,7 @@ def _aggregate_metrics(
     dram_slots_used = dram.used_size() if dram is not None else 0
     ssd = memories.get("npu-0:ssd")
     ssd_slots_used = ssd.used_size() if ssd is not None else 0
-    peak_dup = max(npu0.cache.peak_duplicate_count, npu1.cache.peak_duplicate_count)
+    peak_dup = max(eng.cache.peak_duplicate_count for eng in engines.values())
 
     return SweepRow(
         preset=preset,
@@ -405,8 +489,16 @@ def run_sweep_case(
     if preset.decode_read_path is not None:
         read_path_label = preset.decode_read_path
     requests, _ = build_workload(workload)
-    resources = sim_cfg.resources(tokens_per_block=workload.tokens_per_block)
-    hbm_slots = resources.hbm_size
+    prefill_ids, decode_ids = engine_ids_for_pd(
+        num_prefill=sweep_cfg.num_prefill if sweep_cfg else 1,
+        num_decode=sweep_cfg.num_decode if sweep_cfg else 1,
+    )
+    resources = sim_cfg.resources(
+        tokens_per_block=workload.tokens_per_block,
+        prefill_ids=prefill_ids,
+        decode_ids=decode_ids,
+    )
+    hbm_slots = resources.hbm_size(prefill_ids[0])
     rejected_requests = 0
     if drop_oversized:
         requests, rejected = partition_by_hbm(requests, hbm_slots)
@@ -427,11 +519,15 @@ def run_sweep_case(
     admittable_requests = len(requests)
 
     pool = TaskPool()
-    npu0, npu1, topo = build_engines(
+    routing_name = sweep_cfg.routing if sweep_cfg else "bijection"
+    engines, topo, routing = build_engines(
         requests,
         pool,
         preset,
         sim_cfg,
+        prefill_ids=prefill_ids,
+        decode_ids=decode_ids,
+        routing_name=routing_name,
         rng_seed=workload.seed,
         tokens_per_block=workload.tokens_per_block,
     )
@@ -442,7 +538,7 @@ def run_sweep_case(
             base_speed=sim_cfg.interconnect_speed,
             latency=sim_cfg.link_latency,
         )
-        for eng in (npu0, npu1):
+        for eng in engines.values():
             eng.interconnect = interconnect
             eng.cache.interconnect = interconnect
 
@@ -461,10 +557,11 @@ def run_sweep_case(
     if trace_cfg.enabled:
         trace_writer = EventTraceWriter(trace_cfg)
     sim = Simulator(
-        [npu0, npu1],
+        list(engines.values()),
         pool,
         pd=PDConfig(
-            spawn_map={"npu-0": "npu-1"},
+            routing=routing,
+            engine_role=topo.engine_role,
             hold_kv_on_complete=preset.hold_kv_on_complete,
         ),
         log=SimLogger(SimLogConfig(enabled=False)),
@@ -500,7 +597,8 @@ def run_sweep_case(
     expected = {r.req_id for r in requests}
     decode_done = {
         r.req_id
-        for r in npu1.completed
+        for eid in topo.decode_ids
+        for r in engines[eid].completed
         if r.pd == RequestPD.DECODE and r.status == RequestStatus.COMPLETE
     }
     if decode_done != expected:
@@ -517,7 +615,9 @@ def run_sweep_case(
             wall_seconds=wall_seconds,
         )
 
-    for eng, is_prefill in ((npu0, True), (npu1, False)):
+    for eid in topo.prefill_ids + topo.decode_ids:
+        eng = engines[eid]
+        is_prefill = topo.engine_role[eid] == "prefill"
         tier_key = eng.local_memory
         mem = memories.get(tier_key)
         if mem is None:
@@ -556,8 +656,8 @@ def run_sweep_case(
         preset.name,
         workload.seed,
         workload,
-        npu0,
-        npu1,
+        engines,
+        topo,
         steps=steps,
         finish_time=finish,
         wall_seconds=wall_seconds,
@@ -586,6 +686,9 @@ class SweepConfig:
     read_path: str | None = None
     pull_threshold: float = 1.0
     experiment_spec: str | None = None
+    num_prefill: int = 1
+    num_decode: int = 1
+    routing: str = "bijection"
 
 
 def _workload_config(cfg: SweepConfig, seed: int) -> WorkloadConfig:
@@ -727,11 +830,11 @@ def run_sweep(cfg: SweepConfig) -> list[SweepRow]:
     if cfg.drop_oversized:
         probe_workload = _workload_config(cfg, cfg.base_seed)
         probe_requests, _ = build_workload(probe_workload)
-        _, rejected = partition_by_hbm(probe_requests, resources.hbm_size)
+        _, rejected = partition_by_hbm(probe_requests, resources.hbm_size("npu-0"))
         if rejected:
             print(
                 f"drop-oversized: skipping {len(rejected)} requests with "
-                f"footprint > hbm={resources.hbm_size} slots "
+                f"footprint > hbm={resources.hbm_size('npu-0')} slots "
                 f"({sim_cfg.hbm_gib:g} GiB/engine) "
                 f"({len(probe_requests) - len(rejected)} admittable)",
                 flush=True,
@@ -968,6 +1071,24 @@ def main(argv: list[str] | None = None) -> None:
         help="Multiply trace timestamps (ms) to simulation seconds",
     )
     parser.add_argument(
+        "--prefill",
+        type=int,
+        default=1,
+        help="Number of prefill engines (xPyD)",
+    )
+    parser.add_argument(
+        "--decode",
+        type=int,
+        default=1,
+        help="Number of decode engines (xPyD)",
+    )
+    parser.add_argument(
+        "--routing",
+        default="bijection",
+        choices=["bijection", "round_robin", "hash"],
+        help="PD routing policy (proxy analogue)",
+    )
+    parser.add_argument(
         "--tokens-per-block",
         type=int,
         default=MOONCAKE_TOKENS_PER_BLOCK,
@@ -1010,6 +1131,9 @@ def main(argv: list[str] | None = None) -> None:
         read_path=args.read_path,
         pull_threshold=args.pull_threshold,
         experiment_spec=args.experiment_spec,
+        num_prefill=args.prefill,
+        num_decode=args.decode,
+        routing=args.routing,
     )
 
     rows = run_sweep(cfg)

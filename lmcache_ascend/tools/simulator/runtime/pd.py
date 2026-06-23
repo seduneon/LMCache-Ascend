@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Union
 
+from simulator.model.layout import EngineRole
+from simulator.policy.registry import PolicyContext
+from simulator.policy.routing import ROUTING, RoutingPolicy
+
 if TYPE_CHECKING:
     from simulator.runtime.engine import Engine
 
@@ -12,33 +16,49 @@ class PDConfig:
     """Read-mode PD: late decode spawn, D pre-alloc + WAITING_REMOTE_KV, deferred P release."""
 
     mode: Literal["read"] = "read"
+    routing: RoutingPolicy | None = None
     spawn_map: dict[str, str] = field(default_factory=dict)
+    engine_role: dict[str, EngineRole] = field(default_factory=dict)
     hold_kv_on_complete: bool | None = None
+
+    def resolved_routing(self) -> RoutingPolicy:
+        if self.routing is not None:
+            return self.routing
+        if self.spawn_map:
+            return ROUTING.create(
+                "bijection", PolicyContext(params={"map": self.spawn_map})
+            )
+        raise ValueError("PDConfig requires routing or spawn_map")
+
+    def resolved_engine_role(self, engines: dict[str, Engine]) -> dict[str, EngineRole]:
+        if self.engine_role:
+            return dict(self.engine_role)
+        if self.spawn_map:
+            roles: dict[str, EngineRole] = {
+                prefill_id: "prefill" for prefill_id in self.spawn_map
+            }
+            for decode_id in set(self.spawn_map.values()):
+                roles[decode_id] = "decode"
+            return roles
+        raise ValueError("PDConfig requires engine_role or spawn_map")
 
     def validate_and_apply(self, engines: dict[str, Engine]) -> None:
         if self.mode != "read":
             raise NotImplementedError(f"PD mode {self.mode!r} is not implemented")
 
-        for prefill_id, decode_id in self.spawn_map.items():
-            if prefill_id not in engines:
-                raise ValueError(f"PD spawn_map prefill engine {prefill_id!r} not found")
-            if decode_id not in engines:
-                raise ValueError(f"PD spawn_map decode engine {decode_id!r} not found")
+        roles = self.resolved_engine_role(engines)
+        hold = True if self.hold_kv_on_complete is None else self.hold_kv_on_complete
 
-            prefill = engines[prefill_id]
-            decode = engines[decode_id]
-            if not decode.policies.schedule.pull_sources:
-                raise ValueError(
-                    f"decode engine {decode_id!r} needs pull_sources for PD read mode"
-                )
-
-            hold = (
-                True
-                if self.hold_kv_on_complete is None
-                else self.hold_kv_on_complete
-            )
-            prefill.hold_kv_on_complete = hold
-            decode.remote_kv_wait = True
+        for eng_id, eng in engines.items():
+            role = roles.get(eng_id)
+            if role == "prefill":
+                eng.hold_kv_on_complete = hold
+            elif role == "decode":
+                if not eng.policies.schedule.pull_sources:
+                    raise ValueError(
+                        f"decode engine {eng_id!r} needs pull_sources for PD read mode"
+                    )
+                eng.remote_kv_wait = True
 
 
 # --- merged from events.py (cross-engine simulation events) ---
