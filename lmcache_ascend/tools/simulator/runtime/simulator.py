@@ -4,6 +4,7 @@ import time
 
 from .engine import Engine
 from .pd import DecodeSpawn, KvRelease, PDConfig, SimEvent
+from .roles import ROLES, EngineRoleProfile
 from .plan import BatchPlan
 from simulator.core.request import Request, RequestPD, RequestStatus
 from simulator.observability.event_trace import EventTraceWriter, trace_config_from_env
@@ -28,8 +29,12 @@ class Simulator:
         self.pool = pool
         self.pd = pd
         self.routing = pd.resolved_routing() if pd is not None else None
+        self.role_profiles: dict[str, EngineRoleProfile] = {}
         if pd is not None:
             pd.validate_and_apply(self.engines)
+            for eng_id, role in pd.resolved_engine_role(self.engines).items():
+                if role is not None:
+                    self.role_profiles[eng_id] = ROLES.create(role)
         self.now = 0.0
         self.log = log
         self.progress = progress
@@ -212,24 +217,14 @@ class Simulator:
             )
 
     def _events_from_commit(self, eng_id: str, finished) -> list[SimEvent]:
+        profile = self.role_profiles.get(eng_id)
+        if profile is None:
+            return []
         events: list[SimEvent] = []
         for req in finished:
-            if req.pd == RequestPD.DECODE and req.prefill_engine_id is not None:
-                events.append(
-                    KvRelease(req_id=req.req_id, prefill_engine_id=req.prefill_engine_id)
-                )
-            if self.routing is None or req.pd != RequestPD.PREFILL:
-                continue
-            decode_id = self.routing.route(req, eng_id)
-            events.append(
-                DecodeSpawn(
-                    req_id=req.req_id,
-                    arrival_time=self.now,
-                    prefix_blocks=tuple(req.block_hashes[: req.prefix_block_count]),
-                    max_output_blocks=req.max_output_blocks,
-                    prefix_block_count=req.prefix_block_count,
-                    prefill_engine_id=eng_id,
-                    decode_engine_id=decode_id,
+            events.extend(
+                profile.events_on_commit(
+                    req, eng_id, routing=self.routing, now=self.now
                 )
             )
         return events

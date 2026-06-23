@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from simulator.runtime.plan import EntryPlan, WorkEntry
-from simulator.policy.eviction import FIFOEviction, LRUEviction, RandomEviction
+from simulator.policy.eviction import (
+    CostAwareEviction,
+    FIFOEviction,
+    LRUEviction,
+    RandomEviction,
+)
 from simulator.policy.schedule import local_satisfied
 from simulator.policy.config import placement_edges
 from simulator.policy.placement import HBMOnly, TieredPlacement
@@ -1245,6 +1250,67 @@ def test_routing_registry() -> None:
     assert h.route(req, "p0") in ("d0", "d1")
 
 
+def test_engine_role_profiles() -> None:
+    from simulator.core.request import Request, RequestPD, RequestStatus
+    from simulator.policy.registry import PolicyContext
+    from simulator.policy.routing import ROUTING
+    from simulator.runtime.pd import DecodeSpawn, KvRelease
+    from simulator.runtime.roles import ROLES
+
+    assert ROLES.names() == ["decode", "prefill"]
+
+    prefill = ROLES.create("prefill")
+    decode = ROLES.create("decode")
+    assert prefill.pull_mode == "compute_only"
+    assert prefill.remote_kv_wait is False
+    assert prefill.wants_pull_sources is False
+    assert decode.pull_mode == "ordered_pull"
+    assert decode.remote_kv_wait is True
+    assert decode.wants_pull_sources is True
+
+    routing = ROUTING.create("bijection", PolicyContext(params={"map": {"p0": "d0"}}))
+    prefill_req = Request(
+        "r1",
+        0.0,
+        ["a", "b"],
+        RequestPD.PREFILL,
+        RequestStatus.COMPLETE,
+        max_output_blocks=2,
+        prefix_block_count=2,
+    )
+    events = prefill.events_on_commit(
+        prefill_req, "p0", routing=routing, now=1.5
+    )
+    assert len(events) == 1
+    spawn = events[0]
+    assert isinstance(spawn, DecodeSpawn)
+    assert spawn.req_id == "r1"
+    assert spawn.arrival_time == 1.5
+    assert spawn.prefix_blocks == ("a", "b")
+    assert spawn.prefill_engine_id == "p0"
+    assert spawn.decode_engine_id == "d0"
+
+    decode_req = Request(
+        "r1",
+        0.0,
+        ["a", "b"],
+        RequestPD.DECODE,
+        RequestStatus.COMPLETE,
+        prefill_engine_id="p0",
+    )
+    assert prefill.events_on_commit(decode_req, "p0", routing=routing, now=1.5) == []
+
+    release_events = decode.events_on_commit(
+        decode_req, "d0", routing=routing, now=2.0
+    )
+    assert len(release_events) == 1
+    release = release_events[0]
+    assert isinstance(release, KvRelease)
+    assert release.req_id == "r1"
+    assert release.prefill_engine_id == "p0"
+    assert decode.events_on_commit(prefill_req, "d0", routing=routing, now=2.0) == []
+
+
 def test_xpyd_2p2d_smoke() -> None:
     from simulator.bench.presets import PRESETS, build_engines
     from simulator.bench.sweep import SimConfig
@@ -1293,4 +1359,112 @@ def test_xpyd_2p2d_smoke() -> None:
         mem = eng.memories[eng.local_memory]
         held = sum(1 for block in mem.list() if block.holders)
         assert held == 0, f"{eng.local_memory} leaked held_blocks={held}"
+
+
+def test_cost_aware_eviction_scores_by_reconstruction_cost() -> None:
+    from simulator.observability.estimate import BlockCostEstimate
+
+    class MockCost:
+        def estimate_block(self, pull_sources, block_hash, *, req):
+            del pull_sources, req
+            costs = {"cheap": 1.0, "mid": 5.0, "dear": 20.0}
+            return BlockCostEstimate(pull={"src": costs[block_hash]}, compute=100.0)
+
+    mem = Memory(size=4, name="hbm")
+    for name in ("dear", "cheap", "mid"):
+        mem.append(KVBlock(name, BlockState.RESIDENT))
+    req = Request("r1", 0.0, ["cheap"], RequestPD.DECODE, RequestStatus.RUNNING)
+    policy = CostAwareEviction()
+    victims = policy.pick_victims(
+        mem,
+        1,
+        exclude=set(),
+        cost_ctx=MockCost(),
+        pull_sources=["src"],
+        req=req,
+    )
+    assert victims[0].hash == "cheap"
+
+
+def test_cost_aware_eviction_falls_back_to_lru() -> None:
+    mem = Memory(size=4, name="hbm")
+    old = KVBlock("a", BlockState.RESIDENT)
+    recent = KVBlock("b", BlockState.RESIDENT)
+    mem.append(old)
+    mem.append(recent)
+    mem.touch(old, 1.0)
+    mem.touch(recent, 9.0)
+    policy = CostAwareEviction()
+    victims = policy.pick_victims(mem, 1, exclude=set())
+    assert victims[0].hash == "a"
+
+
+def test_resource_registry_models() -> None:
+    from simulator.core.resource import QueueDiscipline
+    from simulator.core.resource_models import RESOURCE, build_bandwidth_resource
+
+    assert set(RESOURCE.names()) >= {"linear", "saturating", "fixed_latency_op"}
+    sat = build_bandwidth_resource(
+        "saturating",
+        base_speed=32.0,
+        max_concurrency=2,
+    )
+    sat.schedule()
+    sat.start()
+    assert sat.speed(1) == 32.0
+    sat.schedule()
+    sat.start()
+    assert sat.speed(2) == 16.0
+
+    fixed = build_bandwidth_resource(
+        "fixed_latency_op",
+        base_speed=8.0,
+        op_latency=0.5,
+        queue_discipline=QueueDiscipline.FIFO_TAIL,
+    )
+    fixed.schedule()
+    fixed.start()
+    assert fixed.queue_depth() == 0
+    fixed.schedule()
+    assert fixed.queue_depth() == 1
+    assert fixed.estimate_contention_works() >= 2
+
+
+def test_medium_models_opt_in_per_tier_resources() -> None:
+    from simulator.bench.presets import EngineBuildConfig, _transfer_links
+
+    memories = {
+        "npu-0:hbm": Memory(size=4, name="hbm"),
+        "npu-0:dram": Memory(size=8, name="dram"),
+    }
+    build_default = EngineBuildConfig(link_speed=32.0)
+    shared = BandwidthResource(base_speed=32.0)
+    default_links = _transfer_links(
+        memories,
+        ["npu-0:dram", "npu-0:hbm"],
+        build_default,
+        shared,
+    )
+    assert default_links["npu-0:dram"] is shared
+    assert default_links["npu-0:hbm"] is shared
+
+    build_opt_in = EngineBuildConfig(
+        link_speed=32.0,
+        medium_models={":dram": "saturating", ":hbm": "linear"},
+        medium_model_params={":dram": {"max_concurrency": 3}},
+    )
+    opt_links = _transfer_links(
+        memories,
+        ["npu-0:dram", "npu-0:hbm"],
+        build_opt_in,
+        shared,
+    )
+    assert opt_links["npu-0:dram"] is not shared
+    assert opt_links["npu-0:hbm"] is not shared
+    from simulator.core.resource import LinearShareResource
+    from simulator.core.resource_models import SaturatingResource
+
+    assert isinstance(opt_links["npu-0:dram"], SaturatingResource)
+    assert isinstance(opt_links["npu-0:hbm"], LinearShareResource)
+    assert opt_links["npu-0:dram"].max_concurrency == 3
 

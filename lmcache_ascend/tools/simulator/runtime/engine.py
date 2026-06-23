@@ -1,4 +1,9 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from .connector import TierCacheConnector
+from .engine_config import EngineLinks, WorkModel
 from simulator.policy.eviction import LRUEviction
 from .execute import BatchRunner
 from simulator.core.memory import KVBlock, Memory
@@ -9,6 +14,9 @@ from simulator.core.resource import BandwidthResource, ComputeResource
 from .scheduler import Scheduler
 from .tasks import TaskPool
 from simulator.model.tier import Tier, TierGraph
+
+if TYPE_CHECKING:
+    from simulator.observability.event_trace import EventTraceWriter
 
 
 def _merge_tier_graph(graph: TierGraph, memories: dict[str, Memory]) -> TierGraph:
@@ -33,6 +41,9 @@ class Engine:
         policies: EnginePolicies,
         compute_res: ComputeResource,
         bandwidth_res: BandwidthResource | None = None,
+        *,
+        work: WorkModel | None = None,
+        links: EngineLinks | None = None,
         transfer_links: dict[str, BandwidthResource] | None = None,
         write_links: dict[str, BandwidthResource] | None = None,
         work_per_block: float = 1.0,
@@ -48,7 +59,7 @@ class Engine:
         work_per_decode_req: float | None = None,
         sync_evict: bool = True,
         interconnect: BandwidthResource | None = None,
-        event_trace=None,
+        event_trace: EventTraceWriter | None = None,
     ):
         self.engine_id = engine_id
         self.pool = pool
@@ -58,30 +69,46 @@ class Engine:
             policies = EnginePolicies.with_graph(policies, merged_graph)
         self.policies = policies
         self.local_memory = policies.schedule.local_memory
-        self.compute_res = compute_res
-        self.bandwidth_res = bandwidth_res
         schedule = policies.schedule
-        if transfer_links is None and bandwidth_res is not None and schedule.pull_sources:
-            transfer_links = {src: bandwidth_res for src in schedule.pull_sources}
-        self.transfer_links = transfer_links or {}
-        self.write_links = write_links or {}
-        self.work_per_block = work_per_block
-        self.work_per_transfer = (
-            work_per_transfer if work_per_transfer is not None else work_per_block
-        )
-        self.work_per_store = (
-            work_per_store if work_per_store is not None else work_per_transfer
-        )
-        self.work_per_evict = work_per_evict if work_per_evict is not None else 0.0
+
+        if work is None:
+            work = WorkModel(
+                per_block=work_per_block,
+                per_transfer=work_per_transfer,
+                per_store=work_per_store,
+                per_evict=0.0 if work_per_evict is None else work_per_evict,
+                per_prefill_token=work_per_prefill_token,
+                per_decode_req=work_per_decode_req,
+            )
+        self._work = work
+        self.work_per_block = work.per_block
+        self.work_per_transfer = work.resolved_transfer()
+        self.work_per_store = work.resolved_store()
+        self.work_per_evict = work.per_evict
+        self.work_per_prefill_token = work.resolved_prefill_token()
+        self.work_per_decode_req = work.resolved_decode_req()
+
+        if links is None:
+            resolved_transfer = transfer_links
+            if resolved_transfer is None and bandwidth_res is not None and schedule.pull_sources:
+                resolved_transfer = {
+                    src: bandwidth_res for src in schedule.pull_sources
+                }
+            links = EngineLinks(
+                compute_res=compute_res,
+                bandwidth_res=bandwidth_res,
+                transfer_links=dict(resolved_transfer or {}),
+                write_links=dict(write_links or {}),
+                interconnect=interconnect,
+            )
+        self._links = links
+        self.compute_res = links.compute_res
+        self.bandwidth_res = links.bandwidth_res
+        self.transfer_links = links.transfer_links
+        self.write_links = links.write_links
+        self.interconnect = links.interconnect
         self.sync_evict = sync_evict
         self.block_size = block_size
-        self.work_per_prefill_token = (
-            work_per_prefill_token if work_per_prefill_token is not None else work_per_block
-        )
-        self.work_per_decode_req = (
-            work_per_decode_req if work_per_decode_req is not None else work_per_block
-        )
-        self.interconnect = interconnect
         self.event_trace = event_trace
         self._next_batch_id = 0
         if event_trace is not None:
@@ -108,13 +135,13 @@ class Engine:
             graph=merged_graph,
             lifecycle=policies.config.lifecycle,
             local_tier=self.local_memory,
-            compute_res=compute_res,
-            transfer_links=self.transfer_links,
-            write_links=self.write_links,
+            compute_res=links.compute_res,
+            transfer_links=links.transfer_links,
+            write_links=links.write_links,
             work_per_transfer=self.work_per_transfer,
             work_per_prefill_token=self.work_per_prefill_token,
             work_per_decode_req=self.work_per_decode_req,
-            interconnect=interconnect,
+            interconnect=links.interconnect,
             event_trace=event_trace,
         )
 
@@ -257,7 +284,7 @@ class Engine:
                 req.num_computed_blocks += advanced
 
             if req.num_computed_blocks >= req.blocks_target():
-                if req.pd == RequestPD.PREFILL and self.hold_kv_on_complete:
+                if req.is_prefill() and self.hold_kv_on_complete:
                     self.scheduler.finish_prefill_held(req, now=now)
                 else:
                     self.scheduler.finish_request(req, now=now)

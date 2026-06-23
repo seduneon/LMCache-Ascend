@@ -88,7 +88,12 @@ class SchedulePolicy:
         if actions is None:
             return None
         evicts = self.config.local_eviction.plan(
-            memories[self.local_memory], slots_needed(actions), set(block_hashes)
+            memories[self.local_memory],
+            slots_needed(actions),
+            set(block_hashes),
+            cost_ctx=cost_ctx,
+            pull_sources=self.pull_sources,
+            req=req,
         )
         if evicts is None:
             return None

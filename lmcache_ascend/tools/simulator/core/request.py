@@ -6,6 +6,7 @@ from typing import Iterable
 
 
 class RequestPD(StrEnum):
+    """Runtime request phase; use ``StrEnum`` (not ``Literal``) for trace ``.value``."""
     PREFILL = "prefill"
     DECODE = "decode"
 
@@ -116,9 +117,15 @@ class Request:
         return self.prefix_block_count + self.max_output_blocks
 
     def blocks_target(self) -> int:
-        if self.pd == RequestPD.PREFILL:
+        if self.is_prefill():
             return self.prefix_block_count
         return self.total_blocks()
+
+    def is_prefill(self) -> bool:
+        return self.pd == RequestPD.PREFILL
+
+    def is_decode(self) -> bool:
+        return self.pd == RequestPD.DECODE
 
     def is_prefill_chunk(self) -> bool:
         """vLLM: num_computed_tokens < prompt length (here: prefix blocks)."""

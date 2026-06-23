@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from simulator.observability.estimate import CostContext
 from simulator.policy.effects import EffectPolicy
 from simulator.policy.config import LifecycleSpec
@@ -12,6 +14,9 @@ from simulator.core.request import Request, request_owning_prefix_block
 from simulator.core.resource import BandwidthResource, ComputeResource
 from simulator.policy.schedule import SchedulePolicy
 from simulator.model.tier import TierGraph
+
+if TYPE_CHECKING:
+    from simulator.observability.event_trace import EventTraceWriter
 
 
 class TierCacheConnector:
@@ -33,7 +38,7 @@ class TierCacheConnector:
         work_per_prefill_token: float,
         work_per_decode_req: float,
         interconnect: BandwidthResource | None = None,
-        event_trace=None,
+        event_trace: EventTraceWriter | None = None,
     ):
         self.engine_id = engine_id
         self.event_trace = event_trace

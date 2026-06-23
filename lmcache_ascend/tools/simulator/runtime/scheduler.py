@@ -7,7 +7,7 @@ from simulator.policy.block_resolve import local_satisfied
 from simulator.core.kv_content import tier_has_block, tier_has_inflight
 from simulator.core.memory import Memory
 from .plan import EntryPlan, ScheduleResult, WorkEntry
-from simulator.core.request import Request, RequestPD, RequestStatus
+from simulator.core.request import Request, RequestStatus
 
 
 class Scheduler:
@@ -106,7 +106,7 @@ class Scheduler:
             if remaining <= 0:
                 return 0
             return min(remaining, token_budget)
-        if req.pd != RequestPD.DECODE:
+        if not req.is_decode():
             return 0
         remaining = (req.blocks_target() - req.num_computed_blocks) * self.block_size
         if remaining <= 0:
@@ -136,7 +136,7 @@ class Scheduler:
     def _needs_remote_kv(self, req: Request) -> bool:
         if not self.remote_kv_wait:
             return False
-        if req.pd != RequestPD.DECODE:
+        if not req.is_decode():
             return False
         if req.status == RequestStatus.WAITING_REMOTE_KV:
             return False
@@ -219,7 +219,7 @@ class Scheduler:
         """Prefill compute done; keep KV resident until decode acknowledges transfer."""
         if req not in self.running:
             return
-        assert req.pd == RequestPD.PREFILL
+        assert req.is_prefill()
         req.status = RequestStatus.COMPLETE
         req.kv_held_for_transfer = True
         if now is not None:
@@ -341,7 +341,7 @@ class Scheduler:
     def _blocks_for_running(self, req: Request, num_new_tokens: int) -> list[str]:
         if req.is_prefill_chunk():
             return self._blocks_for_prefill_chunk(req, num_new_tokens)
-        if req.pd != RequestPD.DECODE:
+        if not req.is_decode():
             return []
         if req.num_computed_blocks >= req.blocks_target():
             return []

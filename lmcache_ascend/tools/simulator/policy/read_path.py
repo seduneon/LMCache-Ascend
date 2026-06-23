@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from simulator.observability.estimate import BlockCostEstimate, CostContext
 from simulator.core.memory import Memory
@@ -353,3 +353,9 @@ def _min_cost_with_wait(_ctx: PolicyContext) -> ReadPathStrategy:
 def _threshold(ctx: PolicyContext) -> ReadPathStrategy:
     ratio = float(ctx.params.get("threshold_ratio", 1.0))
     return ThresholdStrategy(threshold_ratio=ratio)
+
+
+# Keep ``ReadPathKind`` in sync with registered strategy names (fail fast on drift).
+assert frozenset(READ_PATH.names()) == frozenset(
+    ("compute_only", "min_cost", "min_cost_with_wait", "ordered_pull", "threshold")
+)

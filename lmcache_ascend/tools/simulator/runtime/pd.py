@@ -49,16 +49,13 @@ class PDConfig:
         roles = self.resolved_engine_role(engines)
         hold = True if self.hold_kv_on_complete is None else self.hold_kv_on_complete
 
+        from .roles import ROLES
+
         for eng_id, eng in engines.items():
             role = roles.get(eng_id)
-            if role == "prefill":
-                eng.hold_kv_on_complete = hold
-            elif role == "decode":
-                if not eng.policies.schedule.pull_sources:
-                    raise ValueError(
-                        f"decode engine {eng_id!r} needs pull_sources for PD read mode"
-                    )
-                eng.remote_kv_wait = True
+            if role is None:
+                continue
+            ROLES.create(role).apply(eng, hold=hold)
 
 
 # --- merged from events.py (cross-engine simulation events) ---

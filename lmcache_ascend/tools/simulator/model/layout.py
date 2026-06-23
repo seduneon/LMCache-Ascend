@@ -17,6 +17,10 @@ from simulator.policy.registry import PolicyContext
 from simulator.core.memory import Memory
 from .tier import Tier, TierGraph, TierRole
 
+# Typing convention: ``Literal`` for config/registry-key strings (``EngineRole``,
+# ``pull_mode``, topology kinds).  Runtime request phase uses ``RequestPD``
+# (``StrEnum``) in ``simulator.core.request`` — enums when you need members,
+# iteration, or ``.value`` in traces.
 EngineRole = Literal["prefill", "decode"]
 
 DEFAULT_PREFILL_IDS: tuple[str, ...] = ("npu-0",)

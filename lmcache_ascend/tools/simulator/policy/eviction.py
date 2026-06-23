@@ -23,22 +23,53 @@ def _evictable_candidates(memory: Memory, exclude: set[str]) -> list[KVBlock]:
 
 
 class EvictionPolicy(ABC):
-    def score(self, block: KVBlock, *, now: float = 0.0) -> float:
+    def score(
+        self,
+        block: KVBlock,
+        *,
+        now: float = 0.0,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
+    ) -> float:
         """Lower score = evict first."""
-        del now
+        del now, cost_ctx, pull_sources, req
         return block.last_touch
 
     @abstractmethod
-    def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+    def pick_victims(
+        self,
+        memory: Memory,
+        count: int,
+        exclude: set[str],
+        *,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
+    ) -> list[KVBlock]:
         pass
 
     def plan(
-        self, local: Memory, slots_needed: int, exclude: set[str]
+        self,
+        local: Memory,
+        slots_needed: int,
+        exclude: set[str],
+        *,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
     ) -> list[KVBlock] | None:
         deficit = slots_needed - local.free_size()
         if deficit <= 0:
             return []
-        evicts = self.pick_victims(local, deficit, exclude)
+        evicts = self.pick_victims(
+            local,
+            deficit,
+            exclude,
+            cost_ctx=cost_ctx,
+            pull_sources=pull_sources,
+            req=req,
+        )
         if len(evicts) < deficit:
             return None
         return evicts
@@ -51,7 +82,17 @@ class LRUEviction(EvictionPolicy):
         del now
         return block.last_touch
 
-    def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+    def pick_victims(
+        self,
+        memory: Memory,
+        count: int,
+        exclude: set[str],
+        *,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
+    ) -> list[KVBlock]:
+        del cost_ctx, pull_sources, req
         candidates = _evictable_candidates(memory, exclude)
         candidates.sort(key=lambda block: self.score(block))
         return candidates[:count]
@@ -64,7 +105,17 @@ class LFUEviction(EvictionPolicy):
         del now
         return float(block.access_count)
 
-    def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+    def pick_victims(
+        self,
+        memory: Memory,
+        count: int,
+        exclude: set[str],
+        *,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
+    ) -> list[KVBlock]:
+        del cost_ctx, pull_sources, req
         candidates = _evictable_candidates(memory, exclude)
         candidates.sort(key=lambda block: self.score(block))
         return candidates[:count]
@@ -77,7 +128,17 @@ class FIFOEviction(EvictionPolicy):
         del now
         return float(block.insert_seq)
 
-    def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+    def pick_victims(
+        self,
+        memory: Memory,
+        count: int,
+        exclude: set[str],
+        *,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
+    ) -> list[KVBlock]:
+        del cost_ctx, pull_sources, req
         candidates = _evictable_candidates(memory, exclude)
         candidates.sort(key=lambda block: self.score(block))
         return candidates[:count]
@@ -89,11 +150,64 @@ class RandomEviction(EvictionPolicy):
     def __init__(self, seed: int = 0):
         self._rng = random.Random(seed)
 
-    def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+    def pick_victims(
+        self,
+        memory: Memory,
+        count: int,
+        exclude: set[str],
+        *,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
+    ) -> list[KVBlock]:
+        del cost_ctx, pull_sources, req
         candidates = _evictable_candidates(memory, exclude)
         if len(candidates) <= count:
             return candidates
         return self._rng.sample(candidates, count)
+
+
+class CostAwareEviction(LRUEviction):
+    """Evict blocks cheapest to reconstruct (pull or recompute); LRU fallback."""
+
+    def score(
+        self,
+        block: KVBlock,
+        *,
+        now: float = 0.0,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
+    ) -> float:
+        if cost_ctx is None or req is None:
+            return block.last_touch
+        del now
+        estimate = cost_ctx.estimate_block(
+            list(pull_sources or []),
+            block.hash,
+            req=req,
+        )
+        if estimate.pull:
+            return min(estimate.pull.values())
+        return estimate.compute
+
+    def pick_victims(
+        self,
+        memory: Memory,
+        count: int,
+        exclude: set[str],
+        *,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
+    ) -> list[KVBlock]:
+        candidates = _evictable_candidates(memory, exclude)
+        candidates.sort(
+            key=lambda block: self.score(
+                block, cost_ctx=cost_ctx, pull_sources=pull_sources, req=req
+            )
+        )
+        return candidates[:count]
 
 
 class CostPrefixEviction(EvictionPolicy):
@@ -103,10 +217,25 @@ class CostPrefixEviction(EvictionPolicy):
         del now
         return block.access_count * 1_000_000.0 - float(block.insert_seq)
 
-    def pick_victims(self, memory: Memory, count: int, exclude: set[str]) -> list[KVBlock]:
+    def pick_victims(
+        self,
+        memory: Memory,
+        count: int,
+        exclude: set[str],
+        *,
+        cost_ctx=None,
+        pull_sources: list[str] | None = None,
+        req=None,
+    ) -> list[KVBlock]:
+        del cost_ctx, pull_sources, req
         candidates = _evictable_candidates(memory, exclude)
         candidates.sort(key=lambda block: self.score(block))
         return candidates[:count]
+
+
+@EVICTION.register("cost_aware")
+def _cost_aware(_ctx: PolicyContext) -> EvictionPolicy:
+    return CostAwareEviction()
 
 
 @EVICTION.register("lru")

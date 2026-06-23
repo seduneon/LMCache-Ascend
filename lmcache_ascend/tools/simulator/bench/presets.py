@@ -6,11 +6,13 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from simulator.runtime.engine import Engine
+from simulator.runtime.engine_config import EngineLinks, WorkModel
 from simulator.policy.config import EngineConfig, LifecycleSpec, PlacementSpec, build_placement_spec
 from simulator.core.memory import Memory
 from simulator.policy.policies import EnginePolicies
 from simulator.core.request import Request
 from simulator.core.resource import BandwidthResource, ComputeResource
+from simulator.core.resource_models import build_bandwidth_resource, medium_resource_kind
 from simulator.runtime.tasks import TaskPool
 from simulator.model.layout import (
     DEFAULT_DECODE_IDS,
@@ -25,6 +27,7 @@ from simulator.model.layout import (
 )
 from simulator.policy.registry import PolicyContext
 from simulator.policy.routing import ROUTING, RoutingPolicy
+from simulator.runtime.roles import ROLES
 
 
 @dataclass(frozen=True)
@@ -203,6 +206,20 @@ PRESETS: dict[str, PresetSpec] = {
         decode_retain_prefix_cache=True,
         eviction="lfu",
     ),
+    "evict_cost_aware": PresetSpec(
+        name="evict_cost_aware",
+        description=(
+            "LMCache PD: same as evict_lru but cost-aware eviction on all tiers"
+        ),
+        topology="hbm_dram",
+        decode_pull=("npu-0:dram",),
+        mirror_tiers=("npu-0:dram",),
+        mirror_on_forward=False,
+        store_on_complete=("npu-0:dram",),
+        hold_kv_on_complete=False,
+        decode_retain_prefix_cache=True,
+        eviction="cost_aware",
+    ),
 }
 
 EVICTION_PRESET_NAMES: tuple[str, ...] = (
@@ -210,6 +227,7 @@ EVICTION_PRESET_NAMES: tuple[str, ...] = (
     "evict_fifo",
     "evict_random",
     "evict_lfu",
+    "evict_cost_aware",
 )
 
 DEFAULT_PRESET_NAMES: tuple[str, ...] = (
@@ -231,14 +249,76 @@ class EngineBuildConfig:
     max_num_seqs: int = 12
     max_num_batched_tokens: int = 24
     resources: SimResources = field(default_factory=SimResources.default)
+    medium_models: dict[str, str] | None = None
+    medium_model_params: dict[str, dict] = field(default_factory=dict)
+
+
+def _medium_kind_for_tier(
+    tier_key: str,
+    medium_models: dict[str, str] | None,
+) -> str | None:
+    if medium_models is None:
+        return None
+    if tier_key in medium_models:
+        return medium_models[tier_key]
+    suffix = tier_key.rsplit(":", 1)[-1]
+    if suffix in medium_models:
+        return medium_models[suffix]
+    colon_suffix = f":{suffix}"
+    if colon_suffix in medium_models:
+        return medium_models[colon_suffix]
+    return medium_resource_kind(tier_key)
+
+
+def _params_for_tier(
+    tier_key: str,
+    medium_model_params: dict[str, dict],
+) -> dict:
+    suffix = tier_key.rsplit(":", 1)[-1]
+    for key in (tier_key, suffix, f":{suffix}"):
+        if key in medium_model_params:
+            return dict(medium_model_params[key])
+    return {}
+
+
+def _tier_bandwidth(
+    tier_key: str,
+    build: EngineBuildConfig,
+    *,
+    base_speed: float,
+    shared: BandwidthResource | None = None,
+) -> BandwidthResource:
+    kind = _medium_kind_for_tier(tier_key, build.medium_models)
+    if kind is None:
+        if shared is not None:
+            return shared
+        return BandwidthResource(base_speed=base_speed, latency=build.link_latency)
+    params = _params_for_tier(tier_key, build.medium_model_params)
+    return build_bandwidth_resource(
+        kind,
+        base_speed=base_speed,
+        latency=build.link_latency,
+        **params,
+    )
 
 
 def _transfer_links(
     memories: dict[str, Memory],
     pull_sources: list[str],
-    link: BandwidthResource,
+    build: EngineBuildConfig,
+    shared_link: BandwidthResource | None = None,
 ) -> dict[str, BandwidthResource]:
-    return {src: link for src in pull_sources if src in memories}
+    if build.medium_models is None:
+        link = shared_link or BandwidthResource(
+            base_speed=build.link_speed,
+            latency=build.link_latency,
+        )
+        return {src: link for src in pull_sources if src in memories}
+    return {
+        src: _tier_bandwidth(src, build, base_speed=build.link_speed)
+        for src in pull_sources
+        if src in memories
+    }
 
 
 def _write_links(
@@ -247,9 +327,10 @@ def _write_links(
 ) -> dict[str, BandwidthResource]:
     links: dict[str, BandwidthResource] = {}
     if "npu-0:ssd" in memories:
-        links["npu-0:ssd"] = BandwidthResource(
+        links["npu-0:ssd"] = _tier_bandwidth(
+            "npu-0:ssd",
+            cfg,
             base_speed=cfg.ssd_write_speed,
-            latency=cfg.link_latency,
         )
     return links
 
@@ -293,27 +374,36 @@ def _make_engine(
     remote_kv_wait: bool = False,
 ) -> Engine:
     pull_sources = list(policies.schedule.config.pull_sources)
-    kwargs: dict = {
-        "engine_id": engine_id,
-        "requests": requests,
-        "pool": pool,
-        "memories": topo.memories,
-        "policies": policies,
-        "compute_res": compute,
-        "work_per_block": build.work_per_block,
-        "max_num_seqs": build.max_num_seqs,
-        "max_num_batched_tokens": build.max_num_batched_tokens,
-        "enable_chunked_prefill": True,
-    }
+    work = WorkModel(
+        per_block=build.work_per_block,
+        per_transfer=build.work_per_transfer if remote_kv_wait else None,
+        per_store=build.work_per_transfer if not remote_kv_wait else None,
+    )
     if remote_kv_wait:
-        kwargs["bandwidth_res"] = link
-        kwargs["transfer_links"] = _transfer_links(topo.memories, pull_sources, link)
-        kwargs["work_per_transfer"] = build.work_per_transfer
-        kwargs["remote_kv_wait"] = True
+        links = EngineLinks(
+            compute_res=compute,
+            bandwidth_res=link,
+            transfer_links=_transfer_links(topo.memories, pull_sources, build, link),
+        )
     else:
-        kwargs["write_links"] = _write_links(topo.memories, build)
-        kwargs["work_per_store"] = build.work_per_transfer
-    return Engine(**kwargs)
+        links = EngineLinks(
+            compute_res=compute,
+            write_links=_write_links(topo.memories, build),
+        )
+    return Engine(
+        engine_id=engine_id,
+        requests=requests,
+        pool=pool,
+        memories=topo.memories,
+        policies=policies,
+        compute_res=compute,
+        work=work,
+        links=links,
+        max_num_seqs=build.max_num_seqs,
+        max_num_batched_tokens=build.max_num_batched_tokens,
+        enable_chunked_prefill=True,
+        remote_kv_wait=remote_kv_wait,
+    )
 
 
 def build_engines(
@@ -345,53 +435,49 @@ def build_engines(
     for index, req in enumerate(requests):
         prefill_buckets[topo.prefill_ids[index % len(topo.prefill_ids)]].append(req)
 
-    for prefill_id in topo.prefill_ids:
-        prefill_cfg = EngineConfig(
-            engine_id=prefill_id,
-            local_tier=topo.local_tier[prefill_id],
-            pull_mode="compute_only",
-            placement=_placement_spec(spec),
-            lifecycle=LifecycleSpec(
-                hold_kv_on_complete=spec.hold_kv_on_complete,
-                retain_prefix_cache=spec.prefill_retain_prefix_cache,
-                store_on_complete=spec.store_on_complete,
-            ),
-        )
-        engines[prefill_id] = _make_engine(
-            engine_id=prefill_id,
-            requests=prefill_buckets[prefill_id],
-            pool=pool,
-            topo=topo,
-            policies=EnginePolicies.from_config(prefill_cfg, topo.graph),
-            build=build,
-            compute=compute,
-            link=link,
-        )
+    for role_name, engine_ids in (
+        ("prefill", topo.prefill_ids),
+        ("decode", topo.decode_ids),
+    ):
+        profile = ROLES.create(role_name)
+        for engine_id in engine_ids:
+            if role_name == "prefill":
+                lifecycle = LifecycleSpec(
+                    hold_kv_on_complete=spec.hold_kv_on_complete,
+                    retain_prefix_cache=spec.prefill_retain_prefix_cache,
+                    store_on_complete=spec.store_on_complete,
+                )
+                engine_requests = prefill_buckets[engine_id]
+            else:
+                lifecycle = LifecycleSpec(
+                    retain_prefix_cache=spec.decode_retain_prefix_cache,
+                )
+                engine_requests = []
 
-    for decode_id in topo.decode_ids:
-        decode_cfg = EngineConfig(
-            engine_id=decode_id,
-            local_tier=topo.local_tier[decode_id],
-            pull_sources=topo.decode_pull_sources(spec.decode_pull),
-            pull_mode="ordered_pull",
-            read_path_name=spec.decode_read_path,
-            read_path_params=spec.decode_read_path_params,
-            placement=_placement_spec(spec),
-            lifecycle=LifecycleSpec(
-                retain_prefix_cache=spec.decode_retain_prefix_cache,
-            ),
-        )
-        engines[decode_id] = _make_engine(
-            engine_id=decode_id,
-            requests=[],
-            pool=pool,
-            topo=topo,
-            policies=EnginePolicies.from_config(decode_cfg, topo.graph),
-            build=build,
-            compute=compute,
-            link=link,
-            remote_kv_wait=True,
-        )
+            cfg_kwargs: dict = {
+                "engine_id": engine_id,
+                "local_tier": topo.local_tier[engine_id],
+                "pull_mode": profile.pull_mode,
+                "placement": _placement_spec(spec),
+                "lifecycle": lifecycle,
+            }
+            if profile.wants_pull_sources:
+                cfg_kwargs["pull_sources"] = topo.decode_pull_sources(spec.decode_pull)
+                cfg_kwargs["read_path_name"] = spec.decode_read_path
+                cfg_kwargs["read_path_params"] = spec.decode_read_path_params
+
+            engine_cfg = EngineConfig(**cfg_kwargs)
+            engines[engine_id] = _make_engine(
+                engine_id=engine_id,
+                requests=engine_requests,
+                pool=pool,
+                topo=topo,
+                policies=EnginePolicies.from_config(engine_cfg, topo.graph),
+                build=build,
+                compute=compute,
+                link=link,
+                remote_kv_wait=profile.remote_kv_wait,
+            )
 
     params = dict(routing_params or {})
     if routing_name == "bijection" and "map" not in params and "spawn_map" not in params:

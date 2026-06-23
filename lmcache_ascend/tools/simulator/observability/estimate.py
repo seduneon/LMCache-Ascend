@@ -8,7 +8,7 @@ from simulator.core.kv_content import storage_key, tier_has_block, tier_has_infl
 from simulator.core.memory import Memory
 from simulator.runtime.plan import BatchPlan, WorkEntry
 from simulator.core.request import Request, RequestPD
-from simulator.core.resource import BandwidthResource, ComputeResource, Resource
+from simulator.core.resource import BandwidthResource, ComputeResource, QueueDiscipline, Resource
 from simulator.runtime.tasks import TaskStatus
 
 
@@ -122,11 +122,26 @@ class CostContext:
         work = self.work_per_transfer * transfer_work(
             src_mem, req, [block_hash]
         )
-        queued = link.queued_load() + 1
-        pull_time = link.time_for(work, works=queued)
+        if hasattr(link, "estimate_contention_works"):
+            queued = link.estimate_contention_works()
+        else:
+            queued = link.queued_load() + 1
+        if getattr(link, "queue_discipline", None) == QueueDiscipline.FIFO_TAIL:
+            pull_time = link.latency + work / max(link.speed(1), 1e-12) * queued
+        else:
+            pull_time = link.time_for(work, works=queued)
         if self.interconnect is not None:
-            ic_queued = self.interconnect.queued_load() + 1
-            pull_time += self.interconnect.time_for(work, works=ic_queued)
+            ic = self.interconnect
+            if hasattr(ic, "estimate_contention_works"):
+                ic_queued = ic.estimate_contention_works()
+            elif getattr(ic, "queue_discipline", None) == QueueDiscipline.FIFO_TAIL:
+                ic_queued = ic.queue_position()
+            else:
+                ic_queued = ic.queued_load() + 1
+            if getattr(ic, "queue_discipline", None) == QueueDiscipline.FIFO_TAIL:
+                pull_time += ic.latency + work / max(ic.speed(1), 1e-12) * ic_queued
+            else:
+                pull_time += ic.time_for(work, works=ic_queued)
         return pull_time
 
     def estimate_compute(self, req: Request, block_hash: str) -> float:

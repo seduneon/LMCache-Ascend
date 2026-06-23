@@ -6,7 +6,7 @@ from typing import Literal
 
 from simulator.core.memory import Memory
 from simulator.runtime.plan import BlockAction
-from simulator.core.request import Request, RequestPD
+from simulator.core.request import Request
 
 _LOCAL = Literal["local"]
 BlockResolution = BlockAction | _LOCAL | None
@@ -24,7 +24,7 @@ def pull_sources_for_request(
     req: Request | None,
 ) -> list[str]:
     """Prefer the paired prefill HBM for PD decode; keep downstream tier order."""
-    if req is None or req.pd != RequestPD.DECODE or not req.prefill_engine_id:
+    if req is None or not req.is_decode() or not req.prefill_engine_id:
         return pull_sources
     preferred = f"{req.prefill_engine_id}:hbm"
     if preferred not in pull_sources:
@@ -34,7 +34,7 @@ def pull_sources_for_request(
 
 def skip_foreign_prefill_wait(req: Request | None, src_key: str) -> bool:
     """Do not wait on another prefill engine's HBM in-flight reservation."""
-    if req is None or req.pd != RequestPD.DECODE or not req.prefill_engine_id:
+    if req is None or not req.is_decode() or not req.prefill_engine_id:
         return False
     if not src_key.endswith(":hbm"):
         return False
