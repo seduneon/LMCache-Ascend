@@ -3,21 +3,12 @@
 Lifecycle:
   arrive → admit (scheduler) → plan (schedule) → enrich (effects) → execute → commit
 
-Public batch API:
-  Engine.try_schedule_and_execute(now) → BatchPlan | None
-  Simulator applies completed batches via Engine.apply_plan
-
-Layers:
-  simulator    — event loop, PD dispatch
-  engine       — orchestration; ``EnginePolicies`` bundle
-  scheduler    — RUNNING / WAITING batching (admit)
-  schedule     — block resolution + local-tier eviction at admit time
-  effects      — placement, retention, plan-time store/spill expansion
-  policies     — ``EnginePolicies`` factories + ``enrich_entry_plan``
-  presets      — data-driven ``PRESETS`` + ``build_pd_engines``
-  topology     — tier memory layout for PD experiments
-  execute      — ``BatchRunner``: reservations, tasks, effect callbacks
-  plan         — ``BatchPlan``, ``EntryPlan``, ``StoreOp``
-  placement / retention / eviction — effect implementations
-  memory, tasks, resource, request — domain types
+Package layout:
+  core          — memory, request, resource, kv_content
+  model         — tier graph, capacity, topology layout
+  policy        — eviction, retention, placement, read-path, schedule, effects
+  runtime       — plan, tasks, scheduler, execute, engine, simulator
+  bench         — presets, sweep, workload, traces
+  observability — metrics, tracing, logging, analysis
+  tests         — unit, critical, stress runners
 """

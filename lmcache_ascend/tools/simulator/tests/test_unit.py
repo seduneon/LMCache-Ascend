@@ -2,27 +2,27 @@
 
 from __future__ import annotations
 
-from simulator.plan import EntryPlan, WorkEntry
-from simulator.eviction import FIFOEviction, LRUEviction, RandomEviction
-from simulator.schedule import local_satisfied
-from simulator.engine_config import placement_edges
-from simulator.placement import HBMOnly, TieredPlacement
-from simulator.tier import graph_from_memories
-from simulator.retention import (
+from simulator.runtime.plan import EntryPlan, WorkEntry
+from simulator.policy.eviction import FIFOEviction, LRUEviction, RandomEviction
+from simulator.policy.schedule import local_satisfied
+from simulator.policy.config import placement_edges
+from simulator.policy.placement import HBMOnly, TieredPlacement
+from simulator.model.tier import graph_from_memories
+from simulator.policy.retention import (
     ConsumeOnPull,
     GlobalCopyCap,
     SingleCopyPerTier,
     UnboundedRetention,
 )
-from simulator.kv_content import (
+from simulator.core.kv_content import (
     ContentKey,
     content_id,
     storage_key,
     tier_has_block,
     transfer_block_count,
 )
-from simulator.memory import BlockState, KVBlock, Memory, collect_content_copies
-from simulator.tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
+from simulator.core.memory import BlockState, KVBlock, Memory, collect_content_copies
+from simulator.runtime.tasks import BatchLoadTask, ForwardTask, StoreTask, TaskPool, TaskStatus
 from simulator.tests.test_helpers import (
     SimpleTask,
     make_resident,
@@ -32,11 +32,11 @@ from simulator.tests.test_helpers import (
     schedule_pull,
 )
 
-from simulator.engine import Engine
-from simulator.request import Request, RequestPD, RequestStatus
-from simulator.resource import BandwidthResource, ComputeResource
-from simulator.scheduler import Scheduler
-from simulator.simulator import Simulator
+from simulator.runtime.engine import Engine
+from simulator.core.request import Request, RequestPD, RequestStatus
+from simulator.core.resource import BandwidthResource, ComputeResource
+from simulator.runtime.scheduler import Scheduler
+from simulator.runtime.simulator import Simulator
 
 
 def _dram_placement(memories: dict[str, Memory]) -> TieredPlacement:
@@ -468,11 +468,11 @@ def test_lookup_compute() -> None:
 
 
 def test_min_cost_pull_prefers_dram_when_compute_expensive() -> None:
-    from simulator.estimate import CostContext
-    from simulator.policy_registry import PolicyContext
-    from simulator.read_path import READ_PATH
-    from simulator.resource import BandwidthResource, ComputeResource
-    from simulator.schedule import ScheduleConfig, SchedulePolicy
+    from simulator.observability.estimate import CostContext
+    from simulator.policy.registry import PolicyContext
+    from simulator.policy.read_path import READ_PATH
+    from simulator.core.resource import BandwidthResource, ComputeResource
+    from simulator.policy.schedule import ScheduleConfig, SchedulePolicy
 
     memories = {
         "hbm": Memory(size=10, name="hbm"),
@@ -503,11 +503,11 @@ def test_min_cost_pull_prefers_dram_when_compute_expensive() -> None:
 
 
 def test_threshold_pull_when_cheaper() -> None:
-    from simulator.estimate import CostContext
-    from simulator.policy_registry import PolicyContext
-    from simulator.read_path import READ_PATH
-    from simulator.resource import BandwidthResource, ComputeResource
-    from simulator.schedule import ScheduleConfig, SchedulePolicy
+    from simulator.observability.estimate import CostContext
+    from simulator.policy.registry import PolicyContext
+    from simulator.policy.read_path import READ_PATH
+    from simulator.core.resource import BandwidthResource, ComputeResource
+    from simulator.policy.schedule import ScheduleConfig, SchedulePolicy
 
     memories = {
         "hbm": Memory(size=10, name="hbm"),
@@ -633,7 +633,7 @@ def test_request_metrics_phases() -> None:
 
 
 def test_request_metrics_pd_decode() -> None:
-    from simulator.pd import PDConfig
+    from simulator.runtime.pd import PDConfig
 
     pool = TaskPool()
     memories = {
@@ -692,8 +692,8 @@ def test_request_metrics_pd_decode() -> None:
 
 
 def test_prefix_entry_metrics() -> None:
-    from simulator.estimate import is_prefix_block, record_entry_metrics
-    from simulator.plan import EntryPlan, WorkEntry
+    from simulator.observability.estimate import is_prefix_block, record_entry_metrics
+    from simulator.runtime.plan import EntryPlan, WorkEntry
 
     decode = Request(
         "d1",
@@ -1010,7 +1010,7 @@ def test_sweep_smoke() -> None:
     import tempfile
     from pathlib import Path
 
-    from simulator.sweep import SweepConfig, run_sweep
+    from simulator.bench.sweep import SweepConfig, run_sweep
 
     with tempfile.TemporaryDirectory() as tmp:
         csv_path = str(Path(tmp) / "compare.csv")
@@ -1037,7 +1037,7 @@ def test_sweep_smoke() -> None:
 
 
 def test_blocks_from_gib() -> None:
-    from simulator.capacity import blocks_from_gib, gib_for_blocks
+    from simulator.model.capacity import blocks_from_gib, gib_for_blocks
 
     gib = 32.0
     blocks = blocks_from_gib(
@@ -1050,8 +1050,8 @@ def test_blocks_from_gib() -> None:
 
 
 def test_eviction_preset_sweep_smoke() -> None:
-    from simulator.presets import EVICTION_PRESET_NAMES
-    from simulator.sweep import SimConfig, SweepConfig, run_sweep
+    from simulator.bench.presets import EVICTION_PRESET_NAMES
+    from simulator.bench.sweep import SimConfig, SweepConfig, run_sweep
 
     rows = run_sweep(
         SweepConfig(
@@ -1073,8 +1073,8 @@ def test_eviction_preset_sweep_smoke() -> None:
 def test_load_mooncake_trace() -> None:
     import json
 
-    from simulator.mooncake_trace import DEFAULT_TRACE_PATH, load_mooncake_trace
-    from simulator.workload import WorkloadConfig
+    from simulator.bench.mooncake_trace import DEFAULT_TRACE_PATH, load_mooncake_trace
+    from simulator.bench.workload import WorkloadConfig
 
     cfg = WorkloadConfig(
         num_requests=8,
@@ -1104,13 +1104,13 @@ def test_load_mooncake_trace() -> None:
 
 
 def test_partition_by_hbm() -> None:
-    from simulator.mooncake_trace import (
+    from simulator.bench.mooncake_trace import (
         DEFAULT_TRACE_PATH,
         is_hbm_admittable,
         partition_by_hbm,
         request_block_footprint,
     )
-    from simulator.workload import WorkloadConfig, build_workload
+    from simulator.bench.workload import WorkloadConfig, build_workload
 
     reqs, _ = build_workload(
         WorkloadConfig(num_requests=500, trace_path=str(DEFAULT_TRACE_PATH))
@@ -1125,8 +1125,8 @@ def test_partition_by_hbm() -> None:
 
 
 def test_drop_oversized_sweep_smoke() -> None:
-    from simulator.sweep import SimConfig, SweepConfig, run_sweep
-    from simulator.mooncake_trace import DEFAULT_TRACE_PATH
+    from simulator.bench.sweep import SimConfig, SweepConfig, run_sweep
+    from simulator.bench.mooncake_trace import DEFAULT_TRACE_PATH
 
     rows = run_sweep(
         SweepConfig(
@@ -1152,8 +1152,8 @@ def test_drop_oversized_sweep_smoke() -> None:
 
 
 def test_trace_sweep_smoke() -> None:
-    from simulator.sweep import SimConfig, SweepConfig, run_sweep
-    from simulator.mooncake_trace import DEFAULT_TRACE_PATH
+    from simulator.bench.sweep import SimConfig, SweepConfig, run_sweep
+    from simulator.bench.mooncake_trace import DEFAULT_TRACE_PATH
 
     rows = run_sweep(
         SweepConfig(
@@ -1181,10 +1181,10 @@ def test_event_trace_analyzer_roundtrip() -> None:
     import tempfile
     from pathlib import Path
 
-    from simulator.analyze import analyze, load_events
-    from simulator.presets import PRESETS
-    from simulator.sweep import SimConfig, SweepConfig, run_sweep_case
-    from simulator.workload import WorkloadConfig
+    from simulator.observability.analyze import analyze, load_events
+    from simulator.bench.presets import PRESETS
+    from simulator.bench.sweep import SimConfig, SweepConfig, run_sweep_case
+    from simulator.bench.workload import WorkloadConfig
 
     with tempfile.TemporaryDirectory() as tmp:
         trace_path = Path(tmp) / "trace.jsonl"
@@ -1209,7 +1209,7 @@ def test_event_trace_analyzer_roundtrip() -> None:
 
 
 def test_policy_matrix_sweep_smoke() -> None:
-    from simulator.sweep import SimConfig, SweepConfig, run_sweep
+    from simulator.bench.sweep import SimConfig, SweepConfig, run_sweep
 
     rows = run_sweep(
         SweepConfig(

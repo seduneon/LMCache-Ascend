@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from simulator.engine import Engine
-from simulator.memory import BlockState, Memory
-from simulator.plan import EntryPlan, WorkEntry
-from simulator.request import Request, RequestPD, RequestStatus
-from simulator.resource import BandwidthResource, ComputeResource
-from simulator.scheduler import Scheduler
-from simulator.sim_log import SimLogConfig
-from simulator.simulator import Simulator
-from simulator.tasks import BatchLoadTask, TaskPool, TaskStatus
+from simulator.runtime.engine import Engine
+from simulator.core.memory import BlockState, Memory
+from simulator.runtime.plan import EntryPlan, WorkEntry
+from simulator.core.request import Request, RequestPD, RequestStatus
+from simulator.core.resource import BandwidthResource, ComputeResource
+from simulator.runtime.scheduler import Scheduler
+from simulator.observability.sim_log import SimLogConfig
+from simulator.runtime.simulator import Simulator
+from simulator.runtime.tasks import BatchLoadTask, TaskPool, TaskStatus
+from simulator.runtime.pd import PDConfig
 from simulator.tests.test_helpers import (
     SimpleTask,
     execute_plan,
@@ -30,9 +31,6 @@ def _pd_engines(
     prefill_hbm: int = 100,
     max_num_seqs: int = 10,
 ):
-    from simulator.engine import Engine
-    from simulator.pd import PDConfig
-
     pool = TaskPool()
     memories = {
         "npu-0:hbm": Memory(size=prefill_hbm, name="npu-0:hbm"),
@@ -75,8 +73,6 @@ def _pd_engines(
 
 def test_micro_step_waits_for_arrival() -> None:
     """With no runnable work, one step() advances now to the next arrival."""
-    from simulator.engine import Engine
-
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
     eng = Engine(
@@ -98,8 +94,6 @@ def test_micro_step_waits_for_arrival() -> None:
 
 
 def test_event_steps_matches_completed_steps() -> None:
-    from simulator.engine import Engine
-
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
     eng = Engine(
@@ -119,8 +113,6 @@ def test_event_steps_matches_completed_steps() -> None:
 
 def test_in_flight_blocks_reschedule() -> None:
     """An engine with an in-flight batch must not execute another batch."""
-    from simulator.engine import Engine
-
     pool = TaskPool()
     memories = {"hbm": Memory(size=10, name="hbm")}
     eng = Engine(
@@ -458,8 +450,6 @@ def test_chunked_prefill() -> None:
 
 
 def test_pd_read_mode_flags() -> None:
-    from simulator.pd import PDConfig
-
     pool = TaskPool()
     memories = {
         "npu-0:hbm": Memory(size=100, name="npu-0:hbm"),
@@ -624,8 +614,6 @@ def test_waiting_preempt() -> None:
 
 
 def test_pd_config_validation() -> None:
-    from simulator.pd import PDConfig
-
     pool = TaskPool()
     memories = {"p": Memory(size=10, name="p"), "d": Memory(size=10, name="d")}
     npu0 = Engine("p", [], pool, memories, policies_compute("p"), ComputeResource(base_speed=1.0))

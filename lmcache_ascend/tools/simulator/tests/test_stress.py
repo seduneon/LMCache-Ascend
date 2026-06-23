@@ -6,17 +6,17 @@ import os
 import time
 from dataclasses import dataclass
 
-from simulator.sim_log import SimLogConfig, SimLogger
-from simulator.sim_progress import SimProgress, SimProgressConfig
-from simulator.simulator import Simulator
-from simulator.sweep import PRESETS, SimConfig, build_engines
-from simulator.tasks import TaskPool
-from simulator.workload import WorkloadConfig, generate_prefill_workload
+from simulator.observability.sim_log import SimLogConfig, SimLogger
+from simulator.observability.sim_progress import SimProgress, SimProgressConfig
+from simulator.runtime.simulator import Simulator
+from simulator.bench.sweep import PRESETS, SimConfig, build_engines
+from simulator.runtime.tasks import TaskPool
+from simulator.bench.workload import WorkloadConfig, generate_prefill_workload
 
-from simulator.engine import Engine
-from simulator.memory import Memory
-from simulator.pd import PDConfig
-from simulator.request import Request, RequestPD, RequestStatus
+from simulator.runtime.engine import Engine
+from simulator.core.memory import Memory
+from simulator.runtime.pd import PDConfig
+from simulator.core.request import Request, RequestPD, RequestStatus
 
 
 # Default request-count sweep for benchmark / multi-seed stress runs.

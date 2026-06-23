@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
     if argv:
         key = argv[0]
         if key == "sweep":
-            from simulator.sweep import main as sweep_main
+            from simulator.bench.sweep import main as sweep_main
 
             sweep_main(argv[1:])
             return

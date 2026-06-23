@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from simulator.engine import Engine
-from simulator.eviction import LRUEviction
-from simulator.memory import BlockState, Memory
-from simulator.plan import BatchPlan, WorkEntry
-from simulator.policies import EnginePolicies
-from simulator.tasks import Task
-from simulator.tier import Tier, TierGraph, graph_from_memories
+from simulator.runtime.engine import Engine
+from simulator.policy.eviction import LRUEviction
+from simulator.policy.schedule import ScheduleConfig, SchedulePolicy
+from simulator.core.memory import BlockState, Memory
+from simulator.runtime.plan import BatchPlan, WorkEntry
+from simulator.policy.policies import EnginePolicies
+from simulator.runtime.tasks import Task
+from simulator.model.tier import Tier, TierGraph, graph_from_memories
 
 
 class SimpleTask(Task):
@@ -68,9 +69,6 @@ def schedule_compute(
     *,
     eviction_policy=None,
 ):
-    from simulator.eviction import LRUEviction
-    from simulator.schedule import ScheduleConfig, SchedulePolicy
-
     return SchedulePolicy(
         ScheduleConfig(
             local_memory=local_memory,
@@ -85,9 +83,6 @@ def schedule_pull(
     *,
     eviction_policy=None,
 ):
-    from simulator.eviction import LRUEviction
-    from simulator.schedule import ScheduleConfig, SchedulePolicy
-
     return SchedulePolicy(
         ScheduleConfig(
             local_memory=local_memory,
